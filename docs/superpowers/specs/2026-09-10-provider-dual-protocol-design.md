@@ -6,6 +6,7 @@
 
 - 保留并完善 DeepSeek 的 OpenAI 兼容流式调用；
 - 将 Kimi 配置为 OpenAI 兼容端点（`https://api.moonshot.cn/v1`）；
+- 将 GLM 配置为 OpenAI 兼容端点（`https://open.bigmodel.cn/api/paas/v4`）；
 - 新增通用 `AnthropicCompatProvider`，用于任何支持 `/v1/messages` 的端点；
 - 统一 SSE、文本增量、工具调用增量、结束事件、超时与错误语义；
 - 补齐本地 SSE 回放测试。
@@ -23,6 +24,7 @@
 7. `anthropic-version` 为配置项，默认 `2023-06-01`。
 8. `temperature`、`max_tokens` 由 `ModelSettings` 单一管理，两个协议均透传。
 9. 单测全部使用本地 `httpx.MockTransport` 回放；真实厂商调用留到 E2E/演示验收。
+10. GLM 复用 `OpenAICompatProvider`，使用 `ZHIPU_API_KEY`；模型名由全局 `model.model_name` 选择，不改变默认模型。
 
 ## 架构
 
@@ -68,7 +70,7 @@ Provider 成功流的事件顺序为零或多个 `TEXT_DELTA` / `TOOL_USE_DELTA`
 
 `ModelSettings` 的 `model_name`、`temperature` 与 `max_tokens` 会传给构造器。`build_provider()` 根据 `kind` 创建 `OpenAICompatProvider` 或 `AnthropicCompatProvider`；未知类型、缺失 Provider、非法 URL 或缺失密钥都在启动前报出 `SettingsError`。
 
-`settings.example.json` 展示 `deepseek` 和 `kimi` 两项。Kimi 的 `kind` 为 `openai_compat`、环境变量为 `MOONSHOT_API_KEY`，而非 Anthropic 兼容类型。
+`settings.example.json` 展示 `deepseek`、`kimi` 和 `glm` 三项。Kimi 的 `kind` 为 `openai_compat`、环境变量为 `MOONSHOT_API_KEY`，而非 Anthropic 兼容类型；GLM 同样为 `openai_compat`，使用 `https://open.bigmodel.cn/api/paas/v4` 和 `ZHIPU_API_KEY`。选择 GLM 时，用户将 `model.provider` 改为 `glm`，并按需将 `model.model_name` 设为例如 `glm-5.3-flash`。
 
 ## 协议转换
 
@@ -106,7 +108,7 @@ HTTP 401/403 映射为 `AuthError`，429 映射为 `RateLimitError`，5xx 映射
 - OpenAI `[DONE]` 未带 usage 时的唯一 `MESSAGE_END`；
 - Anthropic 文本与工具调用事件映射；
 - 401、403、429、5xx、SSE error、非法 JSON、截断流、首字节和空闲超时；
-- Provider 注册、Kimi/DeepSeek 选择和配置/密钥校验。
+- Provider 注册、DeepSeek/Kimi/GLM 选择和配置/密钥校验。
 
 验收命令：
 
