@@ -1,5 +1,7 @@
 """FastAPI application and M0 chat routes."""
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from finharness.config.settings import Settings
 from finharness.engine.loop import AgentLoop
 from finharness.data.access import DataAccess
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
@@ -17,6 +20,11 @@ from finharness.provider.registry import build_provider
 from finharness.server.sessions import SessionBusyError, SessionRegistry
 from finharness.server.sse import encode_event
 from finharness.tools.registry import ToolRegistry
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are FinHarness, a careful financial research copilot. "
+    "Use only provided tools for factual market data."
+)
 
 
 class ChatRequest(BaseModel):
@@ -34,13 +42,22 @@ class QueueSink:
         await self.queue.put(event)
 
 
-def create_app(provider=None, data_access=None) -> FastAPI:
+def create_app(provider=None, data_access=None, settings: Settings | None = None) -> FastAPI:
     application = FastAPI(title="FinHarness")
+    settings = settings or Settings.from_file()
     selected_provider = provider or FakeProvider([], error=RuntimeError(
         "No provider configured. Start the production app factory with DEEPSEEK_API_KEY, or inject FakeProvider explicitly for tests."
     ))
     tool_registry = ToolRegistry(data_access or DataAccess([AkShareAdapter()]))
-    registry = SessionRegistry(lambda: AgentLoop(provider=selected_provider, registry=tool_registry), ttl_s=1800)
+    registry = SessionRegistry(
+        lambda: AgentLoop(
+            provider=selected_provider,
+            registry=tool_registry,
+            settings=settings,
+            system=DEFAULT_SYSTEM_PROMPT,
+        ),
+        ttl_s=settings.server.session_ttl_s,
+    )
     frontend_dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
     if (frontend_dist / "assets").is_dir():
         application.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
@@ -70,7 +87,6 @@ def create_app(provider=None, data_access=None) -> FastAPI:
         sink = QueueSink()
         session.loop.output = sink
         session.busy = True
-        import asyncio
         task = asyncio.create_task(session.loop.run(request.message))
 
         async def events() -> AsyncIterator[str]:
@@ -80,12 +96,17 @@ def create_app(provider=None, data_access=None) -> FastAPI:
                     if task.done() and sink.queue.empty():
                         break
                     event = await sink.queue.get()
-                    yield encode_event(_event_name(event.kind), event.data)
-                    if event.kind == "done" and task.done():
+                    data = event.data
+                    if event.kind == "done":
+                        data = {**data, "session_id": session.session_id}
+                    yield encode_event(_event_name(event.kind), data)
+                    if event.kind == "done":
                         break
                 await task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, GeneratorExit):
                 task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
                 raise
             finally:
                 registry.release(session)
@@ -95,8 +116,10 @@ def create_app(provider=None, data_access=None) -> FastAPI:
     return application
 
 
-def create_production_app() -> FastAPI:
-    return create_app(build_provider())
+def create_production_app(path: str | Path = "settings.json") -> FastAPI:
+    settings = Settings.from_file(path)
+    settings.validate_runtime()
+    return create_app(build_provider(settings=settings), settings=settings)
 
 
 def _event_name(kind: str) -> str:
