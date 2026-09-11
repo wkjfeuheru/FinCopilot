@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from finharness.config.settings import Settings, SettingsError
 
@@ -21,13 +22,17 @@ def test_settings_defaults_include_complete_contract(tmp_path):
     assert settings.providers["deepseek"].cost_per_1m.input == 1.0
     assert settings.permission.default_mode == "default"
     assert settings.tools.timeout_default_s == 30
-    assert settings.data.adapter_order == ["akshare", "tushare", "baostock"]
+    assert settings.data.adapter_order == ("akshare", "tushare", "baostock")
     assert settings.context.max_turns == 30
     assert settings.server.confirm_ttl_s == 120
     assert settings.server.allow_remote is False
-    assert set(settings.providers) >= {"deepseek", "kimi", "glm"}
-    assert settings.providers["kimi"].base_url == "https://api.moonshot.cn/v1"
+    assert set(settings.providers) >= {"deepseek", "kimi", "glm", "fake"}
+    assert settings.providers["kimi"].kind == "anthropic_compat"
+    assert settings.providers["kimi"].base_url == "https://api.moonshot.cn/anthropic/v1"
+    assert settings.providers["glm"].kind == "anthropic_compat"
+    assert settings.providers["glm"].base_url == "https://open.bigmodel.cn/api/anthropic/v1"
     assert settings.providers["glm"].env_key == "ZHIPU_API_KEY"
+    assert settings.providers["fake"].kind == "fake"
     assert settings.providers["deepseek"].first_byte_timeout_s == 30.0
     assert settings.providers["deepseek"].idle_timeout_s == 60.0
 
@@ -54,10 +59,20 @@ def test_selected_glm_requires_its_key(monkeypatch, tmp_path):
     with pytest.raises(SettingsError, match="ZHIPU_API_KEY"):
         Settings.from_file(path, require_api_key=True)
 
-def test_unselected_invalid_provider_does_not_block_startup(tmp_path):
+def test_invalid_unselected_provider_is_rejected_by_strict_schema(tmp_path):
     path = write_settings(tmp_path, {"providers": {"unused": {"kind": "invalid"}}})
-    settings = Settings.from_file(path)
-    assert settings.model.provider == "deepseek"
+
+    with pytest.raises(SettingsError, match="providers.unused.kind"):
+        Settings.from_file(path)
+
+
+def test_no_argument_loads_settings_json_from_working_directory(monkeypatch, tmp_path):
+    write_settings(tmp_path, {"model": {"provider": "fake"}})
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings.from_file()
+
+    assert settings.model.provider == "fake"
 
 
 def test_settings_loads_json_and_resolves_relative_paths(tmp_path):
@@ -74,7 +89,7 @@ def test_settings_loads_json_and_resolves_relative_paths(tmp_path):
     settings = Settings.from_file(path)
 
     assert settings.model.temperature == 0.25
-    assert settings.data.adapter_order == ["akshare"]
+    assert settings.data.adapter_order == ("akshare",)
     assert settings.data.cache_dir == (tmp_path / "cache").resolve()
     assert settings.audit.log_path == (tmp_path / "logs" / "audit.jsonl").resolve()
     assert settings.paths.output_dir == (tmp_path / "artifacts").resolve()
@@ -110,8 +125,44 @@ def test_settings_environment_overrides_scalar_and_json_fields(monkeypatch, tmp_
 
     assert settings.model.provider == "deepseek"
     assert settings.server.port == 8123
-    assert settings.data.adapter_order == ["akshare"]
+    assert settings.data.adapter_order == ("akshare",)
     assert settings.tools.timeout_overrides == {"get_kline": 45}
+
+
+def test_single_underscore_environment_overrides_nested_and_path_fields(monkeypatch, tmp_path):
+    path = write_settings(tmp_path, {"model": {"provider": "fake"}})
+    monkeypatch.setenv("FINH_MODEL_THINKING_ENABLED", "false")
+    monkeypatch.setenv("FINH_SERVER_ALLOW_REMOTE", "true")
+    monkeypatch.setenv("FINH_SERVER_HOST", "0.0.0.0")
+    monkeypatch.setenv("FINH_PATHS_OUTPUT_DIR", "generated")
+
+    settings = Settings.from_file(path)
+
+    assert settings.model.thinking.enabled is False
+    assert settings.server.allow_remote is True
+    assert settings.server.host == "0.0.0.0"
+    assert settings.paths.output_dir == (tmp_path / "generated").resolve()
+
+
+def test_json_environment_can_replace_provider_table(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "FINH_PROVIDERS",
+        json.dumps(
+            {
+                "custom": {
+                    "kind": "openai_compat",
+                    "base_url": "https://models.example/v1",
+                    "env_key": "CUSTOM_API_KEY",
+                }
+            }
+        ),
+    )
+    path = write_settings(tmp_path, {"model": {"provider": "custom"}})
+
+    settings = Settings.from_file(path)
+
+    assert settings.providers["custom"].base_url == "https://models.example/v1"
+    assert "deepseek" not in settings.providers
 
 
 def test_double_underscore_environment_variables_are_rejected(monkeypatch, tmp_path):
@@ -119,6 +170,42 @@ def test_double_underscore_environment_variables_are_rejected(monkeypatch, tmp_p
 
     with pytest.raises(SettingsError, match="双下划线"):
         Settings.from_file(write_settings(tmp_path, {}))
+
+
+def test_unknown_prefixed_environment_variable_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("FINH_MODEL_TYPO", "deepseek")
+
+    with pytest.raises(SettingsError, match="FINH_MODEL_TYPO"):
+        Settings.from_file(write_settings(tmp_path, {}))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"server": {"port": "8000"}},
+        {"server": {"allow_remote": 0}},
+        {"model": {"temperature": "0.1"}},
+    ],
+)
+def test_json_values_are_strictly_typed(tmp_path, payload):
+    with pytest.raises(SettingsError):
+        Settings.from_file(write_settings(tmp_path, payload))
+
+
+def test_settings_and_nested_models_are_frozen(tmp_path):
+    settings = Settings.from_file(write_settings(tmp_path, {}))
+
+    with pytest.raises(ValidationError, match="frozen"):
+        settings.server.port = 9000
+
+    with pytest.raises(AttributeError):
+        settings.data.adapter_order.append("custom")
+
+    with pytest.raises(TypeError):
+        settings.tools.timeout_overrides["get_quote"] = 10
+
+    with pytest.raises(TypeError):
+        settings.providers["custom"] = settings.providers["deepseek"]
 
 
 @pytest.mark.parametrize(

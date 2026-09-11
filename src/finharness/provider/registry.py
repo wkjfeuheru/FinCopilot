@@ -13,12 +13,17 @@ from finharness.provider.openai_compat import OpenAICompatProvider
 from finharness.provider.anthropic_compat import AnthropicCompatProvider
 
 
-def build_provider(path: str | Path = "settings.json", *, client: httpx.AsyncClient | None = None):
-    settings = Settings.from_file(path)
-    if settings.model.provider == "fake":
-        return FakeProvider(["FakeProvider is enabled explicitly."])
+def build_provider(
+    path: str | Path = "settings.json",
+    *,
+    client: httpx.AsyncClient | None = None,
+    settings: Settings | None = None,
+):
+    settings = settings or Settings.from_file(path)
     settings.validate(require_api_key=True)
     config = settings.providers[settings.model.provider]
+    if config.kind == "fake":
+        return FakeProvider(["FakeProvider is enabled explicitly."])
     if config.kind == "anthropic_compat":
         return AnthropicCompatProvider(
             base_url=config.base_url,

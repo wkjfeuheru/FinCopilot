@@ -17,20 +17,40 @@
       "cost_per_1m": {"input": 1.0, "output": 2.0}
     },
     "kimi": {
-      "kind": "openai_compat",
-      "base_url": "https://api.moonshot.cn/v1",
+      "kind": "anthropic_compat",
+      "base_url": "https://api.moonshot.cn/anthropic/v1",
       "env_key": "MOONSHOT_API_KEY",
-      "cost_per_1m": {"input": 1.0, "output": 2.0}
+      "api_version": "2023-06-01",
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0,
+      "cost_per_1m": {"input": 2.0, "output": 12.0}
     },
     "glm": {
-      "kind": "openai_compat",
-      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "kind": "anthropic_compat",
+      "base_url": "https://open.bigmodel.cn/api/anthropic/v1",
       "env_key": "ZHIPU_API_KEY",
-      "cost_per_1m": {"input": 1.0, "output": 2.0}
+      "api_version": "2023-06-01",
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0,
+      "cost_per_1m": {"input": 1.0, "output": 4.0}
+    },
+    "fake": {
+      "kind": "fake",
+      "base_url": null,
+      "env_key": null,
+      "api_version": null,
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0,
+      "cost_per_1m": {"input": 0.0, "output": 0.0}
     }
   },
   "permission": {"default_mode": "default"},
-  "tools": {"timeout_default_s": 30, "timeout_overrides": {}},
+  "tools": {
+    "timeout_default_s": 30,
+    "timeout_overrides": {},
+    "resident": [],
+    "lazy": []
+  },
   "data": {
     "adapter_order": ["akshare", "tushare", "baostock"],
     "tushare_token_env": "TUSHARE_TOKEN",

@@ -2,8 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.pytest-tmp/
-.pytest-tmp-final/
+.pytest-tmp*/
 .tmp/
 .ruff_cache/
 .mypy_cache/
@@ -18,6 +17,7 @@ frontend/vite.config.d.ts
 .env
 .env.*
 !.env.example
+settings.json
 data_cache/*
 !data_cache/.gitkeep
 logs/*
