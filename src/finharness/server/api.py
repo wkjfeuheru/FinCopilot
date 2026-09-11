@@ -3,7 +3,6 @@
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
-import os
 from pathlib import Path
 
 from fastapi import FastAPI
