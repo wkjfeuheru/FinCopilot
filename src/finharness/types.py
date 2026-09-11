@@ -75,6 +75,8 @@ class AgentTurnOutcome:
     succeeded: bool = True
     usage: ModelUsage = field(default_factory=ModelUsage)
     error: str | None = None
+    reason: str | None = None
+    tool_calls: int = 0
 
 
 class OutputSink(Protocol):

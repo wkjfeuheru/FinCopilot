@@ -18,10 +18,17 @@ class ToolRegistry:
     def resolve(self, name: str):
         return self.tools.get(name)
 
-    def schemas(self) -> list[dict]:
+    def schemas(self, names: set[str] | None = None) -> list[dict]:
         parameters = {
             "get_quote": {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]},
             "get_kline": {"type": "object", "properties": {"symbol": {"type": "string"}, "period": {"type": "string"}, "adjust": {"type": ["string", "null"]}, "years": {"type": "integer"}}, "required": ["symbol"]},
             "get_indicators": {"type": "object", "properties": {"symbol": {"type": "string"}, "years": {"type": "integer"}, "fields": {"type": ["array", "null"], "items": {"type": "string"}}}, "required": ["symbol"]},
         }
-        return [{"type": "function", "function": {"name": name, "description": tool.description, "parameters": parameters[name]}} for name, tool in self.tools.items()]
+        return [
+            {"type": "function", "function": {"name": name, "description": tool.description, "parameters": parameters[name]}}
+            for name, tool in self.tools.items()
+            if names is None or name in names
+        ]
+
+    def is_read_only(self, name: str) -> bool:
+        return name in {"get_quote", "get_kline", "get_indicators"}
