@@ -114,9 +114,21 @@ class AgentLoop:
 
             if tool_uses:
                 self.messages.append(Msg(role="assistant", content=None, tool_uses=tool_uses))
-                results = list(
-                    await asyncio.gather(*(self._execute_one(tool_use) for tool_use in tool_uses))
-                )
+                try:
+                    results = list(
+                        await asyncio.gather(*(self._execute_one(tool_use) for tool_use in tool_uses))
+                    )
+                except BaseException:
+                    # An aborted round must not leave the assistant frame without the
+                    # paired tool messages, or the next request is malformed.
+                    self.messages.append(
+                        Msg(
+                            role="tool_result",
+                            content=None,
+                            tool_results=self._aborted_results(tool_uses),
+                        )
+                    )
+                    raise
                 self.messages.append(Msg(role="tool_result", content=None, tool_results=results))
                 tool_calls_total += len(results)
                 continue
@@ -156,6 +168,24 @@ class AgentLoop:
             },
             ensure_ascii=False,
         )
+
+    def _aborted_results(self, tool_uses: list[ToolUse]) -> list[tuple[str, str]]:
+        """Placeholder failures so a cancelled round still pairs every call id."""
+
+        return [
+            (
+                tool_use.call_id,
+                json.dumps(
+                    {
+                        "ok": False,
+                        "content": "",
+                        "error": f"tool call cancelled: {tool_use.name}",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            for tool_use in tool_uses
+        ]
 
     async def _reject(self, tool_use: ToolUse, message: str) -> tuple[str, str]:
         await self._emit(

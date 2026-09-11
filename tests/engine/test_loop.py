@@ -590,3 +590,49 @@ def test_cancelling_run_cancels_running_tools_and_never_emits_done():
     assert events[0].data["status"] == "started"
     assert "done" not in kinds(events)
     assert "error" not in kinds(events)
+
+
+def test_cancelled_tool_round_backfills_a_failure_for_every_call_id():
+    async def run():
+        sink = Sink()
+        tool = CancellableTool("get_quote")
+        registry = StubRegistry({"get_quote": tool})
+        provider = ScriptedProvider(
+            [
+                tool_round(ToolUse("call_1", "get_quote", {}), ToolUse("call_2", "get_quote", {})),
+                text_round("第二轮答案"),
+            ]
+        )
+        loop = make_loop(provider, registry=registry, output=sink)
+        task = asyncio.create_task(loop.run("查询报价"))
+        await asyncio.wait_for(tool.started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        outcome = await loop.run("再问一次")
+        return loop.messages, provider, outcome, sink.events
+
+    messages, provider, outcome, events = asyncio.run(run())
+
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "tool_result",
+        "user",
+        "assistant",
+    ]
+    payloads = [json.loads(raw) for _, raw in messages[2].tool_results]
+    assert [call_id for call_id, _ in messages[2].tool_results] == ["call_1", "call_2"]
+    assert [payload["ok"] for payload in payloads] == [False, False]
+    assert all("cancel" in payload["error"] for payload in payloads)
+    second_request = provider.requests[1]["messages"]
+    requested = {tool_use.call_id for message in second_request for tool_use in message.tool_uses}
+    answered = {
+        call_id
+        for message in second_request
+        if message.role == "tool_result"
+        for call_id, _ in message.tool_results
+    }
+    assert requested == answered == {"call_1", "call_2"}
+    assert outcome.answer == "第二轮答案"
+    assert kinds(events)[-1] == "done"

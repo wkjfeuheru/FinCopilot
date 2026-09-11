@@ -302,14 +302,23 @@ def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session() -> 
         second_task = second.start()
         await second.wait_for("event: done")
         await second_task
-        return stream, second, session_id
+        return stream, second, session_id, provider
 
-    stream, second, session_id = asyncio.run(run())
+    stream, second, session_id, provider = asyncio.run(run())
 
     assert "event: done" not in stream.text()
     assert "event: answer" not in stream.text()
     assert f'"session_id": "{session_id}"' in second.text()
     assert "event: answer" in second.text()
+    follow_up = provider.requests[-1]
+    requested = {tool_use.call_id for message in follow_up for tool_use in message.tool_uses}
+    answered = {
+        call_id
+        for message in follow_up
+        if message.role == "tool_result"
+        for call_id, _ in message.tool_results
+    }
+    assert requested == answered == {"call_1"}
 
 
 def test_production_factory_runs_runtime_audit_validation(tmp_path) -> None:
