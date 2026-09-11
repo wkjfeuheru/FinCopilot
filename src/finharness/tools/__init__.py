@@ -1,0 +1,1 @@
+"""Tool declarations and registry."""

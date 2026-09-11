@@ -1,0 +1,56 @@
+{
+  "model": {
+    "provider": "deepseek",
+    "model_name": "deepseek-chat",
+    "temperature": 0.1,
+    "max_tokens": 4096,
+    "thinking": {"enabled": true, "budget_tokens": 2048}
+  },
+  "providers": {
+    "deepseek": {
+      "kind": "openai_compat",
+      "base_url": "https://api.deepseek.com/v1",
+      "env_key": "DEEPSEEK_API_KEY",
+      "api_version": null,
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0,
+      "cost_per_1m": {"input": 1.0, "output": 2.0}
+    },
+    "kimi": {
+      "kind": "openai_compat",
+      "base_url": "https://api.moonshot.cn/v1",
+      "env_key": "MOONSHOT_API_KEY",
+      "cost_per_1m": {"input": 1.0, "output": 2.0}
+    },
+    "glm": {
+      "kind": "openai_compat",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "env_key": "ZHIPU_API_KEY",
+      "cost_per_1m": {"input": 1.0, "output": 2.0}
+    }
+  },
+  "permission": {"default_mode": "default"},
+  "tools": {"timeout_default_s": 30, "timeout_overrides": {}},
+  "data": {
+    "adapter_order": ["akshare", "tushare", "baostock"],
+    "tushare_token_env": "TUSHARE_TOKEN",
+    "throttle_seconds": 1.0,
+    "cache_dir": "data_cache",
+    "cache_ttl_days": {"quote": 1, "kline": 1, "indicators": 7, "financials": 365, "announcements": 7}
+  },
+  "context": {"max_turns": 30, "compaction_ratio": 0.8, "trim_rows": 20, "max_result_tokens": 1000, "max_tool_schema_tokens": 60, "short_mem_cap": 200, "recall_max_tokens": 400, "ltm_inject_max_tokens": 600},
+  "audit": {"log_path": "logs/audit.jsonl"},
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "session_ttl_s": 1800,
+    "confirm_ttl_s": 120,
+    "static_dir": "src/finharness/server/static",
+    "allow_remote": false
+  },
+  "paths": {
+    "output_dir": "output",
+    "memory_db": "data_cache/memory.db",
+    "skills_dir": "skills"
+  }
+}

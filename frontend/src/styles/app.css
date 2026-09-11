@@ -1,0 +1,47 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  color: #17202a;
+  background: #f4f6f8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+.app-shell { min-height: 100vh; }
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 24px 40px;
+  background: #ffffff;
+  border-bottom: 1px solid #dce2e8;
+}
+.eyebrow { margin: 0 0 8px; color: #617080; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; }
+h1, h2, p { margin-top: 0; }
+h1 { margin-bottom: 0; font-size: 24px; }
+.status-pill { padding: 6px 10px; border: 1px solid #dce2e8; color: #617080; font-size: 12px; }
+.workspace { max-width: 1120px; margin: 0 auto; padding: 56px 40px; }
+
+.session-bar { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; color: #617080; font-size: 12px; }
+.session-bar button, .composer button { border: 0; background: #17202a; color: #fff; padding: 10px 14px; cursor: pointer; }
+.session-bar button:disabled, .composer button:disabled { cursor: not-allowed; opacity: .5; }
+.chat-panel { display: grid; gap: 16px; }
+.message-list { min-height: 420px; display: grid; align-content: start; gap: 12px; }
+.message { max-width: 80%; padding: 14px 16px; border: 1px solid #dce2e8; background: #fff; }
+.message-user { justify-self: end; background: #e9f0f5; }
+.message-error { border-color: #c44b4b; color: #9b3030; }
+.message-role { display: block; margin-bottom: 6px; color: #617080; font-size: 11px; font-weight: 700; }
+.message p { margin: 0; white-space: pre-wrap; line-height: 1.65; }
+.tool-status { color: #617080; font-size: 12px; }
+.composer { display: flex; gap: 12px; align-items: flex-end; }
+.composer textarea { flex: 1; resize: vertical; min-width: 0; border: 1px solid #b9c3cc; padding: 12px; font: inherit; }
+.empty-state { max-width: 560px; padding: 32px 0; }
+.empty-state h2 { margin-bottom: 12px; font-size: 28px; }
+.empty-state p:last-child { color: #617080; line-height: 1.7; }
+@media (max-width: 640px) {
+  .app-header { padding: 20px; }
+  .workspace { padding: 32px 20px; }
+  .composer { align-items: stretch; flex-direction: column; }
+  .composer button { width: 100%; }
+}
