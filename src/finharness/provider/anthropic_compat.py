@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 import httpx
 from finharness.provider.base import Provider
-from finharness.provider.errors import AuthError, NetworkError, RateLimitError, ServerError
+from finharness.provider.errors import AuthError, NetworkError, RateLimitError, ServerError, parse_retry_after
 from finharness.provider.event_stream import ToolUseAccumulator, iter_sse_data
 from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUseDelta
 
@@ -63,7 +63,7 @@ class AnthropicCompatProvider(Provider):
         try:
             async with self.client.stream("POST", f"{self.base_url}/messages", headers={"x-api-key": self.api_key, "anthropic-version": self.api_version, "content-type": "application/json"}, json=payload) as response:
                 if response.status_code in (401, 403): raise AuthError(f"Provider authentication failed ({response.status_code})")
-                if response.status_code == 429: raise RateLimitError("Provider rate limit exceeded")
+                if response.status_code == 429: raise RateLimitError("Provider rate limit exceeded", retry_after_s=parse_retry_after(response.headers.get("Retry-After")))
                 if response.status_code >= 500: raise ServerError(f"Provider server error ({response.status_code})")
                 if response.status_code >= 400: raise NetworkError(f"Provider request failed ({response.status_code})")
                 async for data in iter_sse_data(response.aiter_lines(), first_byte_timeout_s=self.first_byte_timeout_s, idle_timeout_s=self.idle_timeout_s):
@@ -113,5 +113,7 @@ class AnthropicCompatProvider(Provider):
                         continue
                     elif typ not in {"message_start", "message_delta", "content_block_start", "content_block_delta"}:
                         raise NetworkError("Provider returned invalid SSE event")
-        except httpx.HTTPError as exc: raise NetworkError(str(exc)) from exc
+        except httpx.HTTPError as exc:
+            retryable = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.WriteError))
+            raise NetworkError(str(exc), retryable=retryable) from exc
         final.tool_uses = acc.build(); yield StreamChunk(StreamEvent.MESSAGE_END, final)

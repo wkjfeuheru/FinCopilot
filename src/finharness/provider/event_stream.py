@@ -79,7 +79,7 @@ async def iter_sse_data(
                 if first_read
                 else "Provider stream idle timeout"
             )
-            raise NetworkError(message) from error
+            raise NetworkError(message, retryable=first_read) from error
 
         first_read = False
         line = line.rstrip("\r\n")

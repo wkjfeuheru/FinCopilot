@@ -8,7 +8,13 @@ from typing import Any
 import httpx
 
 from finharness.provider.base import Provider
-from finharness.provider.errors import AuthError, NetworkError, RateLimitError, ServerError
+from finharness.provider.errors import (
+    AuthError,
+    NetworkError,
+    RateLimitError,
+    ServerError,
+    parse_retry_after,
+)
 from finharness.provider.event_stream import ToolUseAccumulator, iter_sse_data
 from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUseDelta
 
@@ -59,7 +65,7 @@ class OpenAICompatProvider(Provider):
         try:
             async with self.client.stream("POST", f"{self.base_url}/chat/completions", headers={"Authorization": f"Bearer {self.api_key}"}, json=payload) as response:
                 if response.status_code in (401, 403): raise AuthError(f"Provider authentication failed ({response.status_code})")
-                if response.status_code == 429: raise RateLimitError("Provider rate limit exceeded")
+                if response.status_code == 429: raise RateLimitError("Provider rate limit exceeded", retry_after_s=parse_retry_after(response.headers.get("Retry-After")))
                 if response.status_code >= 500: raise ServerError(f"Provider server error ({response.status_code})")
                 if response.status_code >= 400: raise NetworkError(f"Provider request failed ({response.status_code})")
                 async for data in iter_sse_data(response.aiter_lines(), first_byte_timeout_s=self.first_byte_timeout_s, idle_timeout_s=self.idle_timeout_s):
@@ -122,6 +128,10 @@ class OpenAICompatProvider(Provider):
                         accumulator.add(td)
                         yield StreamChunk(StreamEvent.TOOL_USE_DELTA, td)
         except httpx.HTTPError as exc:
-            raise NetworkError(str(exc)) from exc
+            retryable = isinstance(
+                exc,
+                (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.WriteError),
+            )
+            raise NetworkError(str(exc), retryable=retryable) from exc
         final_usage.tool_uses = accumulator.build()
         yield StreamChunk(StreamEvent.MESSAGE_END, final_usage)

@@ -1,5 +1,7 @@
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 import httpx
 import pytest
@@ -240,6 +242,84 @@ def test_openai_httpx_error_is_wrapped_as_network_error():
         collect_from(handler)
 
 
+def test_openai_retry_metadata_marks_status_and_connection_errors():
+    async def rate_limited(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "2.5"})
+
+    with pytest.raises(RateLimitError) as rate_limit:
+        collect_from(rate_limited)
+    assert rate_limit.value.retryable is True
+    assert rate_limit.value.retry_after_s == 2.5
+
+    async def unavailable(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    with pytest.raises(ServerError) as server_error:
+        collect_from(unavailable)
+    assert server_error.value.retryable is True
+
+    async def connection_failed(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection failed", request=request)
+
+    with pytest.raises(NetworkError) as network_error:
+        collect_from(connection_failed)
+    assert network_error.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        (format_datetime(datetime.now(timezone.utc) + timedelta(seconds=60)), pytest.approx(60, abs=2)),
+        (format_datetime(datetime.now(timezone.utc) - timedelta(seconds=60)), 0.0),
+        ("not-a-delay", None),
+        ("NaN", None),
+        ("Infinity", None),
+    ],
+)
+def test_openai_retry_after_supports_http_dates_and_ignores_invalid_values(header, expected):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": header})
+
+    with pytest.raises(RateLimitError) as error:
+        collect_from(handler)
+
+    assert error.value.retry_after_s == expected
+
+
+def test_openai_protocol_and_idle_failures_are_not_retryable():
+    async def invalid_payload(request: httpx.Request) -> httpx.Response:
+        return sse_response(lines=["data: {bad}\n\n"])
+
+    with pytest.raises(NetworkError) as malformed:
+        collect_from(invalid_payload)
+    assert malformed.value.retryable is False
+
+    class SlowLines(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"
+            await asyncio.sleep(0.05)
+            yield b"data: [DONE]\n\n"
+
+        async def aclose(self):
+            return None
+
+    async def idle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=SlowLines())
+
+    with pytest.raises(NetworkError) as idle_error:
+        collect_from(idle, idle_timeout_s=0.001)
+    assert idle_error.value.retryable is False
+
+
+def test_openai_auth_failure_is_not_retryable():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401)
+
+    with pytest.raises(AuthError) as error:
+        collect_from(handler)
+    assert error.value.retryable is False
+
+
 def test_openai_eof_without_done_still_emits_message_end():
     async def handler(request: httpx.Request) -> httpx.Response:
         return sse_response(lines=["data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"])
@@ -260,8 +340,9 @@ def test_openai_first_byte_timeout_is_network_error():
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=SlowLines())
 
-    with pytest.raises(NetworkError, match="first response byte"):
+    with pytest.raises(NetworkError, match="first response byte") as error:
         collect_from(handler, first_byte_timeout_s=0.001)
+    assert error.value.retryable is True
 
 
 def test_openai_idle_timeout_is_network_error():
