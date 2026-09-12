@@ -67,6 +67,10 @@ class ToolResult:
     ok: bool = True
     error: str | None = None
     attachments: list[str] = field(default_factory=list)
+    # Raw payloads this result was rendered from; the loop registers them as
+    # citations and fills ``citations`` with the assigned ids.
+    sources: list[Any] = field(default_factory=list)
+    citations: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -79,6 +83,7 @@ class AgentTurnOutcome:
     tool_calls: int = 0
     retry_count: int = 0
     tool_duration_ms: int = 0
+    citations: list[str] = field(default_factory=list)
 
 
 class OutputSink(Protocol):

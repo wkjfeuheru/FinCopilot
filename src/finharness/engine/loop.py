@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from finharness.config.settings import Settings
+from finharness.data.citation import CitationRegistry, fingerprint_frame
 from finharness.engine.cost import SessionStats
 from finharness.engine.retry import RetryPolicy, stream_with_retry
 from finharness.provider.base import Provider
@@ -38,6 +39,8 @@ class AgentLoop:
         output: OutputSink | None = None,
         retry_policy: RetryPolicy | None = None,
         stats: SessionStats | None = None,
+        cite: CitationRegistry | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -46,6 +49,8 @@ class AgentLoop:
         self.output = output
         self.retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self.stats = stats if stats is not None else SessionStats()
+        self.cite = cite if cite is not None else CitationRegistry()
+        self.session_id = session_id or "local"
         self.messages: list[Msg] = []
         self.usage = ModelUsage()
         self.turn = 0
@@ -68,7 +73,11 @@ class AgentLoop:
             "tool_calls": tool_calls,
             "retry_count": snapshot.retry_count,
             "tool_duration_ms": snapshot.tool_duration_ms,
+            "citations": [item.cid for item in self.cite.all()],
         }
+
+    def _citation_ids(self) -> list[str]:
+        return [item.cid for item in self.cite.all()]
 
     async def _fail(
         self,
@@ -90,6 +99,7 @@ class AgentLoop:
             tool_calls=tool_calls,
             retry_count=self.stats.retry_count,
             tool_duration_ms=self.stats.snapshot().tool_duration_ms,
+            citations=self._citation_ids(),
         )
 
     async def run(self, user_msg: str) -> AgentTurnOutcome:
@@ -163,6 +173,7 @@ class AgentLoop:
                 tool_calls=tool_calls_total,
                 retry_count=self.stats.retry_count,
                 tool_duration_ms=self.stats.snapshot().tool_duration_ms,
+                citations=self._citation_ids(),
             )
 
         return await self._fail(
@@ -182,14 +193,14 @@ class AgentLoop:
         return content[: limit - len(self.TRUNCATION_MARKER)] + self.TRUNCATION_MARKER
 
     def _encode(self, result: ToolResult) -> str:
-        return json.dumps(
-            {
-                "ok": bool(result.ok),
-                "content": self._truncate(result.content),
-                "error": result.error,
-            },
-            ensure_ascii=False,
-        )
+        payload: dict[str, Any] = {
+            "ok": bool(result.ok),
+            "content": self._truncate(result.content),
+            "error": result.error,
+        }
+        if result.citations:
+            payload["citations"] = list(result.citations)
+        return json.dumps(payload, ensure_ascii=False)
 
     def _aborted_results(self, tool_uses: list[ToolUse]) -> list[tuple[str, str]]:
         """Placeholder failures so a cancelled round still pairs every call id."""
@@ -254,6 +265,7 @@ class AgentLoop:
             return await self._reject(tool_use, f"tool failed: {exc}", duration_ms=duration_ms)
 
         duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
+        result.citations = self._register_citations(tool_use, result)
         await self._emit(
             "tool_status",
             {
@@ -262,6 +274,27 @@ class AgentLoop:
                 "status": "completed" if result.ok else "failed",
                 "ok": bool(result.ok),
                 "duration_ms": duration_ms,
+                "citations": list(result.citations),
             },
         )
         return tool_use.call_id, self._encode(result)
+
+    def _register_citations(self, tool_use: ToolUse, result: ToolResult) -> list[str]:
+        """Turn a tool's raw payloads into session-tracked citation ids."""
+        cids: list[str] = []
+        symbol = tool_use.args.get("symbol") if isinstance(tool_use.args, dict) else None
+        for source in getattr(result, "sources", []) or []:
+            df = getattr(source, "df", None)
+            citation = self.cite.register(
+                tool=tool_use.name,
+                endpoint=getattr(source, "endpoint", "") or tool_use.name,
+                symbol=str(symbol) if symbol is not None else None,
+                params=dict(getattr(source, "params", {}) or {}),
+                rows=int(len(df)) if df is not None else 0,
+                cols=int(len(df.columns)) if df is not None else 0,
+                fingerprint=fingerprint_frame(df),
+                from_cache=bool(getattr(source, "from_cache", False)),
+                parquet_path=getattr(source, "parquet_path", None),
+            )
+            cids.append(citation.cid)
+        return cids

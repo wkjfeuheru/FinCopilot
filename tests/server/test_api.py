@@ -40,8 +40,13 @@ class QuoteAdapter(DataAdapter):
     def fetch_quote(self, symbol):
         import pandas as pd
 
+        from finharness.data.adapters.base import FetchResult
+
         self.quoted.append(symbol)
-        return pd.DataFrame([{"symbol": symbol, "price": 100.0}])
+        return FetchResult(
+            df=pd.DataFrame([{"symbol": symbol, "close": 100.0}]),
+            interface="offline_quote",
+        )
 
 
 class BlockingQuoteData:
@@ -219,12 +224,23 @@ def test_chat_stream_reports_provider_error_and_done_as_sse_events() -> None:
     assert done["session_id"] == session_id_from(response.text)
 
 
-def test_tools_endpoint_lists_m0_financial_tools() -> None:
+def test_tools_endpoint_lists_m1_financial_tools() -> None:
     client = TestClient(create_app(FakeProvider(["ok"])))
 
     response = client.get("/v1/tools")
 
-    assert response.json() == {"tools": ["get_quote", "get_kline", "get_indicators"]}
+    assert response.json() == {
+        "tools": [
+            "get_quote",
+            "get_kline",
+            "get_indicators",
+            "get_financials",
+            "get_valuation",
+            "get_peers",
+            "get_market_news",
+            "get_announcements",
+        ]
+    }
 
 
 def test_second_turn_reuses_session_history() -> None:

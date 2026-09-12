@@ -36,7 +36,7 @@ class SessionRegistry:
                 session.last_active = now
                 return session
         session_id = f"s_{uuid.uuid4().hex[:12]}"
-        session = ServerSession(session_id, self.loop_factory(), now, now)
+        session = ServerSession(session_id, self.loop_factory(session_id), now, now)
         self.sessions[session_id] = session
         return session
 

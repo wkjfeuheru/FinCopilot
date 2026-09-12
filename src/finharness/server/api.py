@@ -5,7 +5,7 @@ import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -13,9 +13,11 @@ from pydantic import BaseModel
 from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
 from finharness.config.store import ConfigStore
-from finharness.engine.loop import AgentLoop
 from finharness.data.access import DataAccess
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
+from finharness.data.cache import LocalCache
+from finharness.data.citation import CitationRegistry
+from finharness.engine.loop import AgentLoop
 from finharness.provider.fake import FakeProvider
 from finharness.provider.registry import build_provider
 from finharness.provider.resolver import NotConfigured, ProviderResolver
@@ -69,19 +71,37 @@ def create_app(
     if resolver is None:
         resolver = ProviderResolver(store_factory=store_factory, settings=settings)
 
-    tool_registry = ToolRegistry(data_access or DataAccess([AkShareAdapter()]))
-    fallback_provider = provider
+    # One cache serves the whole process; each session gets its own citation
+    # registry so provenance stays scoped to that conversation. A caller-supplied
+    # DataAccess is used as-is (tests pass hermetic doubles), so it is never
+    # mutated here.
+    data_cache = LocalCache(settings.data.cache_dir)
+    shared_data = data_access or DataAccess(
+        [AkShareAdapter(throttle_seconds=settings.data.throttle_seconds)],
+        cache=data_cache,
+        settings=settings,
+    )
 
-    def loop_factory() -> AgentLoop:
+    def make_registry() -> ToolRegistry:
+        return ToolRegistry(shared_data)
+    tool_registry = make_registry()
+    session_citations: dict[str, CitationRegistry] = {}
+    fallback_provider = provider
+    def loop_factory(session_id: str | None = None) -> AgentLoop:
         if fallback_provider is not None:
             selected = fallback_provider
         else:
             selected = resolver.current()
+        citations = CitationRegistry()
+        if session_id:
+            session_citations[session_id] = citations
         return AgentLoop(
             provider=selected,
-            registry=tool_registry,
+            registry=make_registry(),
             settings=settings,
             system=DEFAULT_SYSTEM_PROMPT,
+            cite=citations,
+            session_id=session_id,
         )
 
     registry = SessionRegistry(loop_factory, ttl_s=settings.server.session_ttl_s)
@@ -104,6 +124,43 @@ def create_app(
     @application.get("/v1/tools")
     async def tools() -> dict[str, list]:
         return {"tools": tool_registry.names()}
+
+    @application.get("/v1/cache/stats")
+    async def cache_stats() -> dict:
+        snapshot = data_cache.stats()
+        return {
+            "entries": snapshot.entries,
+            "hits": snapshot.hits,
+            "misses": snapshot.misses,
+            "hit_ratio": snapshot.hit_ratio,
+        }
+
+    @application.get("/v1/citations")
+    async def citations(session_id: str | None = None) -> dict:
+        """Citations for one session; falls back to every live session."""
+        if session_id:
+            registries = [session_citations[session_id]] if session_id in session_citations else []
+            if not registries:
+                raise HTTPException(status_code=404, detail="会话不存在或已回收")
+        else:
+            registries = list(session_citations.values())
+        items: list[dict] = []
+        for registry in registries:
+            items.extend(
+                {
+                    "cid": item.cid,
+                    "tool": item.tool,
+                    "endpoint": item.endpoint,
+                    "symbol": item.symbol,
+                    "rows": item.rows,
+                    "cols": item.cols,
+                    "from_cache": item.from_cache,
+                    "ts": item.ts,
+                    "fingerprint": item.fingerprint,
+                }
+                for item in registry.all()
+            )
+        return {"citations": items, "count": len(items)}
 
     @application.get("/")
     async def root() -> HTMLResponse:

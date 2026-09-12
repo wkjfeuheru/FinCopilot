@@ -7,7 +7,9 @@ from finharness.server.sessions import SessionBusyError, SessionRegistry
 
 def test_session_registry_reuses_session_and_rejects_busy():
     async def run():
-        registry = SessionRegistry(lambda: object())
+        # The factory receives the new session id so per-session state (such as
+        # the citation registry) can be keyed to it.
+        registry = SessionRegistry(lambda session_id: object())
         session = await registry.ensure(None)
         session.busy = True
         with pytest.raises(SessionBusyError):
