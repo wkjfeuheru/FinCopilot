@@ -7,7 +7,7 @@ import { SessionBar } from "./components/SessionBar";
 import { SettingsModal } from "./components/SettingsModal";
 import { fetchConfig } from "./api/config";
 import type { ConfigSnapshot } from "./api/config";
-import { listConversations, loadConversationMessages } from "./api/client";
+import { deleteConversation, listConversations, loadConversationMessages } from "./api/client";
 import type { ConversationSummary, HistoryMessage } from "./api/client";
 
 const EMPTY_CONFIG: ConfigSnapshot = { configured: false, active_id: null, configs: [] };
@@ -83,6 +83,18 @@ function App() {
     setSessionVersion((version) => version + 1);
   }
 
+  async function handleDeleteConversation(id: string) {
+    try {
+      await deleteConversation(id);
+    } catch {
+      // The list refresh below is the source of truth; a failure here just
+      // leaves the row in place.
+    }
+    // Deleting the conversation being viewed returns the UI to a fresh state.
+    if (id === conversationId) startNewConversation();
+    await refreshConversations();
+  }
+
   function selectConversation(id: string) {
     if (id === conversationId) return;
     rememberConversation(id);
@@ -144,6 +156,7 @@ function App() {
               onSelect={selectConversation}
               onNew={startNewConversation}
               onRefresh={() => void refreshConversations()}
+              onDelete={(id) => void handleDeleteConversation(id)}
             />
             <div className="conversation-panel">
               <SessionBar

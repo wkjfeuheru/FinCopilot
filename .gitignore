@@ -20,6 +20,10 @@ frontend/vite.config.d.ts
 settings.json
 data_cache/*
 !data_cache/.gitkeep
+# Relative default paths resolve against the process working directory when
+# Settings is built without a file, so a stray data_cache can appear in any
+# subdirectory (e.g. frontend/). Ignore it wherever it lands.
+**/data_cache/
 logs/*
 !logs/.gitkeep
 output/*

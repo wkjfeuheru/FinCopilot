@@ -4,7 +4,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from finharness.config.settings import SettingsError
+from finharness.config.settings import Settings, SettingsError
 from finharness.data.access import DataAccess, RawData
 from finharness.data.adapters.base import DataAdapter
 from finharness.provider.base import Provider
@@ -168,6 +168,25 @@ async def wait_until(predicate, *, timeout: float = 5.0) -> None:
     await asyncio.wait_for(poll(), timeout)
 
 
+def make_client(provider=None, data_access=None, tmp_path=None) -> TestClient:
+    """Build a client whose memory store and cache live in a temp directory.
+
+    Without an explicit settings object the app would use the repository's
+    data_cache/memory.db, so every chat test would append conversations to the
+    developer's real store.
+    """
+    if tmp_path is None:
+        import tempfile
+        from pathlib import Path
+
+        tmp_path = Path(tempfile.mkdtemp(prefix="finharness_test_"))
+    settings = Settings(
+        data={"cache_dir": tmp_path / "cache"},
+        paths={"output_dir": tmp_path / "output", "memory_db": tmp_path / "cache" / "memory.db"},
+    )
+    return TestClient(create_app(provider, data_access=data_access, settings=settings))
+
+
 def test_health_endpoint_returns_service_status() -> None:
     response = TestClient(app).get("/v1/health")
 
@@ -176,7 +195,7 @@ def test_health_endpoint_returns_service_status() -> None:
 
 
 def test_chat_stream_returns_session_and_answer_events() -> None:
-    client = TestClient(create_app(FakeProvider(["hello", " world"])))
+    client = make_client(FakeProvider(["hello", " world"]))
 
     response = client.post("/v1/chat/stream", json={"message": "question"})
 
@@ -189,7 +208,7 @@ def test_chat_stream_returns_session_and_answer_events() -> None:
 
 
 def test_done_event_carries_the_session_id_and_usage() -> None:
-    client = TestClient(create_app(FakeProvider(["hello"])))
+    client = make_client(FakeProvider(["hello"]))
 
     response = client.post("/v1/chat/stream", json={"message": "question"})
 
@@ -205,7 +224,7 @@ def test_done_event_carries_the_session_id_and_usage() -> None:
 
 
 def test_chat_stream_reports_provider_error_and_done_as_sse_events() -> None:
-    client = TestClient(create_app(FakeProvider([], error=RuntimeError("provider down"))))
+    client = make_client(FakeProvider([], error=RuntimeError("provider down")))
 
     response = client.post("/v1/chat/stream", json={"message": "question"})
 
@@ -224,7 +243,7 @@ def test_chat_stream_reports_provider_error_and_done_as_sse_events() -> None:
 
 
 def test_tools_endpoint_lists_m1_financial_tools() -> None:
-    client = TestClient(create_app(FakeProvider(["ok"])))
+    client = make_client(FakeProvider(["ok"]))
 
     response = client.get("/v1/tools")
 
@@ -257,7 +276,7 @@ def test_tools_endpoint_lists_m1_financial_tools() -> None:
 
 def test_second_turn_reuses_session_history() -> None:
     provider = FakeProvider(["answer"])
-    client = TestClient(create_app(provider))
+    client = make_client(provider)
     first = client.post("/v1/chat/stream", json={"message": "first"})
     session_id = session_id_from(first.text)
 
@@ -278,7 +297,7 @@ def test_tool_call_streams_tool_status_and_never_leaks_the_model_draft() -> None
             text_round("贵州茅台最新报价 100.0"),
         ]
     )
-    client = TestClient(create_app(provider, data_access=DataAccess([adapter])))
+    client = make_client(provider, data_access=DataAccess([adapter]))
 
     response = client.post("/v1/chat/stream", json={"message": "贵州茅台报价"})
 
@@ -299,7 +318,7 @@ def test_tool_call_streams_tool_status_and_never_leaks_the_model_draft() -> None
 
 def test_session_loop_receives_the_default_system_prompt() -> None:
     provider = ScriptedProvider([text_round("ok")])
-    client = TestClient(create_app(provider))
+    client = make_client(provider)
 
     response = client.post("/v1/chat/stream", json={"message": "hi"})
 
@@ -307,7 +326,7 @@ def test_session_loop_receives_the_default_system_prompt() -> None:
     assert provider.systems == [DEFAULT_SYSTEM_PROMPT]
 
 
-def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session() -> None:
+def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session(tmp_path) -> None:
     async def run():
         data = BlockingQuoteData()
         provider = ScriptedProvider(
@@ -316,7 +335,17 @@ def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session() -> 
                 text_round("迟到的答案"),
             ]
         )
-        asgi_app = create_app(provider, data_access=data)
+        asgi_app = create_app(
+            provider,
+            data_access=data,
+            settings=Settings(
+                data={"cache_dir": tmp_path / "cache"},
+                paths={
+                    "output_dir": tmp_path / "output",
+                    "memory_db": tmp_path / "cache" / "memory.db",
+                },
+            ),
+        )
         stream = AsgiStream(asgi_app, {"message": "查询贵州茅台"})
         task = stream.start()
         await stream.wait_for('"status": "started"')

@@ -81,3 +81,19 @@ export async function loadConversationMessages(
   const body = (await response.json()) as { messages: HistoryMessage[] };
   return body.messages;
 }
+
+export async function deleteConversation(conversationId: string): Promise<void> {
+  const response = await fetch(`/v1/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    let detail = `删除失败：${response.status}`;
+    try {
+      const body = await response.json();
+      if (typeof body.detail === "string") detail = body.detail;
+    } catch {
+      /* keep the status-based message */
+    }
+    throw new Error(detail);
+  }
+}

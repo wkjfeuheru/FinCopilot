@@ -63,7 +63,7 @@ class SessionRegistry:
                 return session
 
         if conversation_id:
-            existing = self._find_by_conversation(conversation_id)
+            existing = self.find_by_conversation(conversation_id)
             if existing is not None:
                 if existing.busy:
                     raise SessionBusyError("session is busy")
@@ -82,7 +82,8 @@ class SessionRegistry:
         self.sessions[session_id] = session
         return session
 
-    def _find_by_conversation(self, conversation_id: str) -> ServerSession | None:
+    def find_by_conversation(self, conversation_id: str) -> ServerSession | None:
+        """The live session bound to a conversation, if any."""
         for session in self.sessions.values():
             if session.conversation_id == conversation_id:
                 return session

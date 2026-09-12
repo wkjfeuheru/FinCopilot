@@ -1,4 +1,4 @@
-import { Button, Empty, List, Typography } from "antd";
+import { Button, Empty, List, Popconfirm, Typography } from "antd";
 import type { ConversationSummary } from "../api/client";
 
 type Props = {
@@ -8,6 +8,7 @@ type Props = {
   onSelect: (conversationId: string) => void;
   onNew: () => void;
   onRefresh: () => void;
+  onDelete: (conversationId: string) => void;
 };
 
 function formatTime(value: string): string {
@@ -33,6 +34,7 @@ export function ConversationList({
   onSelect,
   onNew,
   onRefresh,
+  onDelete,
 }: Props) {
   return (
     <aside className="conversation-list">
@@ -55,6 +57,27 @@ export function ConversationList({
             <List.Item
               className={item.conversation_id === activeId ? "conversation-item active" : "conversation-item"}
               onClick={() => onSelect(item.conversation_id)}
+              actions={[
+                // Deleting is destructive and irreversible, so it asks first.
+                <Popconfirm
+                  key="delete"
+                  title="删除该对话？"
+                  description="对话内容、引用与结论将一并删除，且不可恢复。"
+                  okText="删除"
+                  cancelText="取消"
+                  okButtonProps={{ danger: true }}
+                  onConfirm={() => onDelete(item.conversation_id)}
+                >
+                  <Button
+                    size="small"
+                    type="link"
+                    danger
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    删除
+                  </Button>
+                </Popconfirm>,
+              ]}
             >
               <div className="conversation-item-body">
                 <span className="conversation-title">{item.title || "未命名对话"}</span>

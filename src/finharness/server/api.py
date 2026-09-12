@@ -347,6 +347,30 @@ def create_app(
             "messages": rendered[-max(limit, 1) :],
         }
 
+    @application.delete("/v1/conversations/{conversation_id}")
+    async def delete_conversation(conversation_id: str) -> dict:
+        """Delete a conversation and everything scoped to it.
+
+        Removes the transcript, summaries, citations, conclusions and symbol
+        pool. User preferences are global and deliberately unaffected.
+
+        Refused while the conversation is mid-request: deleting the store out
+        from under a running loop would leave it persisting into nothing.
+        """
+        if memory_store.get_conversation(conversation_id) is None:
+            raise HTTPException(status_code=404, detail="对话不存在")
+        active = registry.find_by_conversation(conversation_id)
+        if active is not None and active.busy:
+            raise HTTPException(status_code=409, detail="该对话正在处理中，请稍后再删除")
+        memory_store.delete_conversation(conversation_id)
+        conversation_citations.pop(conversation_id, None)
+        for session_id, session in list(registry.sessions.items()):
+            if session.conversation_id == conversation_id:
+                registry.sessions.pop(session_id, None)
+                session_citations.pop(session_id, None)
+                session_contexts.pop(session_id, None)
+        return {"ok": True, "conversation_id": conversation_id}
+
     @application.get("/")
     async def root() -> HTMLResponse:
         index = frontend_dist / "index.html"

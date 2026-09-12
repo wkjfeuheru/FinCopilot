@@ -35,6 +35,8 @@ h1 { margin-bottom: 0; font-size: 24px; }
 .conversation-item-body { display: grid; gap: 2px; min-width: 0; }
 .conversation-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-time { color: #617080; font-size: 11px; }
+.conversation-item .ant-list-item-action { margin-inline-start: 4px; }
+.conversation-item .ant-list-item-action > li { padding: 0 2px; }
 
 .session-bar { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; color: #617080; font-size: 12px; }
 .session-bar button, .composer button { border: 0; background: #17202a; color: #fff; padding: 10px 14px; cursor: pointer; }
