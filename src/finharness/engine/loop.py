@@ -7,6 +7,8 @@ import json
 from typing import Any
 
 from finharness.config.settings import Settings
+from finharness.engine.cost import SessionStats
+from finharness.engine.retry import RetryPolicy, stream_with_retry
 from finharness.provider.base import Provider
 from finharness.tools.registry import ToolRegistry
 from finharness.types import (
@@ -34,12 +36,16 @@ class AgentLoop:
         settings: Settings,
         system: str,
         output: OutputSink | None = None,
+        retry_policy: RetryPolicy | None = None,
+        stats: SessionStats | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
         self.settings = settings
         self.system = system
         self.output = output
+        self.retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        self.stats = stats if stats is not None else SessionStats()
         self.messages: list[Msg] = []
         self.usage = ModelUsage()
         self.turn = 0
@@ -50,6 +56,7 @@ class AgentLoop:
             await self.output.emit(EngineEvent(kind, data))
 
     def _done_payload(self, *, succeeded: bool, reason: str | None, tool_calls: int) -> dict[str, Any]:
+        snapshot = self.stats.snapshot()
         return {
             "succeeded": succeeded,
             "reason": reason,
@@ -59,6 +66,8 @@ class AgentLoop:
             },
             "cost_cny": 0.0,
             "tool_calls": tool_calls,
+            "retry_count": snapshot.retry_count,
+            "tool_duration_ms": snapshot.tool_duration_ms,
         }
 
     async def _fail(
@@ -79,6 +88,8 @@ class AgentLoop:
             error=error,
             reason=reason,
             tool_calls=tool_calls,
+            retry_count=self.stats.retry_count,
+            tool_duration_ms=self.stats.snapshot().tool_duration_ms,
         )
 
     async def run(self, user_msg: str) -> AgentTurnOutcome:
@@ -91,11 +102,15 @@ class AgentLoop:
             deltas: list[str] = []
             tool_uses: list[ToolUse] = []
             try:
-                async for chunk in self.provider.stream(
-                    system=self.system,
-                    messages=self.messages,
-                    tools=self.registry.schemas(self.active_tool_names),
-                    usage=self.usage,
+                async for chunk in stream_with_retry(
+                    lambda: self.provider.stream(
+                        system=self.system,
+                        messages=self.messages,
+                        tools=self.registry.schemas(self.active_tool_names),
+                        usage=self.usage,
+                    ),
+                    policy=self.retry_policy,
+                    on_retry=lambda _error, _index, _delay: self.stats.add_retry(),
                 ):
                     if chunk.event is StreamEvent.TEXT_DELTA:
                         deltas.append(chunk.data)
@@ -103,6 +118,7 @@ class AgentLoop:
                         tool_uses = list(chunk.data.tool_uses)
                         self.usage.input_tokens += chunk.data.input_tokens
                         self.usage.output_tokens += chunk.data.output_tokens
+                        self.stats.add_usage(chunk.data.input_tokens, chunk.data.output_tokens)
             except Exception as exc:
                 return await self._fail(
                     kind=type(exc).__name__,
@@ -141,7 +157,13 @@ class AgentLoop:
                 "done", self._done_payload(succeeded=True, reason=None, tool_calls=tool_calls_total)
             )
             self.messages.append(Msg(role="assistant", content=answer))
-            return AgentTurnOutcome(answer=answer, usage=self.usage, tool_calls=tool_calls_total)
+            return AgentTurnOutcome(
+                answer=answer,
+                usage=self.usage,
+                tool_calls=tool_calls_total,
+                retry_count=self.stats.retry_count,
+                tool_duration_ms=self.stats.snapshot().tool_duration_ms,
+            )
 
         return await self._fail(
             kind="max_turns_exhausted",
@@ -187,22 +209,25 @@ class AgentLoop:
             for tool_use in tool_uses
         ]
 
-    async def _reject(self, tool_use: ToolUse, message: str) -> tuple[str, str]:
-        await self._emit(
-            "tool_status",
-            {
-                "call_id": tool_use.call_id,
-                "name": tool_use.name,
-                "status": "failed",
-                "ok": False,
-                "error": message,
-            },
-        )
+    async def _reject(
+        self, tool_use: ToolUse, message: str, *, duration_ms: int | None = None
+    ) -> tuple[str, str]:
+        status: dict[str, Any] = {
+            "call_id": tool_use.call_id,
+            "name": tool_use.name,
+            "status": "failed",
+            "ok": False,
+            "error": message,
+        }
+        if duration_ms is not None:
+            status["duration_ms"] = duration_ms
+        await self._emit("tool_status", status)
         return tool_use.call_id, json.dumps(
             {"ok": False, "content": "", "error": message}, ensure_ascii=False
         )
 
     async def _execute_one(self, tool_use: ToolUse) -> tuple[str, str]:
+        self.stats.record_tool_request(tool_use.name)
         tool = self.registry.resolve(tool_use.name)
         if tool is None:
             return await self._reject(tool_use, f"unknown tool: {tool_use.name}")
@@ -216,22 +241,27 @@ class AgentLoop:
         timeout = self.settings.tools.timeout_overrides.get(
             tool_use.name, self.settings.tools.timeout_default_s
         )
+        started_at = self.stats.now()
         try:
             result = await asyncio.wait_for(tool.run(**tool_use.args), timeout)
         except TimeoutError:
+            duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
             return await self._reject(
-                tool_use, f"tool timeout after {timeout}s: {tool_use.name}"
+                tool_use, f"tool timeout after {timeout}s: {tool_use.name}", duration_ms=duration_ms
             )
         except Exception as exc:
-            return await self._reject(tool_use, f"tool failed: {exc}")
+            duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
+            return await self._reject(tool_use, f"tool failed: {exc}", duration_ms=duration_ms)
 
+        duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
         await self._emit(
             "tool_status",
             {
                 "call_id": tool_use.call_id,
                 "name": tool_use.name,
-                "status": "completed",
+                "status": "completed" if result.ok else "failed",
                 "ok": bool(result.ok),
+                "duration_ms": duration_ms,
             },
         )
         return tool_use.call_id, self._encode(result)

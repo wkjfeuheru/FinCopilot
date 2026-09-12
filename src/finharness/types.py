@@ -77,6 +77,8 @@ class AgentTurnOutcome:
     error: str | None = None
     reason: str | None = None
     tool_calls: int = 0
+    retry_count: int = 0
+    tool_duration_ms: int = 0
 
 
 class OutputSink(Protocol):

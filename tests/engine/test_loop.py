@@ -4,8 +4,11 @@ import json
 import pytest
 
 from finharness.config.settings import ContextSettings, Settings, ToolSettings
+from finharness.engine.cost import SessionStats
 from finharness.engine.loop import AgentLoop
+from finharness.engine.retry import RetryPolicy
 from finharness.provider.base import Provider
+from finharness.provider.errors import RateLimitError
 from finharness.provider.fake import FakeProvider
 from finharness.tools.registry import ToolRegistry
 from finharness.types import (
@@ -17,6 +20,19 @@ from finharness.types import (
     ToolResult,
     ToolUse,
 )
+
+
+class StepClock:
+    """Deterministic clock advancing a fixed step per call."""
+
+    def __init__(self, step_s: float = 0.25):
+        self._value = 0.0
+        self._step_s = step_s
+
+    def __call__(self) -> float:
+        value = self._value
+        self._value += self._step_s
+        return value
 
 
 class Sink:
@@ -75,6 +91,19 @@ class ScriptedProvider(Provider):
             raise script
         for chunk in script:
             yield chunk
+
+
+class ChunkThenErrorProvider(Provider):
+    """Yields one delta, then fails mid-stream so retry must not trigger."""
+
+    def __init__(self, error: Exception):
+        self.error = error
+        self.calls = 0
+
+    async def stream(self, *, system: str, messages: list, tools: list[dict], usage: ModelUsage):
+        self.calls += 1
+        yield StreamChunk(StreamEvent.TEXT_DELTA, "partial")
+        raise self.error
 
 
 class RecordingTool:
@@ -197,6 +226,8 @@ def make_loop(
     settings: Settings | None = None,
     output=None,
     system: str = "test-system",
+    retry_policy: RetryPolicy | None = None,
+    stats: SessionStats | None = None,
 ) -> AgentLoop:
     return AgentLoop(
         provider=provider,
@@ -204,6 +235,8 @@ def make_loop(
         settings=settings or make_settings(),
         system=system,
         output=output,
+        retry_policy=retry_policy,
+        stats=stats,
     )
 
 
@@ -216,6 +249,8 @@ def test_agent_turn_outcome_has_reason_and_tool_call_defaults():
 
     assert outcome.reason is None
     assert outcome.tool_calls == 0
+    assert outcome.retry_count == 0
+    assert outcome.tool_duration_ms == 0
 
 
 def test_tool_registry_schemas_filters_names_in_registry_order():
@@ -636,3 +671,178 @@ def test_cancelled_tool_round_backfills_a_failure_for_every_call_id():
     assert requested == answered == {"call_1", "call_2"}
     assert outcome.answer == "第二轮答案"
     assert kinds(events)[-1] == "done"
+
+
+def test_provider_retry_recovers_before_the_first_chunk_and_counts_retries():
+    async def run():
+        sink = Sink()
+        provider = ScriptedProvider(
+            [RateLimitError("limited"), RateLimitError("limited"), text_round("ok")]
+        )
+        loop = make_loop(
+            provider,
+            output=sink,
+            retry_policy=RetryPolicy(
+                max_retries=4, base_delay_s=0.0, cap_delay_s=0.0
+            ),
+        )
+        outcome = await loop.run("question")
+        return outcome, sink.events, provider, loop
+
+    outcome, events, provider, loop = asyncio.run(run())
+
+    assert outcome.succeeded is True
+    assert outcome.retry_count == 2
+    assert outcome.tool_calls == 0
+    assert outcome.usage.input_tokens == 1
+    assert len(provider.requests) == 3
+    assert loop.stats.retry_count == 2
+    done = events[-1].data
+    assert done["retry_count"] == 2
+    assert done["tool_duration_ms"] == 0
+    assert kinds(events) == ["text_delta", "answer", "done"]
+
+
+def test_provider_retry_exhaustion_fails_with_retry_count_in_done():
+    async def run():
+        sink = Sink()
+        provider = ScriptedProvider(
+            [RateLimitError("limited"), RateLimitError("limited"),
+             RateLimitError("limited"), RateLimitError("limited"),
+             RateLimitError("limited")]
+        )
+        loop = make_loop(
+            provider,
+            output=sink,
+            retry_policy=RetryPolicy(
+                max_retries=4, base_delay_s=0.0, cap_delay_s=0.0
+            ),
+        )
+        outcome = await loop.run("question")
+        return outcome, sink.events, provider
+
+    outcome, events, provider = asyncio.run(run())
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "provider_error"
+    assert outcome.retry_count == 4
+    assert len(provider.requests) == 5
+    assert kinds(events) == ["error", "done"]
+    assert events[-1].data["retry_count"] == 4
+    assert events[-1].data["tool_duration_ms"] == 0
+
+
+def test_provider_failure_after_a_chunk_is_not_retried():
+    async def run():
+        sink = Sink()
+        provider = ChunkThenErrorProvider(RateLimitError("mid-stream failure"))
+        loop = make_loop(
+            provider,
+            output=sink,
+            retry_policy=RetryPolicy(
+                max_retries=4, base_delay_s=0.0, cap_delay_s=0.0
+            ),
+        )
+        outcome = await loop.run("question")
+        return outcome, sink.events, provider
+
+    outcome, events, provider = asyncio.run(run())
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "provider_error"
+    assert provider.calls == 1
+    assert outcome.retry_count == 0
+    assert events[-1].data["retry_count"] == 0
+
+
+def test_tool_timing_and_accumulated_stats_reach_the_done_event():
+    async def run():
+        sink = Sink()
+        tool = RecordingTool("get_quote", content="报价")
+        registry = StubRegistry({"get_quote": tool})
+        provider = ScriptedProvider(
+            [
+                tool_round(ToolUse("call_1", "get_quote", {"symbol": "600519"})),
+                text_round("ok"),
+            ]
+        )
+        stats = SessionStats(clock=StepClock())
+        loop = make_loop(
+            provider, registry=registry, output=sink, stats=stats
+        )
+        outcome = await loop.run("查询报价")
+        return outcome, sink.events, loop
+
+    outcome, events, loop = asyncio.run(run())
+
+    statuses = [event.data for event in events if event.kind == "tool_status"]
+    assert statuses[0]["status"] == "started"
+    assert statuses[1]["status"] == "completed"
+    assert statuses[1]["duration_ms"] == 250
+    snapshot = loop.stats.snapshot()
+    assert snapshot.tool_calls == 1
+    assert snapshot.tool_duration_ms == 250
+    assert dict(snapshot.per_tool) == {"get_quote": {"count": 1, "duration_ms": 250}}
+    assert outcome.tool_duration_ms == 250
+    done = events[-1].data
+    assert done["tool_calls"] == 1
+    assert done["retry_count"] == 0
+    assert done["tool_duration_ms"] == 250
+
+
+def test_unknown_and_denied_tools_count_as_requests_without_duration():
+    async def run():
+        sink = Sink()
+        registry = StubRegistry({"get_quote": RecordingTool("get_quote")}, read_only=set())
+        provider = ScriptedProvider(
+            [
+                tool_round(
+                    ToolUse("call_unknown", "missing_tool", {}),
+                    ToolUse("call_read", "get_quote", {}),
+                ),
+                text_round("ok"),
+            ]
+        )
+        stats = SessionStats(clock=StepClock())
+        loop = make_loop(provider, registry=registry, output=sink, stats=stats)
+        outcome = await loop.run("混合调用")
+        return outcome, sink.events, loop
+
+    outcome, events, loop = asyncio.run(run())
+
+    snapshot = loop.stats.snapshot()
+    assert snapshot.tool_calls == 2
+    assert snapshot.tool_duration_ms == 0
+    assert dict(snapshot.per_tool) == {
+        "missing_tool": {"count": 1, "duration_ms": 0},
+        "get_quote": {"count": 1, "duration_ms": 0},
+    }
+    assert outcome.tool_duration_ms == 0
+    failed = [event.data for event in events if event.kind == "tool_status" and event.data["status"] == "failed"]
+    assert all("duration_ms" not in data for data in failed)
+
+
+def test_failed_tool_result_reports_failed_status_with_duration():
+    async def run():
+        sink = Sink()
+        tool = RecordingTool("get_quote", content="stale", ok=False, error="denied by source")
+        registry = StubRegistry({"get_quote": tool})
+        provider = ScriptedProvider(
+            [
+                tool_round(ToolUse("call_1", "get_quote", {})),
+                text_round("ok"),
+            ]
+        )
+        stats = SessionStats(clock=StepClock())
+        loop = make_loop(provider, registry=registry, output=sink, stats=stats)
+        outcome = await loop.run("查询报价")
+        return outcome, sink.events, loop
+
+    outcome, events, loop = asyncio.run(run())
+
+    completed = [event.data for event in events if event.kind == "tool_status" and event.data["status"] != "started"]
+    assert completed[0]["status"] == "failed"
+    assert completed[0]["ok"] is False
+    assert completed[0]["duration_ms"] == 250
+    assert loop.stats.snapshot().tool_duration_ms == 250
+    assert outcome.tool_duration_ms == 250
