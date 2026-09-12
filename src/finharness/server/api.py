@@ -19,6 +19,7 @@ from finharness.data.adapters.akshare_adapter import AkShareAdapter
 from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
+from finharness.engine.prompt import system_prompt
 from finharness.hooks.audit import AuditHook, AuditLogWriter, summarize_args
 from finharness.hooks.base import HookChain
 from finharness.permissions.gate import PermissionGate
@@ -31,10 +32,9 @@ from finharness.server.sessions import SessionBusyError, SessionRegistry
 from finharness.server.sse import encode_event
 from finharness.tools.registry import ALL_TOOL_CLASSES, ToolRegistry
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are FinHarness, a careful financial research copilot. "
-    "Use only provided tools for factual market data."
-)
+# One definition, loaded from prompts/system.md so tests exercise the same text
+# the product ships (docs: it governs planning, citation and convergence).
+DEFAULT_SYSTEM_PROMPT = system_prompt()
 
 
 class ChatRequest(BaseModel):
@@ -199,6 +199,27 @@ def create_app(
             "hit_ratio": snapshot.hit_ratio,
         }
 
+    @application.get("/v1/artifacts")
+    async def download_artifact(path: str):
+        """Serve a produced file, restricted to the artefact directories.
+
+        Containment is enforced after resolution, mirroring read_file; without
+        it this endpoint would be an arbitrary file read.
+        """
+        allowed_roots = [
+            Path(settings.paths.output_dir).resolve(),
+            Path(settings.data.cache_dir).resolve(),
+        ]
+        try:
+            target = Path(path).resolve()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="非法路径") from exc
+        if not any(target == root or target.is_relative_to(root) for root in allowed_roots):
+            raise HTTPException(status_code=403, detail="路径超出允许范围（仅限 output/ 与 data_cache/）")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="文件不存在")
+        return FileResponse(target, filename=target.name)
+
     @application.get("/v1/citations")
     async def citations(session_id: str | None = None) -> dict:
         """Citations for one session; falls back to every live session."""
@@ -232,6 +253,21 @@ def create_app(
         if index.is_file():
             return FileResponse(index)
         return HTMLResponse("<html><body><div id='root'>FinHarness</div></body></html>")
+
+    @application.post("/v1/report")
+    async def report_stream(request: ChatRequest):
+        """Turn the conversation into a report.
+
+        This endpoint adds no fixed pipeline of its own: it submits an ordinary
+        request in the session, so the model loads the report-template skill and
+        calls write_report exactly as it would if the user had typed it. The
+        resulting files then arrive as tool_status attachments.
+        """
+        prompt = (
+            request.message.strip()
+            or "请基于本次会话的研究内容生成一份研报，先加载 report-template 技能再成稿。"
+        )
+        return await chat_stream(ChatRequest(session_id=request.session_id, message=prompt))
 
     @application.post("/v1/chat/stream")
     async def chat_stream(request: ChatRequest):

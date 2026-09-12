@@ -479,41 +479,48 @@ def test_tool_exception_and_timeout_backfill_failures_and_model_recovers():
     assert outcome.tool_calls == 2
 
 
-def test_tool_result_content_is_truncated_to_the_configured_character_limit():
+def test_tool_result_content_is_truncated_to_the_configured_token_limit():
+    """max_result_tokens is a token budget, so Chinese is cut at a real count."""
+
     async def run():
-        tool = RecordingTool("get_kline", content="x" * 100)
+        tool = RecordingTool("get_kline", content="茅" * 400)
         registry = StubRegistry({"get_kline": tool})
         provider = ScriptedProvider(
             [tool_round(ToolUse("call_1", "get_kline", {})), text_round("ok")]
         )
         loop = make_loop(provider, registry=registry, settings=make_settings(max_result_tokens=40))
         await loop.run("要很长的K线")
-        return loop.messages, provider
+        return loop.messages, provider, loop
 
-    messages, provider = asyncio.run(run())
+    messages, provider, loop = asyncio.run(run())
 
     content = json.loads(messages[2].tool_results[0][1])["content"]
-    assert len(content) == 40
-    assert content == "x" * 28 + "\n[truncated]"
-    sent_to_model = json.loads(provider.requests[1]["messages"][2].tool_results[0][1])
-    assert sent_to_model["content"] == content
-    assert "x" * 100 not in json.dumps(provider.requests[1]["messages"][2].tool_results)
+    # The truncation marker is appended after the budgeted prefix.
+    assert content.endswith(loop.TRUNCATION_MARKER)
+    body = content[: -len(loop.TRUNCATION_MARKER)]
+    assert loop.memory.counter.count(body).tokens <= 40
+    # The untruncated payload must not have been forwarded.
+    assert "茅" * 400 not in json.dumps(provider.requests[1]["messages"][2].tool_results)
 
 
-def test_truncation_keeps_only_the_prefix_when_the_limit_is_shorter_than_the_marker():
+def test_tiny_token_budget_truncates_without_room_for_the_marker():
     async def run():
-        tool = RecordingTool("get_kline", content="abcdefghij")
+        tool = RecordingTool("get_kline", content="abcdefghij" * 20)
         registry = StubRegistry({"get_kline": tool})
         provider = ScriptedProvider(
             [tool_round(ToolUse("call_1", "get_kline", {})), text_round("ok")]
         )
-        loop = make_loop(provider, registry=registry, settings=make_settings(max_result_tokens=5))
+        loop = make_loop(provider, registry=registry, settings=make_settings(max_result_tokens=4))
         await loop.run("短上限")
-        return loop.messages
+        return loop.messages, loop
 
-    messages = asyncio.run(run())
+    messages, loop = asyncio.run(run())
 
-    assert json.loads(messages[2].tool_results[0][1])["content"] == "abcde"
+    content = json.loads(messages[2].tool_results[0][1])["content"]
+    # With a 4-token budget there is no room for the marker, so the prefix is cut
+    # to fit instead of overshooting the budget.
+    assert loop.TRUNCATION_MARKER not in content
+    assert loop.memory.counter.count(content).tokens <= 4
 
 
 def test_short_tool_result_is_backfilled_unchanged():

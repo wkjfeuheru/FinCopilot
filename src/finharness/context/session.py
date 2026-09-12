@@ -58,6 +58,22 @@ class ResearchContext:
         self.conclusions: list[Conclusion] = []
         self.loaded_skills: list[str] = []
         self.loaded_tools: list[str] = []
+        # Set by AgentLoop once L1 memory exists; these aliases forward to it so
+        # docs 03.6.2's append_* surface is available without ctx owning the
+        # transcript.
+        self.memory: object | None = None
+
+    # -- transcript forwarding (docs 03.6.2) ----------------------------------
+    def append_user(self, text: str) -> None:
+        """Forward to L1 working memory; a no-op when memory is not attached."""
+        memory = self.memory
+        if memory is not None:
+            memory.append_user(text)  # type: ignore[attr-defined]
+
+    def append_tool_result(self, call_id: str, content: str) -> None:
+        memory = self.memory
+        if memory is not None:
+            memory.append_tool_result(call_id, content)  # type: ignore[attr-defined]
 
     # -- symbols --------------------------------------------------------------
     @property

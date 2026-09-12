@@ -19,6 +19,7 @@ from finharness.data.adapters.akshare_adapter import AkShareAdapter
 from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
+from finharness.engine.prompt import system_prompt
 from finharness.hooks.audit import AuditHook, AuditLogWriter
 from finharness.hooks.base import HookChain
 from finharness.permissions.gate import PermissionGate
@@ -27,11 +28,8 @@ from finharness.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.smoke
 
-SYSTEM_PROMPT = (
-    "你是 FinHarness 金融研究助手。"
-    "对于需要多步取数与分析的复杂问题，先用 research_plan 制定计划；"
-    "简单事实问题直接调用数据工具。回答事实前必须先取数，不要凭记忆作答。"
-)
+# Exercise the shipped prompt so the asset itself is under test.
+SYSTEM_PROMPT = system_prompt()
 
 
 def _api_key() -> str:

@@ -89,7 +89,8 @@ def test_registry_covers_the_documented_catalogue(tmp_path):
     expected = {
         "get_quote", "get_kline", "get_indicators", "get_financials",
         "get_valuation", "get_peers", "get_market_news", "get_announcements",
-        "calc_metrics", "read_file", "write_file", "research_plan",
+        "calc_metrics", "calc_valuation", "make_chart", "write_report",
+        "read_file", "write_file", "research_plan",
         "search_tools", "list_skills", "load_skill", "load_tool", "ask_user",
     }
     assert set(registry.names()) == expected

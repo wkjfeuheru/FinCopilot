@@ -129,9 +129,20 @@ class DataSettings(FrozenModel):
 class ContextSettings(FrozenModel):
     max_turns: Annotated[int, Field(ge=1, le=100)] = 30
     compaction_ratio: Annotated[float, Field(gt=0, le=1)] = 0.8
+    # The model's usable input window. Compaction fires at
+    # compaction_ratio x context_window_tokens. Providers do not advertise a
+    # window, so it is configuration; the default suits deepseek-chat and other
+    # models should set it explicitly.
+    context_window_tokens: PositiveInt = 64000
     trim_rows: PositiveInt = 20
     max_result_tokens: PositiveInt = 1000
     max_tool_schema_tokens: PositiveInt = 60
+    # Loop guard: an identical (tool, args) call repeated this many times is
+    # refused, and refused again after a nudge it aborts the run. Kept low
+    # because a repeated identical call is never informative: its result is
+    # already in the transcript and in the cache.
+    max_identical_tool_calls: Annotated[int, Field(ge=2, le=10)] = 3
+    # Consumed once L2/L3 memory lands; unused today.
     short_mem_cap: PositiveInt = 200
     recall_max_tokens: PositiveInt = 400
     ltm_inject_max_tokens: PositiveInt = 600
@@ -429,9 +440,11 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_DATA_CACHE_TTL_DAYS": (("data", "cache_ttl_days"), dict[CacheKind, int]),
     "FINH_CONTEXT_MAX_TURNS": (("context", "max_turns"), int),
     "FINH_CONTEXT_COMPACTION_RATIO": (("context", "compaction_ratio"), float),
+    "FINH_CONTEXT_CONTEXT_WINDOW_TOKENS": (("context", "context_window_tokens"), int),
     "FINH_CONTEXT_TRIM_ROWS": (("context", "trim_rows"), int),
     "FINH_CONTEXT_MAX_RESULT_TOKENS": (("context", "max_result_tokens"), int),
     "FINH_CONTEXT_MAX_TOOL_SCHEMA_TOKENS": (("context", "max_tool_schema_tokens"), int),
+    "FINH_CONTEXT_MAX_IDENTICAL_TOOL_CALLS": (("context", "max_identical_tool_calls"), int),
     "FINH_CONTEXT_SHORT_MEM_CAP": (("context", "short_mem_cap"), int),
     "FINH_CONTEXT_RECALL_MAX_TOKENS": (("context", "recall_max_tokens"), int),
     "FINH_CONTEXT_LTM_INJECT_MAX_TOKENS": (("context", "ltm_inject_max_tokens"), int),

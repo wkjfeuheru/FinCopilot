@@ -37,6 +37,11 @@ h1 { margin-bottom: 0; font-size: 24px; }
 .message-role { display: block; margin-bottom: 6px; color: #617080; font-size: 11px; font-weight: 700; }
 .message p { margin: 0; white-space: pre-wrap; line-height: 1.65; }
 .tool-status { color: #617080; font-size: 12px; }
+.engine-notice { padding: 8px 12px; border: 1px solid #d8c48a; background: #fdf8e8; color: #7a6320; font-size: 12px; }
+.artifact-list { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid #dce2e8; background: #f7fafc; }
+.artifact-title { color: #617080; font-size: 12px; font-weight: 700; }
+.artifact-link { color: #17202a; font-size: 13px; text-decoration: underline; }
+.artifact-link:hover { color: #0b5cad; }
 .composer { display: flex; gap: 12px; align-items: flex-end; }
 .composer textarea { flex: 1; resize: vertical; min-width: 0; border: 1px solid #b9c3cc; padding: 12px; font: inherit; }
 .empty-state { max-width: 560px; padding: 32px 0; }

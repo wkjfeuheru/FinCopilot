@@ -18,6 +18,7 @@ from finharness.data.adapters.akshare_adapter import AkShareAdapter
 from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
+from finharness.engine.prompt import system_prompt
 from finharness.provider.openai_compat import OpenAICompatProvider
 from finharness.tools.registry import ToolRegistry
 
@@ -25,10 +26,8 @@ pytestmark = pytest.mark.smoke
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-chat"
-SYSTEM_PROMPT = (
-    "You are FinHarness, a financial research copilot. "
-    "Use the provided tools to fetch factual market data before answering."
-)
+# Exercise the shipped prompt so the asset itself is under test.
+SYSTEM_PROMPT = system_prompt()
 
 
 def _api_key() -> str:

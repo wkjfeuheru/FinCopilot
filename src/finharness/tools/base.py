@@ -24,6 +24,10 @@ MAX_RENDER_ROWS = 20
 MAX_RENDER_COLS = 12
 TRIM_NOTE = "（完整数据见缓存 parquet，可用 read_file 精读）"
 
+# Shared token counter: building one re-resolves the vocabulary, so a module-level
+# instance keeps render-time counting cheap.
+_SHARED_COUNTER = None
+
 
 class PermissionLevel(str, Enum):
     READ = "read"
@@ -91,7 +95,14 @@ class BaseTool(ABC):
             content, sources = self.render(raw)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(content="", ok=False, error=_render_message(exc))
-        return ToolResult(content=content, ok=True, sources=list(sources or []))
+        # ``raw.paths`` are files the tool produced (charts, reports); they ride
+        # on the result as attachments so the transport can offer them.
+        return ToolResult(
+            content=content,
+            ok=True,
+            sources=list(sources or []),
+            attachments=[str(path) for path in (raw.paths or [])],
+        )
 
     def _validate(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         if self.input_model is BaseModel:
@@ -107,15 +118,59 @@ class BaseTool(ABC):
         return text, ([] if raw.df is None else [raw])
 
     def trim_dataframe(self, df: pd.DataFrame | None) -> str:
-        """Render a bounded markdown view; the parquet holds the full frame."""
+        """Render a bounded markdown view; the parquet holds the full frame.
+
+        The row budget alone cannot bound the size: wide frames (financial
+        statements have dozens of columns) blow through a token budget with only
+        a few rows, so columns are dropped too until the render fits
+        ``context.max_result_tokens``.
+        """
         if df is None or not len(df):
             return "（无数据）"
-        view = df.head(MAX_RENDER_ROWS)
-        if len(view.columns) > MAX_RENDER_COLS:
-            view = view.iloc[:, :MAX_RENDER_COLS]
-        body = view.to_markdown(index=False)
-        truncated = len(df) > MAX_RENDER_ROWS or len(df.columns) > MAX_RENDER_COLS
-        return body + ("\n" + TRIM_NOTE if truncated else "")
+        max_rows = self._max_rows()
+        budget = self._result_token_budget()
+        view = df.head(max_rows)
+        columns = min(len(view.columns), MAX_RENDER_COLS)
+        body = ""
+        while columns >= 1:
+            candidate = view.iloc[:, :columns].to_markdown(index=False)
+            body = candidate
+            if self._count_tokens(candidate) <= budget:
+                break
+            columns -= 1
+        truncated = (
+            len(df) > max_rows
+            or len(df.columns) > columns
+            or len(df.columns) > MAX_RENDER_COLS
+        )
+        note = TRIM_NOTE if truncated else ""
+        return body + ("\n" + note if note else "")
+
+    def _result_token_budget(self) -> int:
+        settings = getattr(self.data, "settings", None)
+        if settings is None:
+            return 0  # no budget known: keep the rendered frame as-is
+        return int(settings.context.max_result_tokens)
+
+    @staticmethod
+    def _count_tokens(text: str) -> int:
+        """Count with the shared counter; counting must never break rendering."""
+        global _SHARED_COUNTER
+        try:
+            if _SHARED_COUNTER is None:
+                from finharness.context.tokens import TokenCounter
+
+                _SHARED_COUNTER = TokenCounter()
+            return _SHARED_COUNTER.count(text).tokens
+        except Exception:  # noqa: BLE001
+            return int(len(text) / 1.7)
+
+    def _max_rows(self) -> int:
+        """Row budget from settings.context.trim_rows, falling back to the default."""
+        settings = getattr(self.data, "settings", None)
+        if settings is None:
+            return MAX_RENDER_ROWS
+        return int(settings.context.trim_rows)
 
 
 def _validation_message(exc: ValidationError) -> str:

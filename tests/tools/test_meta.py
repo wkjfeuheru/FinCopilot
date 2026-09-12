@@ -13,12 +13,12 @@ from finharness.tools.meta.skills import (
     ListSkillsTool,
     LoadSkillTool,
     SkillError,
-    SkillLibrary,
+    SkillRegistry,
 )
 
 
-def packaged_skills() -> SkillLibrary:
-    return SkillLibrary(Settings().paths.skills_dir)
+def packaged_skills() -> SkillRegistry:
+    return SkillRegistry(Settings().paths.skills_dir)
 
 
 def test_packaged_catalogue_lists_both_sample_skills():
@@ -38,11 +38,12 @@ def test_list_skills_reads_frontmatter_only():
 
 
 def test_load_returns_body_markdown():
-    meta, body = packaged_skills().load("dupont-analysis")
+    meta, body, record = packaged_skills().load("dupont-analysis")
 
     assert meta.name == "dupont-analysis"
     assert "杜邦" in body
     assert body.startswith("#")
+    assert record.reused is False
 
 
 def test_unknown_skill_raises():
@@ -51,7 +52,7 @@ def test_unknown_skill_raises():
 
 
 def test_missing_directory_yields_an_empty_catalogue(tmp_path):
-    library = SkillLibrary(tmp_path / "nope")
+    library = SkillRegistry(tmp_path / "nope")
 
     assert library.list_skills() == []
     assert "为空" in library.describe()

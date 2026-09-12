@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from finharness.config.settings import Settings
+from finharness.context.compaction import AutoCompactor, CompactionResult
+from finharness.context.memory.working import WorkingMemory
 from finharness.context.session import ResearchContext
+from finharness.data.cache import make_lookup_key
 from finharness.data.citation import CitationRegistry, fingerprint_frame
 from finharness.engine.cost import SessionStats
 from finharness.engine.retry import RetryPolicy, stream_with_retry
@@ -26,6 +30,29 @@ from finharness.types import (
     ToolResult,
     ToolUse,
 )
+
+
+class _CompactionMarker:
+    """Stand-in tool for audit records that describe a compaction."""
+
+    name = "context_compaction"
+
+
+@dataclass(slots=True)
+class RepeatVerdict:
+    """Outcome of a repeat check for one tool call."""
+
+    count: int
+    escalate: bool
+    message: str
+
+
+class LoopDetected(RuntimeError):
+    """Raised when the same tool call repeats beyond the allowed threshold."""
+
+    def __init__(self, message: str, *, tool: str = "") -> None:
+        super().__init__(message)
+        self.tool = tool
 
 
 class AgentLoop:
@@ -49,6 +76,7 @@ class AgentLoop:
         gate: Any | None = None,
         hooks: HookChain | None = None,
         interactive: Any | None = None,
+        counter: Any | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -64,9 +92,23 @@ class AgentLoop:
         self.gate = gate if gate is not None else ReadOnlyGate()
         self.hooks = hooks if hooks is not None else HookChain()
         self.interactive = interactive
-        self.messages: list[Msg] = []
+        # L1 memory owns the transcript and its accounting; the loop orchestrates.
+        # A counter may be injected so callers can share one vocabulary cache.
+        self.memory = WorkingMemory(ctx=self.ctx, settings=settings, counter=counter)
+        # Let ctx.append_user/append_tool_result forward here (docs 03.6.2).
+        self.ctx.memory = self.memory
         self.usage = ModelUsage()
         self.turn = 0
+        self.compactions: list[CompactionResult] = []
+        # Loop guard state, reset per run: an identical (tool, args) call repeated
+        # past the threshold stops adding information, so it is refused.
+        self._call_counts: dict[str, int] = {}
+        self._reminded: set[str] = set()
+
+    @property
+    def messages(self) -> list[Msg]:
+        """Read-only view of the transcript (kept for callers and tests)."""
+        return self.memory.snapshot()
 
     async def _emit(self, kind: str, data: dict[str, Any]) -> None:
         if self.output is not None:
@@ -75,6 +117,124 @@ class AgentLoop:
     def _system_prompt(self) -> str:
         """Base prompt plus the session's research state (docs 03.6.2)."""
         return self.system + self.ctx.state_block()
+
+    async def _maybe_compact(self) -> None:
+        """Fold history when the next request would exceed the window budget."""
+        compactor = AutoCompactor(
+            provider=self.provider,
+            memory=self.memory,
+            settings=self.settings,
+            system=self._system_prompt(),
+            tools=self.registry.schemas(),
+        )
+        if not compactor.needs_compaction():
+            return
+        result = await compactor.compact()
+        if not result.compacted and result.warning is None:
+            return
+        self.compactions.append(result)
+        await self._emit(
+            "context_compacted",
+            {
+                "removed": result.removed,
+                "before_tokens": result.before_tokens,
+                "after_tokens": result.after_tokens,
+                "degraded": result.degraded,
+                "warning": result.warning,
+                "duration_ms": result.duration_ms,
+            },
+        )
+        # Compaction must appear in the audit trail (docs 4.3, action=compact).
+        if self.hooks.hooks:
+            try:
+                await self.hooks.post(
+                    _CompactionMarker(), {}, ToolResult(content="", ok=True),
+                    action="compact", verdict="allow",
+                    duration_ms=result.duration_ms, turn=self.turn,
+                )
+            except Exception:  # noqa: BLE001 - auditing is best-effort
+                pass
+
+    async def _audit_detection(self, detected: LoopDetected) -> None:
+        """Record the abort in the audit trail (best-effort, never fatal)."""
+        if not self.hooks.hooks:
+            return
+        try:
+            await self.hooks.post(
+                _CompactionMarker(), {"tool": detected.tool},
+                ToolResult(content="", ok=False, error=str(detected)),
+                action="loop_detected", verdict="abort", turn=self.turn,
+            )
+        except Exception:  # noqa: BLE001 - auditing is best-effort
+            pass
+
+    def _window_tokens(self) -> int:
+        return self.memory.request_tokens(
+            system=self._system_prompt(), tools=self.registry.schemas()
+        )
+
+    # -- loop guard -----------------------------------------------------------
+    def _call_fingerprint(self, tool_use: ToolUse) -> str:
+        """Stable identity for a (tool, args) pair; same key means same result.
+
+        Reuses the cache's key builder so argument normalisation (sorting,
+        JSON-safe rendering) matches how the data layer already treats calls.
+        """
+        return make_lookup_key(kind=tool_use.name, params=dict(tool_use.args or {}))
+
+    def _check_repeat(self, tool_use: ToolUse) -> RepeatVerdict | None:
+        """Count a call and decide whether to nudge or escalate.
+
+        Counting is cumulative for the whole run: an A/B/A/B pattern is a loop
+        too, and a repeated identical call is never informative because its
+        result is already available.
+        """
+        limit = self.settings.context.max_identical_tool_calls
+        key = self._call_fingerprint(tool_use)
+        self._call_counts[key] = self._call_counts.get(key, 0) + 1
+        count = self._call_counts[key]
+        if count < limit:
+            return None
+
+        complex_task = self.ctx.plan is not None
+        if key not in self._reminded:
+            # First offence: nudge and let the model correct itself.
+            self._reminded.add(key)
+            if complex_task:
+                message = (
+                    f"相同参数的 {tool_use.name} 已调用 {count} 次，结果已在上文。"
+                    "若当前方向行不通，请用 research_plan 修订计划后继续，不要重复取数。"
+                )
+            else:
+                message = (
+                    f"相同参数的 {tool_use.name} 已调用 {count} 次，结果已在上文（或对应 citation），"
+                    "请直接复用该结果作答，不要重复取数。"
+                )
+            return RepeatVerdict(count=count, escalate=False, message=message)
+
+        # Second offence on the same call shape: stop; the run cannot progress.
+        return RepeatVerdict(
+            count=count,
+            escalate=True,
+            message=f"相同参数的 {tool_use.name} 重复调用 {count} 次，已中止本轮。",
+        )
+
+    def _partial_answer(self) -> str:
+        """Summarize what the run did manage to establish before stopping."""
+        citations = self.cite.all()
+        conclusions = self.ctx.conclusions
+        lines = ["本轮已提前结束（检测到重复调用）。"]
+        if conclusions:
+            lines.append("已形成的结论：")
+            lines.extend(
+                f"- {item.text}（依据 {'、'.join(item.cids) or '无'}）"
+                for item in conclusions[-5:]
+            )
+        if citations:
+            lines.append(f"已获取 {len(citations)} 份数据，可用 citations 精读。")
+        if len(lines) == 1:
+            lines.append("尚未形成可复述的结论，未能完成该请求。")
+        return "\n".join(lines)
 
     def _done_payload(self, *, succeeded: bool, reason: str | None, tool_calls: int) -> dict[str, Any]:
         snapshot = self.stats.snapshot()
@@ -85,6 +245,10 @@ class AgentLoop:
                 "input_tokens": self.usage.input_tokens,
                 "output_tokens": self.usage.output_tokens,
             },
+            # Distinct from the cumulative usage above: this is how full the
+            # window is now, which compaction is supposed to reduce.
+            "window_tokens": self._window_tokens(),
+            "compactions": len(self.compactions),
             "tool_calls": tool_calls,
             "retry_count": snapshot.retry_count,
             "tool_duration_ms": snapshot.tool_duration_ms,
@@ -102,11 +266,16 @@ class AgentLoop:
         reason: str,
         tool_calls: int,
         error: str | None,
+        answer: str = "",
     ) -> AgentTurnOutcome:
+        """End the run unsuccessfully; ``answer`` may carry partial findings."""
         await self._emit("error", {"kind": kind, "message": message, "reason": reason})
+        if answer:
+            # The run failed, but it is not empty-handed — surface what it found.
+            await self._emit("answer", {"text": answer})
         await self._emit("done", self._done_payload(succeeded=False, reason=reason, tool_calls=tool_calls))
         return AgentTurnOutcome(
-            answer="",
+            answer=answer,
             succeeded=False,
             usage=self.usage,
             error=error,
@@ -119,18 +288,26 @@ class AgentLoop:
 
     async def run(self, user_msg: str) -> AgentTurnOutcome:
         if user_msg:
-            self.messages.append(Msg.user(user_msg))
+            self.memory.append_user(user_msg)
+
+        # Per-run state: the turn budget is per request, so counters reset with it.
+        self.turn = 0
+        self._call_counts = {}
+        self._reminded = set()
 
         tool_calls_total = 0
         for _ in range(self.settings.context.max_turns):
             self.turn += 1
+            # Window maintenance happens between turns, never mid-request, and
+            # must not stop the conversation if summarising fails.
+            await self._maybe_compact()
             deltas: list[str] = []
             tool_uses: list[ToolUse] = []
             try:
                 async for chunk in stream_with_retry(
                     lambda: self.provider.stream(
                         system=self._system_prompt(),
-                        messages=self.messages,
+                        messages=self.memory.snapshot(),
                         tools=self.registry.schemas(),
                         usage=self.usage,
                     ),
@@ -154,15 +331,34 @@ class AgentLoop:
                 )
 
             if tool_uses:
-                self.messages.append(Msg(role="assistant", content=None, tool_uses=tool_uses))
+                self.memory.append_assistant(Msg(role="assistant", content=None, tool_uses=tool_uses))
                 try:
                     results = list(
                         await asyncio.gather(*(self._execute_one(tool_use) for tool_use in tool_uses))
                     )
+                except LoopDetected as detected:
+                    # Pair every call so the transcript stays well-formed, then
+                    # end the run with whatever was already established.
+                    self.memory.append(
+                        Msg(
+                            role="tool_result",
+                            content=None,
+                            tool_results=self._aborted_results(tool_uses),
+                        )
+                    )
+                    await self._audit_detection(detected)
+                    return await self._fail(
+                        kind="loop_detected",
+                        message=str(detected),
+                        reason="loop_detected",
+                        tool_calls=tool_calls_total,
+                        error=str(detected),
+                        answer=self._partial_answer(),
+                    )
                 except BaseException:
                     # An aborted round must not leave the assistant frame without the
                     # paired tool messages, or the next request is malformed.
-                    self.messages.append(
+                    self.memory.append(
                         Msg(
                             role="tool_result",
                             content=None,
@@ -170,7 +366,7 @@ class AgentLoop:
                         )
                     )
                     raise
-                self.messages.append(Msg(role="tool_result", content=None, tool_results=results))
+                self.memory.append(Msg(role="tool_result", content=None, tool_results=results))
                 tool_calls_total += len(results)
                 continue
 
@@ -181,7 +377,7 @@ class AgentLoop:
             await self._emit(
                 "done", self._done_payload(succeeded=True, reason=None, tool_calls=tool_calls_total)
             )
-            self.messages.append(Msg(role="assistant", content=answer))
+            self.memory.append_assistant(Msg(role="assistant", content=answer))
             return AgentTurnOutcome(
                 answer=answer,
                 usage=self.usage,
@@ -200,12 +396,27 @@ class AgentLoop:
         )
 
     def _truncate(self, content: str) -> str:
+        """Cap one tool result at ``context.max_result_tokens`` tokens.
+
+        The setting is named in tokens, so the cut is made on a real count rather
+        than a character length (a character limit would let Chinese text run
+        roughly twice the intended budget).
+        """
         limit = self.settings.context.max_result_tokens
-        if len(content) <= limit:
+        if self.memory.counter.count(content).tokens <= limit:
             return content
-        if limit <= len(self.TRUNCATION_MARKER):
-            return content[:limit]
-        return content[: limit - len(self.TRUNCATION_MARKER)] + self.TRUNCATION_MARKER
+        # Binary-search the longest prefix within budget; the count is monotone.
+        low, high = 0, len(content)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self.memory.counter.count(content[:middle]).tokens <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        prefix = content[:low]
+        if limit <= 4:  # no room for the marker
+            return prefix
+        return prefix.rstrip() + self.TRUNCATION_MARKER
 
     def _encode(self, result: ToolResult) -> str:
         payload: dict[str, Any] = {
@@ -257,6 +468,31 @@ class AgentLoop:
         tool = self.registry.resolve(tool_use.name)
         if tool is None:
             return await self._reject(tool_use, f"unknown tool: {tool_use.name}")
+
+        # Loop guard: an identical call past the threshold cannot add information
+        # (its result is already in the transcript and in the cache), so it is
+        # refused with a nudge instead of being executed again.
+        guard = self._check_repeat(tool_use)
+        if guard is not None:
+            await self._emit(
+                "loop_guard",
+                {
+                    "call_id": tool_use.call_id,
+                    "name": tool_use.name,
+                    "count": guard.count,
+                    "action": "refused" if not guard.escalate else "would_abort",
+                },
+            )
+            if guard.escalate:
+                # Second offence for this call shape: stop the run rather than
+                # keep paying for a turn that cannot progress.
+                raise LoopDetected(
+                    f"tool {tool_use.name} repeated with identical arguments "
+                    f"{guard.count} times"
+                )
+            return tool_use.call_id, json.dumps(
+                {"ok": False, "content": "", "error": guard.message}, ensure_ascii=False
+            )
 
         # Governance chain (docs 03.3.3): permission verdict, then pre-hooks.
         decision = await self.gate.check(tool, tool_use.args)
@@ -315,6 +551,9 @@ class AgentLoop:
                 "ok": bool(result.ok),
                 "duration_ms": duration_ms,
                 "citations": list(result.citations),
+                # Produced files (charts, reports) ride along so the client can
+                # offer them without a second lookup.
+                "attachments": list(result.attachments),
             },
         )
         return tool_use.call_id, self._encode(result)

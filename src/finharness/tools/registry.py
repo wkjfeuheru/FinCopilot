@@ -7,12 +7,14 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from finharness.context.trim import DEFAULT_MAX_DESC_LEN, trim_schema
 from finharness.data.access import DataAccess
 from finharness.tools.base import BaseTool, PermissionLevel
 
 # Tool classes are registered through a loader so the module stays importable
 # while the catalogue grows.
 from finharness.tools.fin.announcements import GetAnnouncementsTool
+from finharness.tools.fin.chart import MakeChartTool
 from finharness.tools.fin.financials import GetFinancialsTool
 from finharness.tools.fin.indicators import GetIndicatorsTool
 from finharness.tools.fin.kline import GetKlineTool
@@ -21,19 +23,21 @@ from finharness.tools.fin.news import GetMarketNewsTool
 from finharness.tools.fin.peers import GetPeersTool
 from finharness.tools.fin.quote import GetQuoteTool
 from finharness.tools.fin.valuation import GetValuationTool
+from finharness.tools.fin.valuation_calc import CalcValuationTool
+from finharness.tools.fin.writer import WriteReportTool
 from finharness.tools.generic.files import ReadFileTool, WriteFileTool
 from finharness.tools.meta.ask import AskUserTool
 from finharness.tools.meta.discovery import LoadToolTool, SearchToolsTool
 from finharness.tools.meta.plan import ResearchPlanTool
 from finharness.tools.meta.skills import ListSkillsTool, LoadSkillTool
 
-# docs 03.4.1 权威口径：resident=20、lazy=4。Tools not listed anywhere default
-# to resident so a newly added tool is reachable without extra wiring.
+# docs 03.4.1 权威口径：resident=20、lazy=4。Every name here must resolve to a
+# registered class — a lazy entry without an implementation would be listed by
+# lazy_names() while being unreachable, so run_backtest / read_pdf are omitted
+# until their tools exist.
 DEFAULT_LAZY_TOOLS: tuple[str, ...] = (
     "get_announcements",
     "calc_valuation",
-    "run_backtest",
-    "read_pdf",
 )
 
 ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
@@ -48,6 +52,10 @@ ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
     GetAnnouncementsTool,
     # 金融-计算
     CalcMetricsTool,
+    CalcValuationTool,
+    # 金融-输出
+    MakeChartTool,
+    WriteReportTool,
     # 通用
     ReadFileTool,
     WriteFileTool,
@@ -86,6 +94,7 @@ class ToolRegistry:
     """Instantiates every tool but only exposes resident schemas by default."""
 
     def __init__(self, data: DataAccess, *, ctx: Any | None = None, settings: Any | None = None) -> None:
+        self.settings = settings
         self.tools: dict[str, BaseTool] = {
             tool_cls.name: tool_cls(data, ctx=ctx) for tool_cls in ALL_TOOL_CLASSES
         }
@@ -136,21 +145,35 @@ class ToolRegistry:
         """OpenAI-style schemas for the injected set (registry order).
 
         ``names`` defaults to the active set, so lazy tools stay hidden until
-        the round after activation.
+        the round after activation. Descriptions are trimmed to the configured
+        budget because every resident schema is re-sent on every request
+        (docs 3.6.1).
         """
         selected = self._active if names is None else names
+        budget = self._desc_budget()
         return [
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": self._describe(tool),
-                    "parameters": build_parameters(tool.input_model),
+            trim_schema(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": self._describe(tool),
+                        "parameters": build_parameters(tool.input_model),
+                    },
                 },
-            }
+                max_desc_len=budget,
+            )
             for name, tool in self.tools.items()
             if name in selected
         ]
+
+    def _desc_budget(self) -> int:
+        """Per-description character budget derived from the token setting."""
+        if self.settings is None:
+            return DEFAULT_MAX_DESC_LEN
+        # Tokens -> characters using the documented Chinese approximation, so the
+        # setting stays expressed in the unit the docs use.
+        return max(int(self.settings.context.max_tool_schema_tokens * 1.7), 20)
 
     # -- search ---------------------------------------------------------------
     def search(self, query: str, *, limit: int = 5) -> list[ToolBrief]:

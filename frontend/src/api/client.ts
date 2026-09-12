@@ -45,3 +45,8 @@ export async function respondChat(requestId: string, response: string): Promise<
     throw new Error((await reply.text()) || `Request failed: ${reply.status}`);
   }
 }
+
+/** URL for downloading a produced artefact (report, chart). */
+export function artifactUrl(path: string): string {
+  return `/v1/artifacts?path=${encodeURIComponent(path)}`;
+}

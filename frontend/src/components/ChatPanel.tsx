@@ -1,6 +1,6 @@
 import { FormEvent, useRef, useState } from "react";
 import { Button, Empty } from "antd";
-import { respondChat, streamChat } from "../api/client";
+import { artifactUrl, respondChat, streamChat } from "../api/client";
 import { Interaction, InteractionPrompt } from "./InteractionPrompt";
 import { Message, MessageList } from "./MessageList";
 import { ToolStatus } from "./ToolStatus";
@@ -12,13 +12,35 @@ type Props = {
   onOpenSettings: () => void;
 };
 
+/** A file the engine produced (chart, report) that the user can download. */
+type Artifact = { path: string; name: string };
+
+function fileName(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
 export function ChatPanel({ sessionId, onSession, configured, onOpenSettings }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [interaction, setInteraction] = useState<Interaction | null>(null);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  function rememberArtifacts(raw: unknown) {
+    const paths = (raw as string[] | undefined) ?? [];
+    if (paths.length === 0) return;
+    setArtifacts((current) => {
+      const seen = new Set(current.map((item) => item.path));
+      const added = paths
+        .filter((path) => !seen.has(path))
+        .map((path) => ({ path, name: fileName(path) }));
+      return added.length ? [...current, ...added] : current;
+    });
+  }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -29,10 +51,32 @@ export function ChatPanel({ sessionId, onSession, configured, onOpenSettings }: 
     setBusy(true);
     const controller = new AbortController();
     abortRef.current = controller;
+    setNotice(null);
     try {
       await streamChat(message, sessionId, (event) => {
         if (event.event === "session") onSession(String(event.data.session_id));
-        if (event.event === "tool_status") setStatus(`${String(event.data.name ?? "tool")} ${String(event.data.status ?? "")}`);
+        if (event.event === "tool_status") {
+          setStatus(`${String(event.data.name ?? "tool")} ${String(event.data.status ?? "")}`);
+          rememberArtifacts(event.data.attachments);
+        }
+        // Engine notices the UI should not swallow: window compaction and the
+        // loop guard both change what the user is looking at.
+        if (event.event === "context_compacted") {
+          const before = Number(event.data.before_tokens ?? 0);
+          const after = Number(event.data.after_tokens ?? 0);
+          const degraded = Boolean(event.data.degraded);
+          setNotice(
+            `上下文已达上限，已压缩历史（${before} → ${after} tokens）${degraded ? "，摘要降级" : ""}`,
+          );
+        }
+        if (event.event === "loop_guard") {
+          const action = String(event.data.action ?? "refused");
+          setNotice(
+            action === "would_abort"
+              ? `检测到重复调用，已终止本轮：${String(event.data.name ?? "")}`
+              : `检测到重复调用，已跳过并提示模型改用已有结果：${String(event.data.name ?? "")}`,
+          );
+        }
         if (event.event === "interactive_request") {
           // The engine is paused awaiting an answer; surface the dialog.
           setInteraction({
@@ -89,6 +133,17 @@ export function ChatPanel({ sessionId, onSession, configured, onOpenSettings }: 
         </Empty>
       )}
       <MessageList messages={messages} />
+      {notice && <div className="engine-notice">{notice}</div>}
+      {artifacts.length > 0 && (
+        <div className="artifact-list" aria-label="产出文件">
+          <span className="artifact-title">产出文件</span>
+          {artifacts.map((item) => (
+            <a key={item.path} className="artifact-link" href={artifactUrl(item.path)} download>
+              {item.name}
+            </a>
+          ))}
+        </div>
+      )}
       <ToolStatus status={status} />
       <form className="composer" onSubmit={submit}>
         <textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder="输入研究问题" rows={3} disabled={busy} />
