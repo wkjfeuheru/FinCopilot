@@ -287,7 +287,6 @@ def test_final_turn_emits_deltas_then_answer_then_done():
     assert done["succeeded"] is True
     assert done["reason"] is None
     assert done["usage"] == {"input_tokens": 1, "output_tokens": 2}
-    assert done["cost_cny"] == 0.0
     assert done["tool_calls"] == 0
     assert [message.role for message in messages] == ["user", "assistant"]
     assert messages[1].content == "hello world"

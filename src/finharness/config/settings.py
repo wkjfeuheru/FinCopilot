@@ -45,11 +45,6 @@ class ModelSettings(FrozenModel):
     thinking: ThinkingSettings = Field(default_factory=ThinkingSettings)
 
 
-class CostSettings(FrozenModel):
-    input: NonNegativeFloat = 0.0
-    output: NonNegativeFloat = 0.0
-
-
 class ProviderSettings(FrozenModel):
     kind: ProviderKind = "openai_compat"
     base_url: str | None = None
@@ -57,7 +52,6 @@ class ProviderSettings(FrozenModel):
     api_version: str | None = None
     first_byte_timeout_s: Annotated[float, Field(gt=0)] = 30.0
     idle_timeout_s: Annotated[float, Field(gt=0)] = 60.0
-    cost_per_1m: CostSettings = Field(default_factory=CostSettings)
 
     @model_validator(mode="after")
     def validate_endpoint_contract(self) -> "ProviderSettings":
@@ -168,19 +162,16 @@ def _default_providers() -> dict[str, ProviderSettings]:
             kind="openai_compat",
             base_url="https://api.deepseek.com/v1",
             env_key="DEEPSEEK_API_KEY",
-            cost_per_1m=CostSettings(input=1.0, output=2.0),
         ),
         "kimi": ProviderSettings(
             kind="anthropic_compat",
             base_url="https://api.moonshot.cn/anthropic/v1",
             env_key="MOONSHOT_API_KEY",
-            cost_per_1m=CostSettings(input=2.0, output=12.0),
         ),
         "glm": ProviderSettings(
             kind="anthropic_compat",
             base_url="https://open.bigmodel.cn/api/anthropic/v1",
             env_key="ZHIPU_API_KEY",
-            cost_per_1m=CostSettings(input=1.0, output=4.0),
         ),
         "volcano": ProviderSettings(
             kind="openai_compat",
@@ -481,14 +472,6 @@ for _provider_name in ("DEEPSEEK", "KIMI", "GLM", "VOLCANO", "QWEN", "FAKE"):
             ),
             f"FINH_PROVIDERS_{_provider_name}_IDLE_TIMEOUT_S": (
                 ("providers", _provider_key, "idle_timeout_s"),
-                float,
-            ),
-            f"FINH_PROVIDERS_{_provider_name}_COST_PER_1M_INPUT": (
-                ("providers", _provider_key, "cost_per_1m", "input"),
-                float,
-            ),
-            f"FINH_PROVIDERS_{_provider_name}_COST_PER_1M_OUTPUT": (
-                ("providers", _provider_key, "cost_per_1m", "output"),
                 float,
             ),
         }

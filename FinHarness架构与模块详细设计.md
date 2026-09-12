@@ -204,10 +204,9 @@ class StreamChunk:
 
 @dataclass(slots=True)
 class ModelUsage:
-    """单轮 usage 与成本（Provider 归一化后）"""
+    """单轮 usage（Provider 归一化后）"""
     input_tokens: int = 0
     output_tokens: int = 0
-    cost_cny: float = 0.0   # 按 settings.cost 表折算
 
 @dataclass(slots=True)
 class EngineEvent:

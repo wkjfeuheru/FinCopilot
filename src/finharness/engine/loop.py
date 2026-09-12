@@ -69,7 +69,6 @@ class AgentLoop:
                 "input_tokens": self.usage.input_tokens,
                 "output_tokens": self.usage.output_tokens,
             },
-            "cost_cny": 0.0,
             "tool_calls": tool_calls,
             "retry_count": snapshot.retry_count,
             "tool_duration_ms": snapshot.tool_duration_ms,

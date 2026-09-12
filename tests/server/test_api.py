@@ -201,7 +201,6 @@ def test_done_event_carries_the_session_id_and_usage() -> None:
     assert done[1]["session_id"] == session_id_from(response.text)
     assert done[1]["succeeded"] is True
     assert done[1]["usage"] == {"input_tokens": 1, "output_tokens": 1}
-    assert done[1]["cost_cny"] == 0.0
     assert done[1]["tool_calls"] == 0
 
 

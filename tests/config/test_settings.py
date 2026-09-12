@@ -19,7 +19,7 @@ def test_settings_defaults_include_complete_contract(tmp_path):
     assert settings.model.provider == "deepseek"
     assert settings.model.model_name == "deepseek-chat"
     assert settings.model.thinking.enabled is True
-    assert settings.providers["deepseek"].cost_per_1m.input == 1.0
+    assert settings.providers["deepseek"].kind == "openai_compat"
     assert settings.permission.default_mode == "default"
     assert settings.tools.timeout_default_s == 30
     assert settings.data.adapter_order == ("akshare", "tushare", "baostock")
@@ -112,12 +112,14 @@ def test_default_relative_paths_use_the_configuration_file_parent(tmp_path):
     assert settings.paths.memory_db == (tmp_path / "data_cache" / "memory.db").resolve()
 
 
-def test_provider_overrides_deep_merge_cost_defaults(tmp_path):
+def test_provider_overrides_deep_merge_preset_defaults(tmp_path):
     settings = Settings.from_file(write_settings(tmp_path, {"providers": {"deepseek": {"env_key": "ALT_KEY"}}}))
 
     assert settings.providers["deepseek"].env_key == "ALT_KEY"
-    assert settings.providers["deepseek"].cost_per_1m.input == 1.0
-    assert settings.providers["deepseek"].cost_per_1m.output == 2.0
+    # Untouched preset fields survive the merge.
+    assert settings.providers["deepseek"].kind == "openai_compat"
+    assert settings.providers["deepseek"].base_url == "https://api.deepseek.com/v1"
+    assert settings.providers["deepseek"].idle_timeout_s == 60.0
 
 
 def test_settings_environment_overrides_scalar_and_json_fields(monkeypatch, tmp_path):

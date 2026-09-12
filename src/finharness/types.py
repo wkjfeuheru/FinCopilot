@@ -45,7 +45,6 @@ class StreamEvent(str, Enum):
 class ModelUsage:
     input_tokens: int = 0
     output_tokens: int = 0
-    cost_cny: float = 0.0
     tool_uses: list[ToolUse] = field(default_factory=list)
 
 
