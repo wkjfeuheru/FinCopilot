@@ -21,6 +21,9 @@ body { margin: 0; min-width: 320px; }
 h1, h2, p { margin-top: 0; }
 h1 { margin-bottom: 0; font-size: 24px; }
 .status-pill { padding: 6px 10px; border: 1px solid #dce2e8; color: #617080; font-size: 12px; }
+.provider-chip { cursor: pointer; background: #fff; display: inline-flex; align-items: center; font: inherit; }
+.provider-chip:hover { border-color: #17202a; color: #17202a; }
+.config-empty-state { padding: 48px 0; }
 .workspace { max-width: 1120px; margin: 0 auto; padding: 56px 40px; }
 
 .session-bar { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; color: #617080; font-size: 12px; }

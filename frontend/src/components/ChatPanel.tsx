@@ -1,11 +1,17 @@
 import { FormEvent, useRef, useState } from "react";
+import { Button, Empty } from "antd";
 import { streamChat } from "../api/client";
 import { Message, MessageList } from "./MessageList";
 import { ToolStatus } from "./ToolStatus";
 
-type Props = { sessionId: string | null; onSession: (id: string) => void };
+type Props = {
+  sessionId: string | null;
+  onSession: (id: string) => void;
+  configured: boolean;
+  onOpenSettings: () => void;
+};
 
-export function ChatPanel({ sessionId, onSession }: Props) {
+export function ChatPanel({ sessionId, onSession, configured, onOpenSettings }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -46,11 +52,21 @@ export function ChatPanel({ sessionId, onSession }: Props) {
 
   return (
     <section className="chat-panel">
+      {!configured && messages.length === 0 && (
+        <Empty
+          className="config-empty-state"
+          description="尚未配置模型供应商，配置后即可开始对话"
+        >
+          <Button type="primary" onClick={onOpenSettings}>
+            去配置供应商
+          </Button>
+        </Empty>
+      )}
       <MessageList messages={messages} />
       <ToolStatus status={status} />
       <form className="composer" onSubmit={submit}>
         <textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder="输入研究问题" rows={3} disabled={busy} />
-        <button type="submit" disabled={busy || !input.trim()}>{busy ? "处理中" : "发送"}</button>
+        <button type="submit" disabled={busy || !input.trim() || !configured}>{busy ? "处理中" : "发送"}</button>
       </form>
     </section>
   );

@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
+    "antd": "^6.6.3",
     "react": "latest",
     "react-dom": "latest"
   },

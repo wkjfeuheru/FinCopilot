@@ -335,3 +335,18 @@ def test_production_factory_runs_runtime_audit_validation(tmp_path) -> None:
 
     with pytest.raises(SettingsError, match="审计日志父目录不可写"):
         create_production_app(settings_path)
+
+
+def test_production_factory_starts_without_an_api_key(monkeypatch, tmp_path) -> None:
+    """Startup must not require credentials; the UI configures the provider later."""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({"model": {"provider": "deepseek"}, "audit": {"log_path": "audit.jsonl"}}),
+        encoding="utf-8",
+    )
+
+    app = create_production_app(settings_path)
+
+    assert app is not None
+    assert app.title == "FinHarness"

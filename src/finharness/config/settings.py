@@ -271,10 +271,10 @@ class Settings(BaseSettings):
                     f"请设置环境变量 {env_key or '<未配置 env_key>'}"
                 )
 
-    def validate_runtime(self, *, check_audit: bool = True) -> None:
+    def validate_runtime(self, *, check_audit: bool = True, require_api_key: bool = True) -> None:
         """校验启动所需外部条件，但不创建目录或访问网络。"""
 
-        self.validate(require_api_key=True)
+        self.validate(require_api_key=require_api_key)
         if not check_audit:
             return
         parent = self.audit.log_path.parent

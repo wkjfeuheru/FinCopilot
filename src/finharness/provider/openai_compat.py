@@ -31,14 +31,23 @@ def _raise_provider_error(error: Any) -> None:
 
 
 def _update_usage(final: ModelUsage, raw_usage: Any) -> None:
+    if raw_usage is None:
+        # Many OpenAI-compatible gateways send "usage": null on every delta and
+        # only fill it on the final chunk; absent usage is not an error.
+        return
     if not isinstance(raw_usage, dict):
         raise NetworkError("Provider returned invalid usage")
     values: dict[str, int] = {}
     for field in ("prompt_tokens", "completion_tokens"):
         value = raw_usage.get(field, 0)
-        if not isinstance(value, int) or isinstance(value, bool):
+        if isinstance(value, bool):
             raise NetworkError("Provider returned invalid usage token count")
-        values[field] = value
+        if isinstance(value, int):
+            values[field] = value
+        elif isinstance(value, float) and value.is_integer():
+            values[field] = int(value)
+        else:
+            raise NetworkError("Provider returned invalid usage token count")
     final.input_tokens = values["prompt_tokens"]
     final.output_tokens = values["completion_tokens"]
 

@@ -10,12 +10,16 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
+from finharness.config.store import ConfigStore
 from finharness.engine.loop import AgentLoop
 from finharness.data.access import DataAccess
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
 from finharness.provider.fake import FakeProvider
 from finharness.provider.registry import build_provider
+from finharness.provider.resolver import NotConfigured, ProviderResolver
+from finharness.server.config_api import create_config_router
 from finharness.server.sessions import SessionBusyError, SessionRegistry
 from finharness.server.sse import encode_event
 from finharness.tools.registry import ToolRegistry
@@ -41,21 +45,53 @@ class QueueSink:
         await self.queue.put(event)
 
 
-def create_app(provider=None, data_access=None, settings: Settings | None = None) -> FastAPI:
+def create_app(
+    provider=None,
+    data_access=None,
+    settings: Settings | None = None,
+    *,
+    config_store: ConfigStore | None = None,
+    resolver: ProviderResolver | None = None,
+    probe_client_factory=None,
+) -> FastAPI:
     application = FastAPI(title="FinHarness")
     settings = settings or Settings.from_file()
-    selected_provider = provider or FakeProvider([], error=RuntimeError(
-        "No provider configured. Start the production app factory with DEEPSEEK_API_KEY, or inject FakeProvider explicitly for tests."
-    ))
+
+    def store_factory() -> ConfigStore:
+        nonlocal config_store
+        if config_store is None:
+            config_store = ConfigStore(
+                settings.data.cache_dir / "config.db",
+                cipher=SecretCipher(settings.data.cache_dir / "secret.key"),
+            )
+        return config_store
+
+    if resolver is None:
+        resolver = ProviderResolver(store_factory=store_factory, settings=settings)
+
     tool_registry = ToolRegistry(data_access or DataAccess([AkShareAdapter()]))
-    registry = SessionRegistry(
-        lambda: AgentLoop(
-            provider=selected_provider,
+    fallback_provider = provider
+
+    def loop_factory() -> AgentLoop:
+        if fallback_provider is not None:
+            selected = fallback_provider
+        else:
+            selected = resolver.current()
+        return AgentLoop(
+            provider=selected,
             registry=tool_registry,
             settings=settings,
             system=DEFAULT_SYSTEM_PROMPT,
-        ),
-        ttl_s=settings.server.session_ttl_s,
+        )
+
+    registry = SessionRegistry(loop_factory, ttl_s=settings.server.session_ttl_s)
+    application.include_router(
+        create_config_router(
+            store_factory=store_factory,
+            resolver=resolver,
+            settings=settings,
+            probe_client_factory=probe_client_factory,
+        )
     )
     frontend_dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
     if (frontend_dist / "assets").is_dir():
@@ -78,11 +114,14 @@ def create_app(provider=None, data_access=None, settings: Settings | None = None
 
     @application.post("/v1/chat/stream")
     async def chat_stream(request: ChatRequest):
+        from fastapi import HTTPException
+
         try:
             session = await registry.ensure(request.session_id)
         except SessionBusyError as exc:
-            from fastapi import HTTPException
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except NotConfigured as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         sink = QueueSink()
         session.loop.output = sink
         session.busy = True
@@ -116,9 +155,11 @@ def create_app(provider=None, data_access=None, settings: Settings | None = None
 
 
 def create_production_app(path: str | Path = "settings.json") -> FastAPI:
-    settings = Settings.from_file(path)
-    settings.validate_runtime()
-    return create_app(build_provider(settings=settings), settings=settings)
+    settings = Settings.from_file(path, require_api_key=False)
+    # The API key is resolved lazily (database config first, then environment),
+    # so startup validates structure and audit writability but not credentials.
+    settings.validate_runtime(require_api_key=False)
+    return create_app(settings=settings)
 
 
 def _event_name(kind: str) -> str:

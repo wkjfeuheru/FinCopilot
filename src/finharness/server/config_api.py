@@ -1,0 +1,316 @@
+"""HTTP routes for provider configuration management.
+
+Secrets are only ever written to the encrypted store and never echoed back:
+responses expose a ``has_key`` boolean instead of the value.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from collections.abc import Callable
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from finharness.config.settings import Settings
+from finharness.config.store import (
+    ActiveConfigDeleteError,
+    ConfigNotFound,
+    ConfigStore,
+    DuplicateConfigName,
+)
+from finharness.provider.base import Provider
+from finharness.provider.errors import ProviderError
+from finharness.provider.registry import build_provider_from_fields
+from finharness.provider.resolver import ProviderResolver
+from finharness.types import ModelUsage, Msg, StreamEvent
+
+SUPPORTED_KINDS = {"openai_compat", "anthropic_compat", "fake"}
+PROBE_TIMEOUT_S = 20.0
+_MISSING_SECRET_MESSAGE = "请填写 API Key 或提供可用的环境变量"
+
+
+class ConfigPayload(BaseModel):
+    name: str
+    kind: str
+    base_url: str | None = None
+    model: str
+    env_key: str | None = None
+    api_key: str | None = None
+    activate: bool = True
+
+
+class ProbePayload(BaseModel):
+    kind: str
+    base_url: str | None = None
+    model: str
+    env_key: str | None = None
+    api_key: str | None = None
+    config_id: int | None = None
+
+
+def _field_errors(payload: ConfigPayload | ProbePayload) -> list[dict[str, str]]:
+    errors: list[dict[str, str]] = []
+    if isinstance(payload, ConfigPayload) and not payload.name.strip():
+        errors.append({"field": "name", "message": "配置名称不能为空"})
+    if not payload.model.strip():
+        errors.append({"field": "model", "message": "模型名称不能为空"})
+    if payload.kind not in SUPPORTED_KINDS:
+        errors.append({"field": "kind", "message": f"不支持的协议类型：{payload.kind}"})
+    if payload.kind != "fake":
+        if not payload.base_url or not payload.base_url.strip():
+            errors.append({"field": "base_url", "message": "base_url 不能为空"})
+        else:
+            parsed = urlparse(payload.base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                errors.append(
+                    {"field": "base_url", "message": "base_url 必须是绝对 HTTP(S) URL"}
+                )
+    return errors
+
+
+def _missing_secret_error() -> dict[str, str]:
+    return {"field": "api_key", "message": _MISSING_SECRET_MESSAGE}
+
+
+def _resolve_secret(explicit: str | None, env_name: str | None) -> str | None:
+    """Prefer an explicitly supplied secret, then the named environment variable."""
+    if explicit:
+        return explicit
+    if env_name:
+        return os.getenv(env_name)
+    return None
+
+
+def _effective_secret(store: ConfigStore, payload, *, config_id: int | None) -> str | None:
+    """Resolve the secret for an unsaved payload, reusing a stored value if editing."""
+    secret = _resolve_secret(payload.api_key, payload.env_key)
+    if secret:
+        return secret
+    if config_id is not None and store.get(config_id) is not None:
+        return store.resolve_key(config_id)
+    return None
+
+
+def _record_payload(record, *, has_key: bool) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "name": record.name,
+        "kind": record.kind,
+        "base_url": record.base_url,
+        "model": record.model,
+        "env_key": record.env_key,
+        "is_active": record.is_active,
+        "has_key": has_key,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    }
+
+
+async def _probe(provider: Provider, *, timeout_s: float = PROBE_TIMEOUT_S) -> None:
+    """Drive one minimal streaming request and require at least one chunk."""
+    usage = ModelUsage()
+
+    async def run() -> None:
+        async for chunk in provider.stream(
+            system="You are a connectivity probe.",
+            messages=[Msg.user("ping")],
+            tools=[],
+            usage=usage,
+        ):
+            if chunk.event in {StreamEvent.TEXT_DELTA, StreamEvent.MESSAGE_END}:
+                return
+
+    async with asyncio.timeout(timeout_s):
+        await run()
+
+
+def _preset_timeouts(settings: Settings, kind: str) -> tuple[float, float]:
+    for preset in settings.providers.values():
+        if preset.kind == kind:
+            return preset.first_byte_timeout_s, preset.idle_timeout_s
+    return 30.0, 60.0
+
+
+def create_config_router(
+    *,
+    store_factory: Callable[[], ConfigStore],
+    resolver: ProviderResolver | None,
+    settings: Settings,
+    probe_client_factory: Callable[[float, float], httpx.AsyncClient] | None = None,
+) -> APIRouter:
+    router = APIRouter(prefix="/v1/config")
+
+    def store() -> ConfigStore:
+        return store_factory()
+
+    def _has_effective_key(record) -> bool:
+        if record.kind == "fake":
+            return True
+        return store().resolve_key(record.id) is not None
+
+    @router.get("/presets")
+    async def list_presets() -> dict[str, list[dict[str, Any]]]:
+        presets = [
+            {
+                "name": name,
+                "kind": preset.kind,
+                "base_url": preset.base_url,
+                "env_key": preset.env_key,
+                "has_env_key": bool(preset.env_key and os.getenv(preset.env_key)),
+            }
+            for name, preset in settings.providers.items()
+        ]
+        return {"presets": presets}
+
+    @router.get("")
+    async def get_config() -> dict[str, Any]:
+        records = store().list_configs()
+        active = store().get_active()
+        return {
+            "configured": active is not None,
+            "active_id": active.id if active is not None else None,
+            "configs": [
+                _record_payload(record, has_key=_has_effective_key(record))
+                for record in records
+            ],
+        }
+
+    @router.post("")
+    async def create_config(payload: ConfigPayload) -> dict[str, Any]:
+        errors = _field_errors(payload)
+        if errors:
+            raise HTTPException(status_code=422, detail={"errors": errors})
+        if payload.kind != "fake" and not _effective_secret(store(), payload, config_id=None):
+            raise HTTPException(status_code=422, detail={"errors": [_missing_secret_error()]})
+        try:
+            record = store().create(
+                name=payload.name.strip(),
+                kind=payload.kind,
+                base_url=payload.base_url,
+                model=payload.model.strip(),
+                env_key=payload.env_key,
+                api_key=payload.api_key,
+                activate=payload.activate,
+            )
+        except DuplicateConfigName as exc:
+            raise HTTPException(
+                status_code=409, detail={"errors": [{"field": "name", "message": str(exc)}]}
+            ) from exc
+        if resolver is not None:
+            resolver.invalidate()
+        return {"config": _record_payload(record, has_key=_has_effective_key(record))}
+
+    @router.put("/{config_id}")
+    async def update_config(config_id: int, payload: ConfigPayload) -> dict[str, Any]:
+        errors = _field_errors(payload)
+        if errors:
+            raise HTTPException(status_code=422, detail={"errors": errors})
+        if store().get(config_id) is None:
+            raise HTTPException(status_code=404, detail="配置不存在")
+        if payload.kind != "fake" and not _effective_secret(store(), payload, config_id=config_id):
+            raise HTTPException(status_code=422, detail={"errors": [_missing_secret_error()]})
+        try:
+            record = store().update(
+                config_id,
+                name=payload.name.strip(),
+                kind=payload.kind,
+                base_url=payload.base_url,
+                model=payload.model.strip(),
+                env_key=payload.env_key,
+                api_key=payload.api_key,
+            )
+        except DuplicateConfigName as exc:
+            raise HTTPException(
+                status_code=409, detail={"errors": [{"field": "name", "message": str(exc)}]}
+            ) from exc
+        if resolver is not None:
+            resolver.invalidate()
+        return {"config": _record_payload(record, has_key=_has_effective_key(record))}
+
+    @router.post("/{config_id}/activate")
+    async def activate_config(config_id: int) -> dict[str, Any]:
+        try:
+            record = store().activate(config_id)
+        except ConfigNotFound as exc:
+            raise HTTPException(status_code=404, detail="配置不存在") from exc
+        if resolver is not None:
+            resolver.invalidate()
+        return {"config": _record_payload(record, has_key=_has_effective_key(record))}
+
+    @router.delete("/{config_id}")
+    async def delete_config(config_id: int) -> dict[str, bool]:
+        try:
+            store().delete(config_id)
+        except ConfigNotFound as exc:
+            raise HTTPException(status_code=404, detail="配置不存在") from exc
+        except ActiveConfigDeleteError as exc:
+            raise HTTPException(
+                status_code=409, detail={"errors": [{"field": "config", "message": str(exc)}]}
+            ) from exc
+        if resolver is not None:
+            resolver.invalidate()
+        return {"ok": True}
+
+    @router.post("/probe")
+    async def probe_config(payload: ProbePayload) -> dict[str, Any]:
+        errors = _field_errors(payload)
+        if errors:
+            raise HTTPException(status_code=422, detail={"errors": errors})
+        if payload.kind == "fake":
+            return {"ok": True, "latency_ms": 0, "model": payload.model, "error": None}
+
+        secret = _effective_secret(store(), payload, config_id=payload.config_id)
+        if not secret:
+            return {
+                "ok": False, "latency_ms": 0, "model": payload.model, "error": _MISSING_SECRET_MESSAGE,
+            }
+
+        first_byte, idle = _preset_timeouts(settings, payload.kind)
+        if probe_client_factory is not None:
+            client = probe_client_factory(first_byte, idle)
+        else:
+            client = httpx.AsyncClient(timeout=httpx.Timeout(idle, connect=first_byte))
+        started = time.perf_counter()
+        try:
+            provider = build_provider_from_fields(
+                kind=payload.kind,
+                base_url=payload.base_url,
+                api_key=secret,
+                model=payload.model,
+                temperature=settings.model.temperature,
+                max_tokens=1,
+                first_byte_timeout_s=first_byte,
+                idle_timeout_s=idle,
+                client=client,
+            )
+            await _probe(provider)
+        except (ProviderError, TimeoutError) as exc:
+            return {
+                "ok": False,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "model": payload.model,
+                "error": str(exc) or type(exc).__name__,
+            }
+        except Exception as exc:  # noqa: BLE001 - surface any transport failure to the UI
+            return {
+                "ok": False,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "model": payload.model,
+                "error": str(exc) or type(exc).__name__,
+            }
+        finally:
+            await client.aclose()
+        return {
+            "ok": True,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "model": payload.model,
+            "error": None,
+        }
+
+    return router

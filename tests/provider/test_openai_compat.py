@@ -135,12 +135,43 @@ def test_openai_non_mapping_usage_is_network_error():
         collect_from(handler)
 
 
-def test_openai_null_usage_is_network_error():
+def test_openai_null_usage_is_ignored_and_real_usage_still_applied():
     async def handler(request: httpx.Request) -> httpx.Response:
-        return sse_response([{"choices": [{"delta": {}}], "usage": None}])
+        return sse_response([
+            {"choices": [{"delta": {"content": "你好"}}], "usage": None},
+            {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2}},
+        ])
 
-    with pytest.raises(NetworkError, match="invalid usage"):
-        collect_from(handler)
+    chunks = collect_from(handler)
+
+    assert [chunk.event for chunk in chunks] == [
+        StreamEvent.TEXT_DELTA,
+        StreamEvent.MESSAGE_END,
+    ]
+    assert chunks[-1].data.input_tokens == 3
+    assert chunks[-1].data.output_tokens == 2
+
+
+def test_openai_null_usage_without_a_real_chunk_defaults_to_zero():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response([{"choices": [{"delta": {"content": "你好"}}], "usage": None}])
+
+    chunks = collect_from(handler)
+
+    assert chunks[-1].data.input_tokens == 0
+    assert chunks[-1].data.output_tokens == 0
+
+
+def test_openai_integer_valued_float_token_counts_are_accepted():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response([
+            {"choices": [{"delta": {}}], "usage": {"prompt_tokens": 5.0, "completion_tokens": 2.0}}
+        ])
+
+    chunks = collect_from(handler)
+
+    assert chunks[-1].data.input_tokens == 5
+    assert chunks[-1].data.output_tokens == 2
 
 
 def test_openai_missing_usage_token_counts_default_to_zero():
@@ -267,16 +298,23 @@ def test_openai_retry_metadata_marks_status_and_connection_errors():
 
 
 @pytest.mark.parametrize(
-    ("header", "expected"),
+    ("retry_after", "expected"),
     [
-        (format_datetime(datetime.now(timezone.utc) + timedelta(seconds=60)), pytest.approx(60, abs=2)),
-        (format_datetime(datetime.now(timezone.utc) - timedelta(seconds=60)), 0.0),
+        (60, pytest.approx(60, abs=2)),
+        (-60, 0.0),
         ("not-a-delay", None),
         ("NaN", None),
         ("Infinity", None),
     ],
 )
-def test_openai_retry_after_supports_http_dates_and_ignores_invalid_values(header, expected):
+def test_openai_retry_after_supports_http_dates_and_ignores_invalid_values(retry_after, expected):
+    # Date headers must be formatted at run time: a collection-time stamp
+    # drifts past the assertion tolerance once the suite runs long enough.
+    if isinstance(retry_after, str):
+        header = retry_after
+    else:
+        header = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=retry_after))
+
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, headers={"Retry-After": header})
 
