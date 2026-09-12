@@ -16,6 +16,8 @@ import httpx
         ("deepseek", OpenAICompatProvider, "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"),
         ("kimi", AnthropicCompatProvider, "https://api.moonshot.cn/anthropic/v1", "MOONSHOT_API_KEY", "kimi-k2"),
         ("glm", AnthropicCompatProvider, "https://open.bigmodel.cn/api/anthropic/v1", "ZHIPU_API_KEY", "glm-4.5"),
+        ("volcano", OpenAICompatProvider, "https://ark.cn-beijing.volces.com/api/v3", "ARK_API_KEY", "doubao-seed-1.6"),
+        ("qwen", OpenAICompatProvider, "https://dashscope.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY", "qwen-plus"),
     ],
 )
 def test_build_provider_assembles_documented_presets(
@@ -95,6 +97,14 @@ def test_build_provider_rejects_missing_glm_key(monkeypatch, tmp_path):
     path.write_text(json.dumps({"model": {"provider": "glm"}}), encoding="utf-8")
     monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
     with pytest.raises(SettingsError, match="ZHIPU_API_KEY"):
+        build_provider(path)
+
+
+def test_build_provider_rejects_missing_volcano_key(monkeypatch, tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"model": {"provider": "volcano"}}), encoding="utf-8")
+    monkeypatch.delenv("ARK_API_KEY", raising=False)
+    with pytest.raises(SettingsError, match="ARK_API_KEY"):
         build_provider(path)
 
 

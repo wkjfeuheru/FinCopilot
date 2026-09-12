@@ -34,6 +34,24 @@
       "idle_timeout_s": 60.0,
       "cost_per_1m": {"input": 1.0, "output": 4.0}
     },
+    "volcano": {
+      "kind": "openai_compat",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "env_key": "ARK_API_KEY",
+      "api_version": null,
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0,
+      "cost_per_1m": {"input": 0.0, "output": 0.0}
+    },
+    "qwen": {
+      "kind": "openai_compat",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "env_key": "DASHSCOPE_API_KEY",
+      "api_version": null,
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0,
+      "cost_per_1m": {"input": 0.0, "output": 0.0}
+    },
     "fake": {
       "kind": "fake",
       "base_url": null,

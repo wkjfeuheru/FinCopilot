@@ -182,6 +182,16 @@ def _default_providers() -> dict[str, ProviderSettings]:
             env_key="ZHIPU_API_KEY",
             cost_per_1m=CostSettings(input=1.0, output=4.0),
         ),
+        "volcano": ProviderSettings(
+            kind="openai_compat",
+            base_url="https://ark.cn-beijing.volces.com/api/v3",
+            env_key="ARK_API_KEY",
+        ),
+        "qwen": ProviderSettings(
+            kind="openai_compat",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            env_key="DASHSCOPE_API_KEY",
+        ),
         "fake": ProviderSettings(kind="fake"),
     }
 
@@ -445,7 +455,7 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
 }
 
 
-for _provider_name in ("DEEPSEEK", "KIMI", "GLM", "FAKE"):
+for _provider_name in ("DEEPSEEK", "KIMI", "GLM", "VOLCANO", "QWEN", "FAKE"):
     _provider_key = _provider_name.lower()
     _ENV_FIELDS.update(
         {

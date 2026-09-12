@@ -26,12 +26,18 @@ def test_settings_defaults_include_complete_contract(tmp_path):
     assert settings.context.max_turns == 30
     assert settings.server.confirm_ttl_s == 120
     assert settings.server.allow_remote is False
-    assert set(settings.providers) >= {"deepseek", "kimi", "glm", "fake"}
+    assert set(settings.providers) >= {"deepseek", "kimi", "glm", "volcano", "qwen", "fake"}
     assert settings.providers["kimi"].kind == "anthropic_compat"
     assert settings.providers["kimi"].base_url == "https://api.moonshot.cn/anthropic/v1"
     assert settings.providers["glm"].kind == "anthropic_compat"
     assert settings.providers["glm"].base_url == "https://open.bigmodel.cn/api/anthropic/v1"
     assert settings.providers["glm"].env_key == "ZHIPU_API_KEY"
+    assert settings.providers["volcano"].kind == "openai_compat"
+    assert settings.providers["volcano"].base_url == "https://ark.cn-beijing.volces.com/api/v3"
+    assert settings.providers["volcano"].env_key == "ARK_API_KEY"
+    assert settings.providers["qwen"].kind == "openai_compat"
+    assert settings.providers["qwen"].base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert settings.providers["qwen"].env_key == "DASHSCOPE_API_KEY"
     assert settings.providers["fake"].kind == "fake"
     assert settings.providers["deepseek"].first_byte_timeout_s == 30.0
     assert settings.providers["deepseek"].idle_timeout_s == 60.0
