@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,14 @@ pytestmark = pytest.mark.smoke
 
 # Exercise the shipped prompt so the asset itself is under test.
 SYSTEM_PROMPT = system_prompt()
+
+# M5 budget envelope (docs §10). Measured on a from-scratch report request
+# against deepseek-chat: 102s wall, 300,319 total tokens (28 tool calls, and the
+# report revised twice after review). These ceilings sit above the measurement
+# with headroom, so they catch a gross regression — an unbounded revise loop, a
+# lost cache — without failing on ordinary model-to-model variance.
+REPORT_WALL_CEILING_S = 240.0
+REPORT_TOKEN_CEILING = 600_000
 
 
 def _api_key() -> str:
@@ -126,3 +135,55 @@ def test_report_request_registers_citations_for_the_appendix(tmp_path):
     assert outcome.succeeded is True, outcome.error
     # Data actually fetched during the run is what the appendix is built from.
     assert ctx.symbols, "the session should have recorded covered symbols"
+
+
+def test_report_generation_triggers_the_risk_review_sub_agent(tmp_path):
+    """M5 acceptance: a report request earns an independent risk review (docs 03.10).
+
+    The demo claim is "writing a report runs a reviewer that did not write it".
+    This asserts the observable outcome — a review file with comments and a
+    per-agent token entry — rather than the mechanism, so it stays honest if the
+    internals move.
+
+    It also enforces the M5 budget envelope: the same run must finish inside the
+    time and token ceilings. That is the point of putting the measurement here —
+    a cost regression and a review regression should both fail this one test.
+    """
+    _require_font()
+    loop, _, settings = _build(tmp_path)
+
+    assert loop.coordinator is not None, "the loop should have a risk reviewer"
+
+    async def run():
+        return await asyncio.wait_for(
+            loop.run("请研究贵州茅台(600519)的基本面并出一份研报，务必包含风险提示章节。"),
+            900,
+        )
+
+    started = time.monotonic()
+    outcome = asyncio.run(run())
+    wall_s = time.monotonic() - started
+
+    assert outcome.succeeded is True, outcome.error
+    output_dir = Path(settings.paths.output_dir)
+    reviews = list(output_dir.glob("*.review.md"))
+    assert reviews, "writing a report must produce a risk review file"
+    comments = reviews[0].read_text(encoding="utf-8")
+    # Either real comments or an explicit clean bill; an empty file is a bug.
+    assert "风险终审意见" in comments
+    assert comments.split("风险终审意见", 1)[1].strip()
+
+    # Review spend is attributed to the session under its own focus.
+    snapshot = loop.stats.snapshot()
+    assert "risk" in snapshot.per_agent
+    assert snapshot.per_agent["risk"]["runs"] >= 1
+    assert snapshot.per_agent["risk"]["input_tokens"] > 0
+
+    # M5 budget envelope.
+    total_tokens = snapshot.input_tokens + snapshot.output_tokens
+    assert wall_s < REPORT_WALL_CEILING_S, (
+        f"report took {wall_s:.0f}s, over the {REPORT_WALL_CEILING_S:.0f}s ceiling"
+    )
+    assert total_tokens < REPORT_TOKEN_CEILING, (
+        f"report spent {total_tokens} tokens, over the {REPORT_TOKEN_CEILING} ceiling"
+    )

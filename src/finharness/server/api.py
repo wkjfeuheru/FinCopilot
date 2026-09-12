@@ -57,6 +57,7 @@ class RespondRequest(BaseModel):
 class QueueSink:
     def __init__(self):
         import asyncio
+
         self.queue = asyncio.Queue()
 
     async def emit(self, event):
@@ -118,7 +119,9 @@ def create_app(
         max_age_days=settings.context.retention_days,
     )
 
-    def loop_factory(session_id: str | None = None, conversation_id: str | None = None) -> AgentLoop:
+    def loop_factory(
+        session_id: str | None = None, conversation_id: str | None = None
+    ) -> AgentLoop:
         if fallback_provider is not None:
             selected = fallback_provider
         else:
@@ -142,7 +145,9 @@ def create_app(
         gate = PermissionGate(
             settings=settings,
             confirm=lambda name, args: _ask(
-                "confirm", f"工具 {name} 将执行，入参：{summarize_args(args)}", ["y", "n"]
+                "confirm",
+                f"工具 {name} 将执行，入参：{summarize_args(args)}",
+                ["y", "n"],
             ),
         )
         loop = AgentLoop(
@@ -187,7 +192,9 @@ def create_app(
     )
     frontend_dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
     if (frontend_dist / "assets").is_dir():
-        application.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
+        application.mount(
+            "/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets"
+        )
 
     @application.get("/v1/health")
     async def health() -> dict[str, str]:
@@ -251,7 +258,9 @@ def create_app(
                         "cids": list(item.cids),
                         "ts": item.ts,
                     }
-                    for item in memory_store.load_conclusions(conversation_id, limit=limit)
+                    for item in memory_store.load_conclusions(
+                        conversation_id, limit=limit
+                    )
                 ]
                 if conversation_id
                 else []
@@ -273,8 +282,13 @@ def create_app(
             target = Path(path).resolve()
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="非法路径") from exc
-        if not any(target == root or target.is_relative_to(root) for root in allowed_roots):
-            raise HTTPException(status_code=403, detail="路径超出允许范围（仅限 output/ 与 data_cache/）")
+        if not any(
+            target == root or target.is_relative_to(root) for root in allowed_roots
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="路径超出允许范围（仅限 output/ 与 data_cache/）",
+            )
         if not target.is_file():
             raise HTTPException(status_code=404, detail="文件不存在")
         return FileResponse(target, filename=target.name)
@@ -286,29 +300,41 @@ def create_app(
         """Citations for a conversation (preferred) or a live session."""
         if conversation_id:
             registry = conversation_citations.get(conversation_id)
-            registries = [registry] if registry is not None else []
+            if registry is not None:
+                records = registry.all()
+            else:
+                # A conversation outlives the process that served it, so fall back
+                # to the persisted citations: a resumed conversation keeps showing
+                # its sources even after a server restart.
+                if memory_store.get_conversation(conversation_id) is None:
+                    raise HTTPException(status_code=404, detail="会话或对话不存在")
+                records = memory_store.load_citations(conversation_id)
         elif session_id:
-            registries = [session_citations[session_id]] if session_id in session_citations else []
+            registry = session_citations.get(session_id)
+            if registry is None:
+                raise HTTPException(status_code=404, detail="会话或对话不存在")
+            records = registry.all()
         else:
-            registries = list(session_citations.values())
-        if (conversation_id or session_id) and not registries:
-            raise HTTPException(status_code=404, detail="会话或对话不存在")
-        items: list[dict] = []
-        for registry in registries:
-            items.extend(
-                {
-                    "cid": item.cid,
-                    "tool": item.tool,
-                    "endpoint": item.endpoint,
-                    "symbol": item.symbol,
-                    "rows": item.rows,
-                    "cols": item.cols,
-                    "from_cache": item.from_cache,
-                    "ts": item.ts,
-                    "fingerprint": item.fingerprint,
-                }
+            records = [
+                item
+                for registry in session_citations.values()
                 for item in registry.all()
-            )
+            ]
+        items: list[dict] = [
+            {
+                "cid": item.cid,
+                "tool": item.tool,
+                "endpoint": item.endpoint,
+                "symbol": item.symbol,
+                "params": dict(item.params),
+                "rows": item.rows,
+                "cols": item.cols,
+                "from_cache": item.from_cache,
+                "ts": item.ts,
+                "fingerprint": item.fingerprint,
+            }
+            for item in records
+        ]
         return {"citations": items, "count": len(items)}
 
     @application.get("/v1/conversations")
@@ -361,7 +387,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="对话不存在")
         active = registry.find_by_conversation(conversation_id)
         if active is not None and active.busy:
-            raise HTTPException(status_code=409, detail="该对话正在处理中，请稍后再删除")
+            raise HTTPException(
+                status_code=409, detail="该对话正在处理中，请稍后再删除"
+            )
         memory_store.delete_conversation(conversation_id)
         conversation_citations.pop(conversation_id, None)
         for session_id, session in list(registry.sessions.items()):
@@ -391,7 +419,9 @@ def create_app(
             request.message.strip()
             or "请基于本次会话的研究内容生成一份研报，先加载 report-template 技能再成稿。"
         )
-        return await chat_stream(ChatRequest(session_id=request.session_id, message=prompt))
+        return await chat_stream(
+            ChatRequest(session_id=request.session_id, message=prompt)
+        )
 
     @application.post("/v1/chat/stream")
     async def chat_stream(request: ChatRequest):

@@ -81,6 +81,7 @@ class AgentLoop:
         counter: Any | None = None,
         conversation_id: str | None = None,
         store: Any | None = None,
+        coordinator: Any | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -91,11 +92,21 @@ class AgentLoop:
         self.stats = stats if stats is not None else SessionStats()
         self.cite = cite if cite is not None else CitationRegistry()
         self.session_id = session_id or "local"
-        self.ctx = ctx if ctx is not None else ResearchContext(cite=self.cite, settings=settings)
+        self.ctx = (
+            ctx
+            if ctx is not None
+            else ResearchContext(cite=self.cite, settings=settings)
+        )
         # Defaults keep pre-governance behaviour for callers that inject nothing.
         self.gate = gate if gate is not None else ReadOnlyGate()
         self.hooks = hooks if hooks is not None else HookChain()
         self.interactive = interactive
+        # Sub-agent coordinator (docs 03.10). Built on demand from the registry's
+        # DataAccess so a caller that injects nothing still gets risk review.
+        # Accounting is bound below, once this loop's own counters exist.
+        self.coordinator = (
+            coordinator if coordinator is not None else self._build_coordinator(counter=counter)
+        )
         # L1 memory owns the transcript and its accounting; the loop orchestrates.
         # A counter may be injected so callers can share one vocabulary cache.
         self.memory = WorkingMemory(ctx=self.ctx, settings=settings, counter=counter)
@@ -112,7 +123,8 @@ class AgentLoop:
             store=store,
             counter=self.memory.counter,
             budget_tokens=int(
-                settings.context.context_window_tokens * settings.context.summary_budget_ratio
+                settings.context.context_window_tokens
+                * settings.context.summary_budget_ratio
             ),
         )
         self.ctx.short_term = self.short_term
@@ -120,6 +132,12 @@ class AgentLoop:
         self.ctx.store = store
         self._memory_loaded = False
         self.usage = ModelUsage()
+        # Review tokens must appear in the session totals, so the coordinator is
+        # wired to the counters now that both exist. A test double may not have
+        # the binding hook, which is fine — it simply is not billed.
+        binding = getattr(self.coordinator, "bind_accounting", None)
+        if binding is not None:
+            binding(usage=self.usage, stats=self.stats)
         self.turn = 0
         self.compactions: list[CompactionResult] = []
         # Loop guard state, reset per run: an identical (tool, args) call repeated
@@ -131,6 +149,36 @@ class AgentLoop:
     def messages(self) -> list[Msg]:
         """Read-only view of the transcript (kept for callers and tests)."""
         return self.memory.snapshot()
+
+    def _build_coordinator(self, *, counter: Any | None) -> Any | None:
+        """Mint a coordinator from the registry's data access, when one is needed.
+
+        Built only when the catalogue actually contains a tool that asks for it,
+        which keeps two cases correct: a caller passing a registry double gets no
+        sub-agent machinery, and the reviewer's own narrowed registry — which has
+        no ``write_report`` — cannot recursively mint a second reviewer.
+
+        The lazy import avoids an engine→coordinator cycle at module load.
+        """
+        tools = getattr(self.registry, "tools", None)
+        if not tools or not any(
+            getattr(tool, "needs_coordinator", False) for tool in tools.values()
+        ):
+            return None
+        data = getattr(self.registry, "data", None)
+        if data is None:
+            return None
+        try:
+            from finharness.coordinator import Coordinator
+        except Exception:  # noqa: BLE001 - a missing coordinator is not fatal
+            return None
+        return Coordinator(
+            provider=self.provider,
+            data=data,
+            settings=self.settings,
+            cite=self.cite,
+            counter=counter,
+        )
 
     async def _emit(self, kind: str, data: dict[str, Any]) -> None:
         if self.output is not None:
@@ -152,7 +200,9 @@ class AgentLoop:
             return
         self._memory_loaded = True
 
-        self.store.ensure_conversation(self.conversation_id, title=_title_from(user_msg))
+        self.store.ensure_conversation(
+            self.conversation_id, title=_title_from(user_msg)
+        )
         # Transcript, so the model resumes mid-thread rather than from nothing.
         # track=False: replayed history is already stored; buffering it would
         # write it again under duplicate sequence numbers.
@@ -255,9 +305,13 @@ class AgentLoop:
         if self.hooks.hooks:
             try:
                 await self.hooks.post(
-                    _CompactionMarker(), {}, ToolResult(content="", ok=True),
-                    action="compact", verdict="allow",
-                    duration_ms=result.duration_ms, turn=self.turn,
+                    _CompactionMarker(),
+                    {},
+                    ToolResult(content="", ok=True),
+                    action="compact",
+                    verdict="allow",
+                    duration_ms=result.duration_ms,
+                    turn=self.turn,
                 )
             except Exception:  # noqa: BLE001 - auditing is best-effort
                 pass
@@ -268,9 +322,12 @@ class AgentLoop:
             return
         try:
             await self.hooks.post(
-                _CompactionMarker(), {"tool": detected.tool},
+                _CompactionMarker(),
+                {"tool": detected.tool},
                 ToolResult(content="", ok=False, error=str(detected)),
-                action="loop_detected", verdict="abort", turn=self.turn,
+                action="loop_detected",
+                verdict="abort",
+                turn=self.turn,
             )
         except Exception:  # noqa: BLE001 - auditing is best-effort
             pass
@@ -343,7 +400,9 @@ class AgentLoop:
             lines.append("尚未形成可复述的结论，未能完成该请求。")
         return "\n".join(lines)
 
-    def _done_payload(self, *, succeeded: bool, reason: str | None, tool_calls: int) -> dict[str, Any]:
+    def _done_payload(
+        self, *, succeeded: bool, reason: str | None, tool_calls: int
+    ) -> dict[str, Any]:
         snapshot = self.stats.snapshot()
         return {
             "succeeded": succeeded,
@@ -359,6 +418,9 @@ class AgentLoop:
             "tool_calls": tool_calls,
             "retry_count": snapshot.retry_count,
             "tool_duration_ms": snapshot.tool_duration_ms,
+            # Sub-agent spend, already included in ``usage`` above; this is the
+            # breakdown so a client can show where the tokens went (docs 03.10).
+            "per_agent": {name: dict(entry) for name, entry in snapshot.per_agent.items()},
             "citations": [item.cid for item in self.cite.all()],
         }
 
@@ -380,7 +442,10 @@ class AgentLoop:
         if answer:
             # The run failed, but it is not empty-handed — surface what it found.
             await self._emit("answer", {"text": answer})
-        await self._emit("done", self._done_payload(succeeded=False, reason=reason, tool_calls=tool_calls))
+        await self._emit(
+            "done",
+            self._done_payload(succeeded=False, reason=reason, tool_calls=tool_calls),
+        )
         return AgentTurnOutcome(
             answer=answer,
             succeeded=False,
@@ -435,12 +500,21 @@ class AgentLoop:
                     on_retry=lambda _error, _index, _delay: self.stats.add_retry(),
                 ):
                     if chunk.event is StreamEvent.TEXT_DELTA:
+                        # Stream each delta as it arrives so the answer appears
+                        # while it is generated, not in one burst at the end. The
+                        # buffer is still kept to assemble the final answer and the
+                        # persisted message.
                         deltas.append(chunk.data)
-                    elif chunk.event is StreamEvent.MESSAGE_END and isinstance(chunk.data, ModelUsage):
+                        await self._emit("text_delta", {"text": chunk.data})
+                    elif chunk.event is StreamEvent.MESSAGE_END and isinstance(
+                        chunk.data, ModelUsage
+                    ):
                         tool_uses = list(chunk.data.tool_uses)
                         self.usage.input_tokens += chunk.data.input_tokens
                         self.usage.output_tokens += chunk.data.output_tokens
-                        self.stats.add_usage(chunk.data.input_tokens, chunk.data.output_tokens)
+                        self.stats.add_usage(
+                            chunk.data.input_tokens, chunk.data.output_tokens
+                        )
             except Exception as exc:
                 return await self._fail(
                     kind=type(exc).__name__,
@@ -451,10 +525,20 @@ class AgentLoop:
                 )
 
             if tool_uses:
-                self.memory.append_assistant(Msg(role="assistant", content=None, tool_uses=tool_uses))
+                # This round turned out to be a tool call, so any text streamed
+                # before it was a draft, not the answer. Tell the client to drop it
+                # before the tool activity is shown; the final answer streams on a
+                # later round.
+                if deltas:
+                    await self._emit("text_reset", {})
+                self.memory.append_assistant(
+                    Msg(role="assistant", content=None, tool_uses=tool_uses)
+                )
                 try:
                     results = list(
-                        await asyncio.gather(*(self._execute_one(tool_use) for tool_use in tool_uses))
+                        await asyncio.gather(
+                            *(self._execute_one(tool_use) for tool_use in tool_uses)
+                        )
                     )
                 except LoopDetected as detected:
                     # Pair every call so the transcript stays well-formed, then
@@ -486,16 +570,19 @@ class AgentLoop:
                         )
                     )
                     raise
-                self.memory.append(Msg(role="tool_result", content=None, tool_results=results))
+                self.memory.append(
+                    Msg(role="tool_result", content=None, tool_results=results)
+                )
                 tool_calls_total += len(results)
                 continue
 
             answer = "".join(deltas)
-            for delta in deltas:
-                await self._emit("text_delta", {"text": delta})
             await self._emit("answer", {"text": answer})
             await self._emit(
-                "done", self._done_payload(succeeded=True, reason=None, tool_calls=tool_calls_total)
+                "done",
+                self._done_payload(
+                    succeeded=True, reason=None, tool_calls=tool_calls_total
+                ),
             )
             self.memory.append_assistant(Msg(role="assistant", content=answer))
             return AgentTurnOutcome(
@@ -618,10 +705,14 @@ class AgentLoop:
         decision = await self.gate.check(tool, tool_use.args)
         if decision.verdict is Verdict.DENY:
             await self._audit(tool, tool_use.args, action="denied", verdict="deny")
-            return await self._reject(tool_use, decision.reason or f"tool denied: {tool_use.name}")
+            return await self._reject(
+                tool_use, decision.reason or f"tool denied: {tool_use.name}"
+            )
         if not await self.hooks.pre(tool, tool_use.args, turn=self.turn):
             await self._audit(tool, tool_use.args, action="denied", verdict="blocked")
-            return await self._reject(tool_use, f"tool blocked by hook: {tool_use.name}")
+            return await self._reject(
+                tool_use, f"tool blocked by hook: {tool_use.name}"
+            )
 
         await self._emit(
             "tool_status",
@@ -636,30 +727,51 @@ class AgentLoop:
         started_at = self.stats.now()
         if getattr(tool, "needs_interactive", False) and self.interactive is not None:
             tool.interactive = self.interactive
+        # Same pattern for tools that spawn a sub-agent (docs 03.10): the tool
+        # cannot build one, so the loop hands over the session's coordinator.
+        if getattr(tool, "needs_coordinator", False) and self.coordinator is not None:
+            tool.coordinator = self.coordinator
         try:
             result = await asyncio.wait_for(tool.run(**tool_use.args), timeout)
         except TimeoutError:
             duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
             await self._audit(
-                tool, tool_use.args, action="run", verdict=decision.verdict.value,
-                ok=False, duration_ms=duration_ms,
+                tool,
+                tool_use.args,
+                action="run",
+                verdict=decision.verdict.value,
+                ok=False,
+                duration_ms=duration_ms,
             )
             return await self._reject(
-                tool_use, f"tool timeout after {timeout}s: {tool_use.name}", duration_ms=duration_ms
+                tool_use,
+                f"tool timeout after {timeout}s: {tool_use.name}",
+                duration_ms=duration_ms,
             )
         except Exception as exc:
             duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
             await self._audit(
-                tool, tool_use.args, action="run", verdict=decision.verdict.value,
-                ok=False, duration_ms=duration_ms,
+                tool,
+                tool_use.args,
+                action="run",
+                verdict=decision.verdict.value,
+                ok=False,
+                duration_ms=duration_ms,
             )
-            return await self._reject(tool_use, f"tool failed: {exc}", duration_ms=duration_ms)
+            return await self._reject(
+                tool_use, f"tool failed: {exc}", duration_ms=duration_ms
+            )
 
         duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
         result.citations = self._register_citations(tool_use, result)
         await self._audit(
-            tool, tool_use.args, action="run", verdict=decision.verdict.value,
-            ok=bool(result.ok), duration_ms=duration_ms, citations=result.citations,
+            tool,
+            tool_use.args,
+            action="run",
+            verdict=decision.verdict.value,
+            ok=bool(result.ok),
+            duration_ms=duration_ms,
+            citations=result.citations,
             result=result,
         )
         await self._emit(
@@ -703,10 +815,17 @@ class AgentLoop:
                 rows, cols = int(len(df)), int(len(df.columns))
         try:
             await self.hooks.post(
-                tool, args, result if result is not None else ToolResult(content="", ok=ok),
-                action=action, verdict=verdict, duration_ms=duration_ms,
-                citations=list(citations or []), turn=self.turn,
-                endpoint=endpoint, rows=rows, cols=cols,
+                tool,
+                args,
+                result if result is not None else ToolResult(content="", ok=ok),
+                action=action,
+                verdict=verdict,
+                duration_ms=duration_ms,
+                citations=list(citations or []),
+                turn=self.turn,
+                endpoint=endpoint,
+                rows=rows,
+                cols=cols,
             )
         except Exception:  # noqa: BLE001 - auditing is best-effort
             pass
@@ -714,7 +833,9 @@ class AgentLoop:
     def _register_citations(self, tool_use: ToolUse, result: ToolResult) -> list[str]:
         """Turn a tool's raw payloads into session-tracked citation ids."""
         cids: list[str] = []
-        symbol = tool_use.args.get("symbol") if isinstance(tool_use.args, dict) else None
+        symbol = (
+            tool_use.args.get("symbol") if isinstance(tool_use.args, dict) else None
+        )
         for source in getattr(result, "sources", []) or []:
             df = getattr(source, "df", None)
             citation = self.cite.register(
@@ -737,7 +858,8 @@ class AgentLoop:
             self._remember_episode(
                 kind="data",
                 subject=str(symbol),
-                summary=f"{tool_use.name} 已取数" + (f"（{len(cids)} 份）" if cids else ""),
+                summary=f"{tool_use.name} 已取数"
+                + (f"（{len(cids)} 份）" if cids else ""),
                 ref={"cids": list(cids)},
             )
         return cids

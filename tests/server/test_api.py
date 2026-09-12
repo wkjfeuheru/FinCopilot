@@ -9,7 +9,12 @@ from finharness.data.access import DataAccess, RawData
 from finharness.data.adapters.base import DataAdapter
 from finharness.provider.base import Provider
 from finharness.provider.fake import FakeProvider
-from finharness.server.api import DEFAULT_SYSTEM_PROMPT, app, create_app, create_production_app
+from finharness.server.api import (
+    DEFAULT_SYSTEM_PROMPT,
+    app,
+    create_app,
+    create_production_app,
+)
 from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
 
 
@@ -21,7 +26,9 @@ class ScriptedProvider(Provider):
         self.requests: list[list] = []
         self.systems: list[str] = []
 
-    async def stream(self, *, system: str, messages: list, tools: list[dict], usage: ModelUsage):
+    async def stream(
+        self, *, system: str, messages: list, tools: list[dict], usage: ModelUsage
+    ):
         self.requests.append(list(messages))
         self.systems.append(system)
         script = self.rounds.pop(0) if self.rounds else []
@@ -66,15 +73,23 @@ class BlockingQuoteData:
         return RawData(kind="df")
 
 
-def message_end(*tool_uses: ToolUse, input_tokens: int = 1, output_tokens: int = 1) -> StreamChunk:
+def message_end(
+    *tool_uses: ToolUse, input_tokens: int = 1, output_tokens: int = 1
+) -> StreamChunk:
     return StreamChunk(
         StreamEvent.MESSAGE_END,
-        ModelUsage(input_tokens=input_tokens, output_tokens=output_tokens, tool_uses=list(tool_uses)),
+        ModelUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            tool_uses=list(tool_uses),
+        ),
     )
 
 
 def text_round(*parts: str) -> list[StreamChunk]:
-    return [StreamChunk(StreamEvent.TEXT_DELTA, part) for part in parts] + [message_end()]
+    return [StreamChunk(StreamEvent.TEXT_DELTA, part) for part in parts] + [
+        message_end()
+    ]
 
 
 def tool_round(*tool_uses: ToolUse, draft: tuple[str, ...] = ()) -> list[StreamChunk]:
@@ -140,7 +155,10 @@ class AsgiStream:
             "path": "/v1/chat/stream",
             "raw_path": b"/v1/chat/stream",
             "query_string": b"",
-            "headers": [(b"host", b"testserver"), (b"content-type", b"application/json")],
+            "headers": [
+                (b"host", b"testserver"),
+                (b"content-type", b"application/json"),
+            ],
             "scheme": "http",
             "server": ("testserver", 80),
             "client": ("127.0.0.1", 123),
@@ -182,7 +200,10 @@ def make_client(provider=None, data_access=None, tmp_path=None) -> TestClient:
         tmp_path = Path(tempfile.mkdtemp(prefix="finharness_test_"))
     settings = Settings(
         data={"cache_dir": tmp_path / "cache"},
-        paths={"output_dir": tmp_path / "output", "memory_db": tmp_path / "cache" / "memory.db"},
+        paths={
+            "output_dir": tmp_path / "output",
+            "memory_db": tmp_path / "cache" / "memory.db",
+        },
     )
     return TestClient(create_app(provider, data_access=data_access, settings=settings))
 
@@ -286,14 +307,23 @@ def test_second_turn_reuses_session_history() -> None:
     )
 
     assert second.status_code == 200
-    assert [message.content for message in provider.requests[-1]] == ["first", "answer", "second"]
+    assert [message.content for message in provider.requests[-1]] == [
+        "first",
+        "answer",
+        "second",
+    ]
 
 
-def test_tool_call_streams_tool_status_and_never_leaks_the_model_draft() -> None:
+def test_tool_call_streams_draft_then_resets_it_and_never_leaks_it_into_the_answer() -> (
+    None
+):
     adapter = QuoteAdapter()
     provider = ScriptedProvider(
         [
-            tool_round(ToolUse("call_1", "get_quote", {"symbol": "600519"}), draft=("草稿：", "查询中")),
+            tool_round(
+                ToolUse("call_1", "get_quote", {"symbol": "600519"}),
+                draft=("草稿：", "查询中"),
+            ),
             text_round("贵州茅台最新报价 100.0"),
         ]
     )
@@ -306,8 +336,14 @@ def test_tool_call_streams_tool_status_and_never_leaks_the_model_draft() -> None
     statuses = [payload["status"] for name, payload in events if name == "tool_status"]
     streamed = "".join(payload["text"] for name, payload in events if name == "delta")
     answers = [payload["text"] for name, payload in events if name == "answer"]
+    reset_at = names.index("text_reset")
+    after_reset = "".join(
+        payload["text"] for name, payload in events[reset_at + 1 :] if name == "delta"
+    )
     assert statuses == ["started", "completed"]
-    assert "草稿" not in streamed
+    # The draft streams live, then text_reset clears it before the answer streams.
+    assert "草稿" in streamed
+    assert "草稿" not in after_reset
     assert "草稿" not in "".join(answers)
     assert answers == ["贵州茅台最新报价 100.0"]
     assert adapter.quoted == ["600519"]
@@ -326,12 +362,17 @@ def test_session_loop_receives_the_default_system_prompt() -> None:
     assert provider.systems == [DEFAULT_SYSTEM_PROMPT]
 
 
-def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session(tmp_path) -> None:
+def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session(
+    tmp_path,
+) -> None:
     async def run():
         data = BlockingQuoteData()
         provider = ScriptedProvider(
             [
-                tool_round(ToolUse("call_1", "get_quote", {"symbol": "600519"}), draft=("草稿",)),
+                tool_round(
+                    ToolUse("call_1", "get_quote", {"symbol": "600519"}),
+                    draft=("草稿",),
+                ),
                 text_round("迟到的答案"),
             ]
         )
@@ -368,7 +409,9 @@ def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session(tmp_p
     assert f'"session_id": "{session_id}"' in second.text()
     assert "event: answer" in second.text()
     follow_up = provider.requests[-1]
-    requested = {tool_use.call_id for message in follow_up for tool_use in message.tool_uses}
+    requested = {
+        tool_use.call_id for message in follow_up for tool_use in message.tool_uses
+    }
     answered = {
         call_id
         for message in follow_up
@@ -399,7 +442,9 @@ def test_production_factory_starts_without_an_api_key(monkeypatch, tmp_path) -> 
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(
-        json.dumps({"model": {"provider": "deepseek"}, "audit": {"log_path": "audit.jsonl"}}),
+        json.dumps(
+            {"model": {"provider": "deepseek"}, "audit": {"log_path": "audit.jsonl"}}
+        ),
         encoding="utf-8",
     )
 

@@ -17,6 +17,10 @@ class SessionStatsSnapshot:
     tool_calls: int = 0
     tool_duration_ms: int = 0
     per_tool: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+    # Sub-agent usage, keyed by focus (e.g. "risk"). A sub-agent's tokens are
+    # also folded into input_tokens/output_tokens above, so the total stays
+    # complete while this dimension shows where the spend went.
+    per_agent: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
 
 
 class SessionStats:
@@ -29,10 +33,25 @@ class SessionStats:
         self.tool_calls = 0
         self._clock = clock
         self._per_tool: dict[str, dict[str, int]] = {}
+        self._per_agent: dict[str, dict[str, int]] = {}
 
     def add_usage(self, input_tokens: int, output_tokens: int) -> None:
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
+
+    def record_agent_usage(self, name: str, input_tokens: int, output_tokens: int) -> None:
+        """Attribute usage to a sub-agent focus as a breakdown, not a second sum.
+
+        The totals are incremented separately via ``add_usage``; keeping the two
+        apart means a snapshot can report both "how much in total" and "how much
+        of it was the risk reviewer" without double-counting.
+        """
+        entry = self._per_agent.setdefault(
+            name, {"input_tokens": 0, "output_tokens": 0, "runs": 0}
+        )
+        entry["input_tokens"] += input_tokens
+        entry["output_tokens"] += output_tokens
+        entry["runs"] += 1
 
     def add_retry(self) -> None:
         self.retry_count += 1
@@ -62,5 +81,8 @@ class SessionStats:
             tool_duration_ms=sum(entry["duration_ms"] for entry in self._per_tool.values()),
             per_tool=MappingProxyType(
                 {name: MappingProxyType(dict(entry)) for name, entry in self._per_tool.items()}
+            ),
+            per_agent=MappingProxyType(
+                {name: MappingProxyType(dict(entry)) for name, entry in self._per_agent.items()}
             ),
         )

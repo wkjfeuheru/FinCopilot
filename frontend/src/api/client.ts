@@ -10,6 +10,20 @@ export type ConversationSummary = {
 /** A restored message: user turns and final answers only (no tool frames). */
 export type HistoryMessage = { role: "user" | "assistant"; text: string };
 
+/** Provenance for one piece of fetched data, shown in the source sidebar. */
+export type Citation = {
+  cid: string;
+  tool: string;
+  endpoint: string;
+  symbol: string | null;
+  params: Record<string, unknown>;
+  rows: number;
+  cols: number;
+  from_cache: boolean;
+  ts: string;
+  fingerprint: string;
+};
+
 export async function streamChat(
   message: string,
   conversationId: string | null,
@@ -61,6 +75,26 @@ export async function respondChat(requestId: string, response: string): Promise<
 /** URL for downloading a produced artefact (report, chart). */
 export function artifactUrl(path: string): string {
   return `/v1/artifacts?path=${encodeURIComponent(path)}`;
+}
+
+/** Sources fetched for a conversation (preferred) or the live session. */
+export async function fetchCitations(
+  conversationId: string | null,
+  sessionId: string | null,
+): Promise<Citation[]> {
+  const params = new URLSearchParams();
+  if (conversationId) params.set("conversation_id", conversationId);
+  else if (sessionId) params.set("session_id", sessionId);
+  const query = params.toString();
+  try {
+    const response = await fetch(`/v1/citations${query ? `?${query}` : ""}`);
+    // A 404 just means the scope is not known yet; an empty sidebar is correct.
+    if (!response.ok) return [];
+    const body = (await response.json()) as { citations: Citation[] };
+    return body.citations;
+  } catch {
+    return [];
+  }
 }
 
 export async function listConversations(): Promise<ConversationSummary[]> {

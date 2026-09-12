@@ -24,6 +24,12 @@ UNSOURCED_NUMBER_RE = re.compile(
     r"(\d+(?:\.\d+)?\s*(?:%|％|元|亿元|万元|倍|股|天|次|个百分点))"
 )
 UNSOURCED_MARK = "[!无来源:{n}]"
+# Internal-fetch vocabulary that must not reach the report body. Tool names and
+# endpoints are system plumbing; the appendix already carries provenance, so the
+# body restating it reads as machine output. Detected against the names that
+# actually appear in this session's citations, not a hardcoded list.
+TOOL_NAME_RE = re.compile(r"`?([a-z][a-z0-9_]+_[a-z0-9_]+)`?")
+ENDPOINT_HINT_RE = re.compile(r"接口\s*[`“\"']?([A-Za-z0-9_.:]+)")
 
 
 class ReportValidationError(ValueError):
@@ -104,6 +110,30 @@ class ReportPipeline:
             raise ReportValidationError(problems)
 
     # -- assembly -------------------------------------------------------------
+    def _internal_name_warnings(self, text: str, warnings: list[str]) -> None:
+        """Flag body text that exposes the system's internal fetch plumbing.
+
+        A hard failure would be wrong here — like the unsourced-number check,
+        the reader still needs the report — so it is a warning the author and
+        reviewer can act on.
+        """
+        known_tools = {item.tool for item in self.cite.all()}
+        known_interfaces: set[str] = set()
+        for item in self.cite.all():
+            endpoint = item.endpoint or ""
+            if ":" in endpoint:
+                known_interfaces.add(endpoint.rsplit(":", 1)[1])
+        if not known_tools:
+            return
+        for match in TOOL_NAME_RE.finditer(text):
+            name = match.group(1)
+            if name in known_tools:
+                warnings.append(f"正文暴露内部工具名：{name}（溯源由引用附录承载）")
+        for match in ENDPOINT_HINT_RE.finditer(text):
+            name = match.group(1)
+            if name in known_interfaces:
+                warnings.append(f"正文暴露内部接口名：{name}（溯源由引用附录承载）")
+
     def build_markdown(self, outline: ReportOutline) -> tuple[str, list[str], list[str]]:
         """Return (markdown, citation ids in order, warnings)."""
         warnings: list[str] = []
@@ -122,6 +152,10 @@ class ReportPipeline:
             )
 
         lines: list[str] = [f"# {outline.topic}", ""]
+        body_parts = [f"- {v}" for v in outline.core_view]
+        body_parts.extend(s.body for s in outline.sections)
+        body_parts.extend(outline.risks)
+        self._internal_name_warnings("\n".join(body_parts), warnings)
 
         lines.append("## 核心观点")
         lines.append("")

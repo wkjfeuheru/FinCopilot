@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from finharness.context.trim import DEFAULT_MAX_DESC_LEN, trim_schema
 from finharness.data.access import DataAccess
-from finharness.tools.base import BaseTool, PermissionLevel
+from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
 
 # Tool classes are registered through a loader so the module stays importable
 # while the catalogue grows.
@@ -72,6 +72,36 @@ ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
 
 FINANCIAL_DATA_TOOLS = ALL_TOOL_CLASSES
 
+# Groups whose tools may be handed to a read-only reviewer sub-agent. Data tools
+# let it re-fetch and check the report's numbers; GENERIC adds read_file for the
+# rendered artefact and cached parquet. FIN_CALC is deliberately absent: those
+# tools only compute over inputs the caller supplies, so they add no ability to
+# independently verify a figure.
+REVIEW_TOOL_GROUPS: tuple[ToolGroup, ...] = (ToolGroup.FIN_DATA, ToolGroup.GENERIC)
+
+
+def review_tool_names() -> tuple[str, ...]:
+    """The read-only subset a reviewer sub-agent is allowed to call.
+
+    Derived from the contract rather than a hand-kept list, so a new read-only
+    data tool is available to the reviewer automatically. Three exclusions are
+    implicit in the rule and each matters:
+
+    * ``PermissionLevel.WRITE`` — the reviewer must not be able to write.
+    * META group — ``research_plan`` and ``remember_preference`` have
+      side effects on session/global state, and ``load_tool`` would let the
+      reviewer widen its own catalogue.
+    * ``needs_interactive`` — ``ask_user`` cannot work in a sub-agent, which has
+      no interactive channel wired.
+    """
+    return tuple(
+        tool_cls.name
+        for tool_cls in ALL_TOOL_CLASSES
+        if tool_cls.permission is PermissionLevel.READ
+        and tool_cls.group in REVIEW_TOOL_GROUPS
+        and not tool_cls.needs_interactive
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class ToolBrief:
@@ -93,19 +123,45 @@ def build_parameters(model: type[BaseModel]) -> dict[str, Any]:
 
 
 class ToolRegistry:
-    """Instantiates every tool but only exposes resident schemas by default."""
+    """Instantiates every tool but only exposes resident schemas by default.
 
-    def __init__(self, data: DataAccess, *, ctx: Any | None = None, settings: Any | None = None) -> None:
+    ``only`` narrows the catalogue itself, not just its visibility: a name
+    outside the set does not resolve, so the loop reports it as unknown. That is
+    how a sub-agent is confined — the restriction is structural rather than a
+    policy the sub-agent could be persuaded to ignore.
+    """
+
+    def __init__(
+        self,
+        data: DataAccess,
+        *,
+        ctx: Any | None = None,
+        settings: Any | None = None,
+        only: set[str] | None = None,
+    ) -> None:
         self.settings = settings
+        # Kept so the loop can mint a coordinator (or a scoped registry for one)
+        # without the caller having to pass the same DataAccess twice.
+        self.data = data
+        classes = (
+            tuple(tool_cls for tool_cls in ALL_TOOL_CLASSES if tool_cls.name in only)
+            if only is not None
+            else ALL_TOOL_CLASSES
+        )
         self.tools: dict[str, BaseTool] = {
-            tool_cls.name: tool_cls(data, ctx=ctx) for tool_cls in ALL_TOOL_CLASSES
+            tool_cls.name: tool_cls(data, ctx=ctx) for tool_cls in classes
         }
         # Meta tools need the catalogue they live in; wire after construction.
         for tool in self.tools.values():
             tool.registry = self
         configured_lazy = tuple(getattr(settings.tools, "lazy", ()) or ()) if settings else ()
         configured_resident = tuple(getattr(settings.tools, "resident", ()) or ()) if settings else ()
-        if configured_resident:
+        if only is not None:
+            # A scoped catalogue is a working set, so nothing in it is lazy: the
+            # activation path needs ``load_tool``, which a confined registry does
+            # not have, so a lazy tool here would be listed but unreachable.
+            self._lazy: set[str] = set()
+        elif configured_resident:
             # An explicit resident list wins; everything else becomes lazy.
             self._lazy = {name for name in self.tools if name not in configured_resident}
         elif configured_lazy:

@@ -5,9 +5,17 @@ topic, which has two consequences: the naming convention cannot be bypassed, and
 — because the permission gate only skips confirmation for writes carrying a
 path inside the artefact directories — producing a report always asks the user
 first.
+
+Writing a report also runs the risk-review sub-agent (docs 03.10). That is the
+only trigger for review: putting it here, rather than in a tool the model may
+choose, makes "every report gets reviewed" a property of the system instead of a
+hope about model behaviour.
 """
 
 from __future__ import annotations
+
+import hashlib
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +27,14 @@ from finharness.report.pipeline import (
     ReportValidationError,
 )
 from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+
+# The appendix is a citation table, not prose: the reviewer judges the body and
+# the risk section, so sending the table would cost tokens without changing a
+# single comment.
+APPENDIX_MARKER = "\n## 附录"
+# A review records the digest of the body it judged, so an unchanged rewrite
+# reuses the verdict instead of paying for the same review twice.
+REVIEW_DIGEST_PREFIX = "<!-- reviewed-body:"
 
 
 class SectionInput(BaseModel):
@@ -48,8 +64,11 @@ class WriteReportTool(BaseTool):
     input_model = ReportInput
     permission = PermissionLevel.WRITE
     group = ToolGroup.FIN_OUTPUT
-    timeout = 120
-    output_schema_note = "产出 output/<topic>_<YYYYMMDD>.md 与 .docx。"
+    # Report rendering plus one review turn against a real provider. The default
+    # 30s budget cannot cover the provider round trip a review needs.
+    timeout = 300
+    output_schema_note = "产出 output/<topic>_<YYYYMMDD>.md 与 .docx，并附风险终审意见。"
+    needs_coordinator = True
 
     async def _dispatch(
         self,
@@ -97,6 +116,10 @@ class WriteReportTool(BaseTool):
             lines.append("- 提示：")
             lines.extend(f"  - {w}" for w in artifact.warnings)
 
+        review_path = await self._review_risk(artifact, lines)
+        if review_path:
+            attachments.append(review_path)
+
         return RawData(
             kind="text",
             text="\n".join(lines),
@@ -104,6 +127,78 @@ class WriteReportTool(BaseTool):
             endpoint="report:pipeline",
             params={"topic": artifact.topic, "citations": len(artifact.citations)},
         )
+
+    async def _review_risk(self, artifact, lines: list[str]) -> str | None:
+        """Run the risk reviewer and fold its verdict into the result text.
+
+        Returns the review file path when one was written. The report itself must
+        survive any review failure: ``BaseTool.run`` turns an exception here into
+        a blanket ``ok=False``, which would discard a report that was rendered
+        perfectly well. So every failure degrades to a warning line.
+        """
+        if self.coordinator is None:
+            return None
+        markdown_path = Path(artifact.markdown_path)
+        review_path = markdown_path.with_suffix(".review.md")
+
+        body = self._report_body(markdown_path)
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+        # Latch on content, not on time. Rewriting the same topic overwrites the
+        # report, so an mtime comparison would call every review stale; comparing
+        # the reviewed body's digest reuses the verdict when nothing changed and
+        # re-reviews only when the report was actually revised.
+        if self._reviewed_digest(review_path) == digest:
+            lines.append(f"- 风险终审：已完成（复用 {review_path}）")
+            return str(review_path)
+
+        try:
+            result = await self.coordinator.review_risk(topic=artifact.topic, markdown=body)
+        except Exception as exc:  # noqa: BLE001 - never fail a rendered report
+            lines.append(f"- 风险终审未完成：{type(exc).__name__}: {exc}")
+            return None
+
+        if not result.ok:
+            lines.append(f"- 风险终审未完成：{result.error}")
+            return None
+
+        comments = (result.summary or "").strip()
+        lines.append("- 风险终审意见（独立复核，供你决定是否修订）：")
+        lines.extend(f"  {line}" for line in (comments or "未发现实质性问题").splitlines())
+        lines.append(f"- 完整意见：{review_path}")
+        try:
+            review_path.write_text(
+                f"{REVIEW_DIGEST_PREFIX}{digest} -->\n\n"
+                f"# 风险终审意见：{artifact.topic}\n\n{comments}\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            # Losing the sidecar file is not worth failing the report over; the
+            # comments are already in the result text.
+            lines.append(f"- 终审意见落盘失败：{exc}")
+            return None
+        return str(review_path)
+
+    @staticmethod
+    def _report_body(markdown_path: Path) -> str:
+        """The report without its citation appendix, for the reviewer to read."""
+        text = markdown_path.read_text(encoding="utf-8")
+        marker = text.find(APPENDIX_MARKER)
+        return text if marker == -1 else text[:marker]
+
+    @staticmethod
+    def _reviewed_digest(review_path: Path) -> str | None:
+        """The body digest a previous review was based on, if any is recorded."""
+        try:
+            head = review_path.read_text(encoding="utf-8")[:200]
+        except OSError:
+            return None
+        marker = REVIEW_DIGEST_PREFIX
+        start = head.find(marker)
+        if start == -1:
+            return None
+        remainder = head[start + len(marker):]
+        return remainder.split(" ", 1)[0].strip() or None
 
     def render(self, raw: RawData) -> tuple[str, list[RawData]]:
         """Report results carry file attachments for the transport layer."""

@@ -57,6 +57,12 @@ class BaseTool(ABC):
     # Tools that need a user reply declare this; the loop injects the callable.
     needs_interactive = False
     interactive = None
+    # Tools that spawn a sub-agent declare this; the loop injects the coordinator
+    # the same way. An injection rather than constructor wiring because a tool
+    # cannot build a coordinator itself — that needs the provider, which tools
+    # never see (docs 03.10).
+    needs_coordinator = False
+    coordinator = None
 
     def __init__(self, data: DataAccess, *, ctx: Any | None = None, registry: Any | None = None) -> None:
         self.data = data

@@ -70,3 +70,40 @@ def test_snapshot_is_detached_and_read_only():
     assert snapshot.tool_calls == 1
     with pytest.raises(TypeError):
         snapshot.per_tool["get_quote"]["count"] = 99
+
+
+def test_sub_agent_usage_is_a_breakdown_not_a_second_total():
+    """``record_agent_usage`` labels spend; ``add_usage`` still owns the total."""
+    stats = SessionStats()
+
+    stats.add_usage(100, 20)          # the sub-agent's tokens, counted once
+    stats.record_agent_usage("risk", 100, 20)
+    stats.add_usage(7, 3)             # a main-loop turn afterwards
+
+    snapshot = stats.snapshot()
+    assert snapshot.input_tokens == 107
+    assert snapshot.output_tokens == 23
+    assert snapshot.per_agent["risk"] == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "runs": 1,
+    }
+
+
+def test_agent_usage_accumulates_across_runs():
+    stats = SessionStats()
+
+    stats.record_agent_usage("risk", 10, 2)
+    stats.record_agent_usage("risk", 5, 1)
+
+    assert stats.snapshot().per_agent["risk"]["runs"] == 2
+    assert stats.snapshot().per_agent["risk"]["input_tokens"] == 15
+
+
+def test_per_agent_snapshot_is_read_only():
+    stats = SessionStats()
+    stats.record_agent_usage("risk", 1, 1)
+
+    snapshot = stats.snapshot()
+    with pytest.raises(TypeError):
+        snapshot.per_agent["risk"]["runs"] = 99

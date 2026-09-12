@@ -5,10 +5,17 @@ import { ConversationList } from "./components/ConversationList";
 import { ChatPanel } from "./components/ChatPanel";
 import { SessionBar } from "./components/SessionBar";
 import { SettingsModal } from "./components/SettingsModal";
+import { SourceSidebar } from "./components/SourceSidebar";
+import type { Activity } from "./components/SourceSidebar";
 import { fetchConfig } from "./api/config";
 import type { ConfigSnapshot } from "./api/config";
-import { deleteConversation, listConversations, loadConversationMessages } from "./api/client";
-import type { ConversationSummary, HistoryMessage } from "./api/client";
+import {
+  deleteConversation,
+  fetchCitations,
+  listConversations,
+  loadConversationMessages,
+} from "./api/client";
+import type { Citation, ConversationSummary, HistoryMessage } from "./api/client";
 
 const EMPTY_CONFIG: ConfigSnapshot = { configured: false, active_id: null, configs: [] };
 // Remembering the conversation locally is what lets a reload resume it: the
@@ -27,6 +34,8 @@ function App() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [history, setHistory] = useState<HistoryMessage[]>([]);
   const [loadingConversations, setLoadingConversations] = useState(false);
+  const [citations, setCitations] = useState<Citation[]>([]);
+  const [activities, setActivities] = useState<Activity[]>([]);
 
   const refreshConfig = useCallback(async (): Promise<ConfigSnapshot> => {
     try {
@@ -62,11 +71,15 @@ function App() {
   useEffect(() => {
     if (!conversationId) {
       setHistory([]);
+      setCitations([]);
       return;
     }
     void loadConversationMessages(conversationId)
       .then(setHistory)
       .catch(() => setHistory([]));
+    // Sources are recovered from the store too, so a resumed (or restarted)
+    // conversation still shows the data it was built on.
+    void fetchCitations(conversationId, null).then(setCitations);
   }, [conversationId]);
   function rememberConversation(id: string | null) {
     setConversationId(id);
@@ -80,6 +93,8 @@ function App() {
     rememberConversation(null);
     setSessionId(null);
     setHistory([]);
+    setCitations([]);
+    setActivities([]);
     setSessionVersion((version) => version + 1);
   }
 
@@ -99,6 +114,7 @@ function App() {
     if (id === conversationId) return;
     rememberConversation(id);
     setSessionId(null);
+    setActivities([]);
     setSessionVersion((version) => version + 1);
   }
 
@@ -122,7 +138,21 @@ function App() {
   const active = snapshot?.configs.find((config) => config.is_active) ?? null;
 
   return (
-    <ConfigProvider locale={zhCN} theme={{ token: { motion: false } }}>
+    <ConfigProvider locale={zhCN} theme={{ token: {
+      motion: false,
+      colorPrimary: "#176b63",
+      colorInfo: "#176b63",
+      colorSuccess: "#247552",
+      colorWarning: "#a97620",
+      colorError: "#b64444",
+      colorText: "#243649",
+      colorTextSecondary: "#637487",
+      colorBorder: "#d8e0e7",
+      borderRadius: 6,
+      fontFamily: '"Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+      fontSize: 13,
+      controlHeight: 34,
+    } }}>
       <main className="app-shell">
         <header className="app-header">
           <div>
@@ -172,8 +202,13 @@ function App() {
                 onSession={handleSession}
                 configured={snapshot?.configured ?? true}
                 onOpenSettings={() => setSettingsOpen(true)}
+                citations={citations}
+                onCitations={setCitations}
+                activities={activities}
+                onActivities={setActivities}
               />
             </div>
+            <SourceSidebar activities={activities} citations={citations} />
           </div>
         </section>
         <SettingsModal

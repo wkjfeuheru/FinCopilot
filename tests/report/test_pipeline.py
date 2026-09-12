@@ -156,6 +156,48 @@ def test_appendix_lists_only_referenced_citations(tmp_path):
     assert used in markdown
 
 
+def test_tool_name_in_body_is_warned(tmp_path):
+    pipeline, _, cid = make_pipeline(tmp_path)
+    outline = simple_outline(
+        cid,
+        sections=[ReportSection(
+            heading="说明",
+            body=f"get_quote 返回的行情快照与标的不符，故改用 get_kline {{cite:{cid}}}",
+        )],
+    )
+    _, _, warnings = pipeline.build_markdown(outline)
+
+    assert any("get_quote" in w and "工具名" in w for w in warnings)
+    assert any("get_kline" in w for w in warnings)
+
+
+def test_interface_name_in_body_is_warned(tmp_path):
+    pipeline, _, cid = make_pipeline(tmp_path)
+    outline = simple_outline(
+        cid,
+        sections=[ReportSection(
+            heading="说明", body=f"接口 stock_zh_a_spot_em 不可用 {{cite:{cid}}}"
+        )],
+    )
+    _, _, warnings = pipeline.build_markdown(outline)
+
+    assert any("stock_zh_a_spot_em" in w and "接口名" in w for w in warnings)
+
+
+def test_plain_reader_wording_produces_no_internal_name_warning(tmp_path):
+    pipeline, _, cid = make_pipeline(tmp_path)
+    outline = simple_outline(
+        cid,
+        sections=[ReportSection(
+            heading="说明",
+            body=f"行情为 9 月 11 日收盘价 330.51 元；该估值序列未标注分位口径 {{cite:{cid}}}",
+        )],
+    )
+    _, _, warnings = pipeline.build_markdown(outline)
+
+    assert not any("工具名" in w or "接口名" in w for w in warnings)
+
+
 def test_export_writes_markdown_and_docx(tmp_path):
     pipeline, _, cid = make_pipeline(tmp_path)
 

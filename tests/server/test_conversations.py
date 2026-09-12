@@ -27,7 +27,9 @@ class EchoProvider(FakeProvider):
         users = [m for m in messages if m.role == "user"]
         self.seen_user_turns.append(len(users))
         yield StreamChunk(StreamEvent.TEXT_DELTA, f"第{len(users)}问已回答")
-        yield StreamChunk(StreamEvent.MESSAGE_END, ModelUsage(input_tokens=1, output_tokens=1))
+        yield StreamChunk(
+            StreamEvent.MESSAGE_END, ModelUsage(input_tokens=1, output_tokens=1)
+        )
 
 
 def make_client(tmp_path) -> tuple[TestClient, EchoProvider]:
@@ -86,7 +88,11 @@ def test_replay_omits_tool_frames(tmp_path):
         "c_tools",
         [
             Msg.user("查报价"),
-            Msg(role="assistant", content=None, tool_uses=[ToolUse("c1", "get_quote", {})]),
+            Msg(
+                role="assistant",
+                content=None,
+                tool_uses=[ToolUse("c1", "get_quote", {})],
+            ),
             Msg(role="tool_result", content=None, tool_results=[("c1", '{"ok":true}')]),
             Msg(role="assistant", content="报价是 100"),
         ],
@@ -161,4 +167,44 @@ def test_citations_can_be_read_by_conversation(tmp_path):
 def test_citations_404_for_an_unknown_conversation(tmp_path):
     client, _ = make_client(tmp_path)
 
-    assert client.get("/v1/citations", params={"conversation_id": "c_none"}).status_code == 404
+    assert (
+        client.get("/v1/citations", params={"conversation_id": "c_none"}).status_code
+        == 404
+    )
+
+
+def test_persisted_citations_are_readable_after_the_session_is_gone(tmp_path):
+    """A conversation outlives the process; its sources must remain addressable."""
+    from finharness.data.citation import Citation
+
+    client, _ = make_client(tmp_path)
+    store = client.app.state.memory_store
+    store.ensure_conversation("c_sources")
+    store.save_citations(
+        "c_sources",
+        [
+            Citation(
+                cid="cit_000001",
+                tool="get_quote",
+                endpoint="akshare:stock_zh_a_spot_em",
+                symbol="600519",
+                params={"symbol": "600519"},
+                ts="2026-09-12T10:30:00+08:00",
+                rows=1,
+                cols=3,
+                fingerprint="abc123",
+                from_cache=False,
+            )
+        ],
+    )
+
+    # No live registry exists for this conversation, so the endpoint must fall
+    # back to the persisted store rather than reporting an empty scope.
+    body = client.get("/v1/citations", params={"conversation_id": "c_sources"}).json()
+
+    assert body["count"] == 1
+    citation = body["citations"][0]
+    assert citation["cid"] == "cit_000001"
+    assert citation["symbol"] == "600519"
+    assert citation["params"] == {"symbol": "600519"}
+    assert citation["from_cache"] is False

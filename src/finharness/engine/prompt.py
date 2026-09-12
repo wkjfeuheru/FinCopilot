@@ -11,6 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "system.md"
+RISK_REVIEW_PATH = Path(__file__).resolve().parent.parent / "prompts" / "risk_review.md"
 
 
 class PromptNotFoundError(RuntimeError):
@@ -27,4 +28,21 @@ def system_prompt(path: str | Path | None = None) -> str:
         raise PromptNotFoundError(f"无法读取系统提示词文件：{target}") from exc
     if not text:
         raise PromptNotFoundError(f"系统提示词文件为空：{target}")
+    return text
+
+
+@lru_cache(maxsize=1)
+def risk_review_prompt(path: str | Path | None = None) -> str:
+    """System prompt for the risk-review sub-agent (a separate role, not a mode).
+
+    Cached for the same reason as ``system_prompt``: it is read on every review
+    but never changes during a run.
+    """
+    target = Path(path) if path is not None else RISK_REVIEW_PATH
+    try:
+        text = target.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise PromptNotFoundError(f"无法读取风险终审提示词文件：{target}") from exc
+    if not text:
+        raise PromptNotFoundError(f"风险终审提示词文件为空：{target}")
     return text

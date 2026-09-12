@@ -29,3 +29,5 @@ logs/*
 output/*
 !output/.gitkeep
 .mimosa/
+# ZCode IDE session plans and scratch state; not project content.
+.zcode/

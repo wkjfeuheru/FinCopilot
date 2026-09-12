@@ -143,3 +143,188 @@ def test_write_report_reports_validation_problems_to_the_model(tmp_path):
     assert "报告校验未通过" in result.error
     # The message must name the fields, so the model can repair the outline.
     assert "topic" in result.error
+
+
+def test_write_report_warns_when_the_body_exposes_tool_names(tmp_path):
+    settings = Settings(
+        paths={"output_dir": tmp_path / "output"}, data={"cache_dir": tmp_path / "cache"}
+    )
+    cite = CitationRegistry()
+    cid = cite.register(
+        tool="get_quote", endpoint="e", symbol="600519", params={},
+        rows=1, cols=1, fingerprint="x",
+    ).cid
+    ctx = ResearchContext(cite=cite, settings=settings)
+    tool = WriteReportTool(DataAccess([], settings=settings), ctx=ctx)
+
+    result = asyncio.run(
+        tool.run(
+            topic="测试报告",
+            core_view=[f"观点 {{cite:{cid}}}"],
+            sections=[{
+                "heading": "说明",
+                "body": f"get_quote 返回的行情与标的不符，故改用 get_kline {{cite:{cid}}}",
+                "cids": [cid],
+            }],
+            risks=["风险一"],
+        )
+    )
+
+    assert result.ok is True, result.error
+    assert "正文暴露内部工具名" in result.content
+
+
+# --- risk review on write (docs 03.10) ---------------------------------------
+
+class FakeCoordinator:
+    """Stands in for the sub-agent: records the request, returns canned comments."""
+
+    def __init__(self, *, summary="### [高] 数字无来源\n- 位置：核心观点", ok=True,
+                 error=None, raises=None):
+        self.summary = summary
+        self.ok = ok
+        self.error = error
+        self.raises = raises
+        self.calls: list[dict] = []
+
+    async def review_risk(self, *, topic, markdown):
+        self.calls.append({"topic": topic, "markdown": markdown})
+        if self.raises is not None:
+            raise self.raises
+        from finharness.coordinator import SubAgentResult
+
+        return SubAgentResult(
+            focus="risk", summary=self.summary, ok=self.ok, error=self.error,
+            input_tokens=10, output_tokens=4, turns=1,
+        )
+
+
+def make_writer(tmp_path, *, coordinator) -> tuple[WriteReportTool, str]:
+    settings = Settings(
+        paths={"output_dir": tmp_path / "output"}, data={"cache_dir": tmp_path / "cache"}
+    )
+    cite = CitationRegistry()
+    cid = cite.register(
+        tool="get_quote", endpoint="e", symbol="600519", params={},
+        rows=1, cols=1, fingerprint="x",
+    ).cid
+    ctx = ResearchContext(cite=cite, settings=settings)
+    tool = WriteReportTool(DataAccess([], settings=settings), ctx=ctx)
+    tool.coordinator = coordinator
+    return tool, cid
+
+
+def run_write(tool, cid):
+    return asyncio.run(
+        tool.run(
+            topic="测试报告",
+            core_view=[f"观点 {{cite:{cid}}}"],
+            sections=[{"heading": "章节", "body": f"正文 {{cite:{cid}}}", "cids": [cid]}],
+            risks=["风险一"],
+        )
+    )
+
+
+def test_write_report_runs_the_risk_review_and_returns_its_comments(tmp_path):
+    coordinator = FakeCoordinator()
+    tool, cid = make_writer(tmp_path, coordinator=coordinator)
+
+    result = run_write(tool, cid)
+
+    assert result.ok is True, result.error
+    assert len(coordinator.calls) == 1
+    assert "风险终审意见" in result.content
+    assert "数字无来源" in result.content
+
+
+def test_review_receives_the_report_body_without_the_appendix(tmp_path):
+    coordinator = FakeCoordinator()
+    tool, cid = make_writer(tmp_path, coordinator=coordinator)
+
+    run_write(tool, cid)
+
+    sent = coordinator.calls[0]["markdown"]
+    assert "测试报告" in sent
+    assert "## 附录" not in sent  # the citation table is not review material
+
+
+def test_review_file_is_written_next_to_the_report(tmp_path):
+    coordinator = FakeCoordinator()
+    tool, cid = make_writer(tmp_path, coordinator=coordinator)
+
+    result = run_write(tool, cid)
+
+    reviews = [p for p in result.attachments if p.endswith(".review.md")]
+    assert len(reviews) == 1
+    assert Path(reviews[0]).is_file()
+    assert "数字无来源" in Path(reviews[0]).read_text(encoding="utf-8")
+
+
+def test_write_report_survives_a_review_failure(tmp_path):
+    """A failed review must never discard a perfectly rendered report."""
+    coordinator = FakeCoordinator(raises=RuntimeError("provider down"))
+    tool, cid = make_writer(tmp_path, coordinator=coordinator)
+
+    result = run_write(tool, cid)
+
+    assert result.ok is True, result.error
+    assert "风险终审未完成" in result.content
+    # The report artefacts are still attached.
+    assert any(p.endswith(".md") for p in result.attachments)
+    assert any(p.endswith(".docx") for p in result.attachments)
+
+
+def test_write_report_survives_a_declined_review(tmp_path):
+    coordinator = FakeCoordinator(ok=False, error="max_turns_exhausted")
+    tool, cid = make_writer(tmp_path, coordinator=coordinator)
+
+    result = run_write(tool, cid)
+
+    assert result.ok is True
+    assert "风险终审未完成" in result.content
+    assert "max_turns_exhausted" in result.content
+
+
+def test_a_current_review_is_reused_instead_of_paying_twice(tmp_path):
+    """Rewriting the same topic must not re-run a review that is still current."""
+    first = FakeCoordinator()
+    tool, cid = make_writer(tmp_path, coordinator=first)
+    run_write(tool, cid)
+
+    # Second call: a fresh coordinator, same topic, report already reviewed.
+    second = FakeCoordinator()
+    tool.coordinator = second
+    result = run_write(tool, cid)
+
+    assert second.calls == []
+    assert "复用" in result.content
+
+
+def test_a_revised_report_is_reviewed_again(tmp_path):
+    """The latch is content-based: a changed body must earn a fresh review."""
+    first = FakeCoordinator()
+    tool, cid = make_writer(tmp_path, coordinator=first)
+    run_write(tool, cid)
+
+    second = FakeCoordinator()
+    tool.coordinator = second
+    result = asyncio.run(
+        tool.run(
+            topic="测试报告",
+            core_view=[f"观点 {{cite:{cid}}}"],
+            sections=[{"heading": "章节", "body": f"修订后的正文 {{cite:{cid}}}", "cids": [cid]}],
+            risks=["风险一", "风险二"],
+        )
+    )
+
+    assert result.ok is True
+    assert len(second.calls) == 1
+
+
+def test_write_report_without_a_coordinator_still_works(tmp_path):
+    tool, cid = make_writer(tmp_path, coordinator=None)
+
+    result = run_write(tool, cid)
+
+    assert result.ok is True
+    assert "风险终审" not in result.content
