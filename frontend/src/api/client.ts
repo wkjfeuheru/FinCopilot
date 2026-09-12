@@ -1,15 +1,27 @@
 export type ChatEvent = { event: string; data: Record<string, unknown> };
 
+export type ConversationSummary = {
+  conversation_id: string;
+  title: string | null;
+  created_at: string;
+  last_active_at: string;
+};
+
+/** A restored message: user turns and final answers only (no tool frames). */
+export type HistoryMessage = { role: "user" | "assistant"; text: string };
+
 export async function streamChat(
   message: string,
-  sessionId: string | null,
+  conversationId: string | null,
   onEvent: (event: ChatEvent) => void,
   signal: AbortSignal,
 ): Promise<void> {
   const response = await fetch("/v1/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, session_id: sessionId, mode: "default" }),
+    // conversation_id is the durable handle: sending it resumes a conversation
+    // whose execution session has already expired.
+    body: JSON.stringify({ message, conversation_id: conversationId, mode: "default" }),
     signal,
   });
   if (!response.ok) {
@@ -49,4 +61,23 @@ export async function respondChat(requestId: string, response: string): Promise<
 /** URL for downloading a produced artefact (report, chart). */
 export function artifactUrl(path: string): string {
   return `/v1/artifacts?path=${encodeURIComponent(path)}`;
+}
+
+export async function listConversations(): Promise<ConversationSummary[]> {
+  const response = await fetch("/v1/conversations");
+  if (!response.ok) throw new Error(`加载对话列表失败：${response.status}`);
+  const body = (await response.json()) as { conversations: ConversationSummary[] };
+  return body.conversations;
+}
+
+export async function loadConversationMessages(
+  conversationId: string,
+): Promise<HistoryMessage[]> {
+  const response = await fetch(
+    `/v1/conversations/${encodeURIComponent(conversationId)}/messages`,
+  );
+  if (response.status === 404) return [];
+  if (!response.ok) throw new Error(`加载历史失败：${response.status}`);
+  const body = (await response.json()) as { messages: HistoryMessage[] };
+  return body.messages;
 }

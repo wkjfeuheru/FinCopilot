@@ -40,7 +40,8 @@ class WorkingMemory:
     def __init__(self, *, ctx=None, settings: Settings, counter: TokenCounter | None = None) -> None:
         self.settings = settings
         self.ctx = ctx
-        self.counter = counter or TokenCounter(cache_dir=_token_cache_dir(settings))
+        # The counter's vocabulary cache is project-wide, not per data directory.
+        self.counter = counter or TokenCounter()
         self.raw: list[Msg] = []
         self.used_tokens = 0
         self._exact = True
@@ -205,8 +206,3 @@ def _message_texts(message: Msg):
         yield f"{tool_use.name}{tool_use.args}"
     for call_id, raw in message.tool_results:
         yield f"{call_id}{raw}"
-
-
-def _token_cache_dir(settings: Settings) -> str:
-    """Keep the tiktoken vocabulary beside the other caches."""
-    return str(settings.data.cache_dir / "tiktoken")

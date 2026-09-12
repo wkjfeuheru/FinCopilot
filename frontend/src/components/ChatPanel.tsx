@@ -1,4 +1,4 @@
-import { FormEvent, useRef, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { Button, Empty } from "antd";
 import { artifactUrl, respondChat, streamChat } from "../api/client";
 import { Interaction, InteractionPrompt } from "./InteractionPrompt";
@@ -7,7 +7,10 @@ import { ToolStatus } from "./ToolStatus";
 
 type Props = {
   sessionId: string | null;
-  onSession: (id: string) => void;
+  conversationId: string | null;
+  /** History restored from the store when resuming a conversation. */
+  initialMessages: Message[];
+  onSession: (sessionId: string, conversationId: string | null) => void;
   configured: boolean;
   onOpenSettings: () => void;
 };
@@ -20,8 +23,16 @@ function fileName(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-export function ChatPanel({ sessionId, onSession, configured, onOpenSettings }: Props) {
-  const [messages, setMessages] = useState<Message[]>([]);
+export function ChatPanel({
+  sessionId,
+  conversationId,
+  initialMessages,
+  onSession,
+  configured,
+  onOpenSettings,
+}: Props) {
+  // Seeded from restored history so a resumed conversation shows where it left off.
+  const [messages, setMessages] = useState<Message[]>(initialMessages);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
@@ -29,6 +40,13 @@ export function ChatPanel({ sessionId, onSession, configured, onOpenSettings }: 
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Restored history arrives asynchronously, after this component has already
+  // mounted with an empty list. Sync it in, but never clobber a conversation the
+  // user has already started typing into in this session.
+  useEffect(() => {
+    setMessages((current) => (current.length === 0 ? initialMessages : current));
+  }, [initialMessages]);
 
   function rememberArtifacts(raw: unknown) {
     const paths = (raw as string[] | undefined) ?? [];
@@ -53,8 +71,13 @@ export function ChatPanel({ sessionId, onSession, configured, onOpenSettings }: 
     abortRef.current = controller;
     setNotice(null);
     try {
-      await streamChat(message, sessionId, (event) => {
-        if (event.event === "session") onSession(String(event.data.session_id));
+      await streamChat(message, conversationId, (event) => {
+        if (event.event === "session") {
+          onSession(
+            String(event.data.session_id),
+            event.data.conversation_id ? String(event.data.conversation_id) : null,
+          );
+        }
         if (event.event === "tool_status") {
           setStatus(`${String(event.data.name ?? "tool")} ${String(event.data.status ?? "")}`);
           rememberArtifacts(event.data.attachments);

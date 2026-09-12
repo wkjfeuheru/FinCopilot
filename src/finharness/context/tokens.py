@@ -19,6 +19,10 @@ from pathlib import Path
 # cl100k_base is the closest widely-available vocabulary for the mixed
 # Chinese/English traffic this system sees.
 ENCODING_NAME = "cl100k_base"
+# A single project-local cache for the vocabulary, independent of the data cache
+# layout so test temp directories do not each fetch their own copy.
+# parents: [0]=context, [1]=finharness, [2]=src, [3]=repo root
+VOCAB_CACHE_DIR = Path(__file__).resolve().parents[3] / "data_cache" / "tiktoken"
 # Documented fallback (docs 03.6.3): Chinese-heavy text runs about 1.7 chars
 # per token.
 CHARS_PER_TOKEN = 1.7
@@ -34,11 +38,13 @@ class TokenCounter:
     """Counts tokens, preferring tiktoken and degrading to an estimate."""
 
     def __init__(self, *, cache_dir: str | Path | None = None) -> None:
-        if cache_dir is not None:
-            directory = Path(cache_dir)
-            directory.mkdir(parents=True, exist_ok=True)
-            # tiktoken reads this when resolving its vocabulary blob.
-            os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(directory))
+        # The vocabulary is shared across every counter: it is large, slow to
+        # fetch, and identical regardless of which cache directory a caller
+        # happens to use. Pointing per-instance directories at it would make each
+        # new directory re-download the file (observed as ~100s on first use).
+        directory = Path(cache_dir) if cache_dir is not None else _default_cache_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(directory))
         self._encoder = None
         self._failed = False
 
@@ -101,3 +107,9 @@ def truncate_to_tokens(
     if len(prefix) < len(text):
         return prefix + marker
     return prefix
+
+
+def _default_cache_dir() -> Path:
+    """Project-local vocabulary cache; overridable by the environment."""
+    override = os.environ.get("TIKTOKEN_CACHE_DIR")
+    return Path(override) if override else VOCAB_CACHE_DIR

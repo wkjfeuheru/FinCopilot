@@ -39,6 +39,11 @@ DEFAULT_SYSTEM_PROMPT = system_prompt()
 
 
 class ChatRequest(BaseModel):
+    # conversation_id is the memory scope and the client's durable handle; it can
+    # be supplied to resume a conversation whose session has expired.
+    conversation_id: str | None = None
+    # session_id is the live execution window; optional and normally omitted,
+    # since the server resolves it from the conversation.
     session_id: str | None = None
     message: str
     mode: str = "default"
@@ -99,6 +104,9 @@ def create_app(
     application.state.confirm_bus = confirm_bus
     session_citations: dict[str, CitationRegistry] = {}
     session_contexts: dict[str, ResearchContext] = {}
+    # Citations also follow the conversation, so they remain addressable after
+    # the execution session that produced them has expired.
+    conversation_citations: dict[str, CitationRegistry] = {}
     fallback_provider = provider
 
     # Conversation memory: one store serves every conversation; the transcript,
@@ -110,16 +118,20 @@ def create_app(
         max_age_days=settings.context.retention_days,
     )
 
-    def loop_factory(session_id: str | None = None) -> AgentLoop:
+    def loop_factory(session_id: str | None = None, conversation_id: str | None = None) -> AgentLoop:
         if fallback_provider is not None:
             selected = fallback_provider
         else:
             selected = resolver.current()
         citations = CitationRegistry()
         ctx = ResearchContext(cite=citations, settings=settings)
+        # Index by both ids: citations and context follow the conversation, and
+        # the session id is just this execution window's handle.
         if session_id:
             session_citations[session_id] = citations
             session_contexts[session_id] = ctx
+        if conversation_id:
+            conversation_citations[conversation_id] = citations
 
         # Tool schemas are generated per session because lazy activation is
         # session-scoped; ctx and registry are wired to each other.
@@ -143,7 +155,7 @@ def create_app(
             ctx=ctx,
             gate=gate,
             hooks=HookChain([audit]),
-            conversation_id=session_id,
+            conversation_id=conversation_id,
             store=memory_store,
         )
 
@@ -164,6 +176,7 @@ def create_app(
         return loop
 
     registry = SessionRegistry(loop_factory, ttl_s=settings.server.session_ttl_s)
+    application.state.session_registry = registry
     application.include_router(
         create_config_router(
             store_factory=store_factory,
@@ -267,14 +280,19 @@ def create_app(
         return FileResponse(target, filename=target.name)
 
     @application.get("/v1/citations")
-    async def citations(session_id: str | None = None) -> dict:
-        """Citations for one session; falls back to every live session."""
-        if session_id:
+    async def citations(
+        session_id: str | None = None, conversation_id: str | None = None
+    ) -> dict:
+        """Citations for a conversation (preferred) or a live session."""
+        if conversation_id:
+            registry = conversation_citations.get(conversation_id)
+            registries = [registry] if registry is not None else []
+        elif session_id:
             registries = [session_citations[session_id]] if session_id in session_citations else []
-            if not registries:
-                raise HTTPException(status_code=404, detail="会话不存在或已回收")
         else:
             registries = list(session_citations.values())
+        if (conversation_id or session_id) and not registries:
+            raise HTTPException(status_code=404, detail="会话或对话不存在")
         items: list[dict] = []
         for registry in registries:
             items.extend(
@@ -292,6 +310,42 @@ def create_app(
                 for item in registry.all()
             )
         return {"citations": items, "count": len(items)}
+
+    @application.get("/v1/conversations")
+    async def conversations(limit: int = 50) -> dict:
+        """List stored conversations, newest activity first, for a picker."""
+        return {
+            "conversations": [
+                {
+                    "conversation_id": record.conversation_id,
+                    "title": record.title,
+                    "created_at": record.created_at,
+                    "last_active_at": record.last_active_at,
+                }
+                for record in memory_store.list_conversations(limit=limit)
+            ]
+        }
+
+    @application.get("/v1/conversations/{conversation_id}/messages")
+    async def conversation_messages(conversation_id: str, limit: int = 200) -> dict:
+        """Replay a conversation's transcript so a client can restore its view.
+
+        Only user turns and final answers are returned: the intermediate tool
+        frames are working state, not something a reader should scroll through.
+        """
+        messages = memory_store.load_messages(conversation_id)
+        if not messages:
+            raise HTTPException(status_code=404, detail="对话不存在或无消息")
+        rendered: list[dict] = []
+        for message in messages:
+            if message.role == "user" and message.content:
+                rendered.append({"role": "user", "text": message.content})
+            elif message.role == "assistant" and message.content:
+                rendered.append({"role": "assistant", "text": message.content})
+        return {
+            "conversation_id": conversation_id,
+            "messages": rendered[-max(limit, 1) :],
+        }
 
     @application.get("/")
     async def root() -> HTMLResponse:
@@ -320,7 +374,9 @@ def create_app(
         from fastapi import HTTPException
 
         try:
-            session = await registry.ensure(request.session_id)
+            session = await registry.ensure(
+                request.session_id, conversation_id=request.conversation_id
+            )
         except SessionBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except NotConfigured as exc:
@@ -338,7 +394,15 @@ def create_app(
         task = asyncio.create_task(session.loop.run(request.message))
 
         async def events() -> AsyncIterator[str]:
-            yield encode_event("session", {"session_id": session.session_id})
+            # Both ids travel: the client persists conversation_id (durable) and
+            # may echo session_id back for efficiency within one window.
+            yield encode_event(
+                "session",
+                {
+                    "session_id": session.session_id,
+                    "conversation_id": session.conversation_id,
+                },
+            )
             try:
                 while True:
                     if task.done() and sink.queue.empty():
@@ -346,7 +410,11 @@ def create_app(
                     event = await sink.queue.get()
                     data = event.data
                     if event.kind == "done":
-                        data = {**data, "session_id": session.session_id}
+                        data = {
+                            **data,
+                            "session_id": session.session_id,
+                            "conversation_id": session.conversation_id,
+                        }
                     # The request_id belongs to the confirm bus, not the engine
                     # payload shape, so it is added at the transport edge.
                     yield encode_event(_event_name(event.kind), data)

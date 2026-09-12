@@ -25,6 +25,16 @@ h1 { margin-bottom: 0; font-size: 24px; }
 .provider-chip:hover { border-color: #17202a; color: #17202a; }
 .config-empty-state { padding: 48px 0; }
 .workspace { max-width: 1120px; margin: 0 auto; padding: 56px 40px; }
+.workspace-body { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 24px; align-items: start; }
+.conversation-panel { min-width: 0; }
+.conversation-list { display: grid; gap: 8px; padding: 12px; border: 1px solid #dce2e8; background: #fff; }
+.conversation-list-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.conversation-item { cursor: pointer; padding: 6px 4px !important; border-radius: 4px; }
+.conversation-item:hover { background: #f2f6f9; }
+.conversation-item.active { background: #e9f0f5; }
+.conversation-item-body { display: grid; gap: 2px; min-width: 0; }
+.conversation-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-time { color: #617080; font-size: 11px; }
 
 .session-bar { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; color: #617080; font-size: 12px; }
 .session-bar button, .composer button { border: 0; background: #17202a; color: #fff; padding: 10px 14px; cursor: pointer; }
