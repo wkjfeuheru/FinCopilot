@@ -46,11 +46,19 @@ class BaseTool(ABC):
     input_model: type[BaseModel] = BaseModel
     permission: PermissionLevel = PermissionLevel.READ
     group: ToolGroup = ToolGroup.GENERIC
-    timeout: int = 30
+    # ``None`` inherits settings.tools.timeout_default_s; declare a value only
+    # when the interface needs a different budget (docs 03.4.1 超时列).
+    timeout: int | None = None
     output_schema_note: str = ""
+    # Tools that need a user reply declare this; the loop injects the callable.
+    needs_interactive = False
+    interactive = None
 
-    def __init__(self, data: DataAccess) -> None:
+    def __init__(self, data: DataAccess, *, ctx: Any | None = None, registry: Any | None = None) -> None:
         self.data = data
+        self.ctx = ctx
+        # Meta tools (search_tools / load_tool) inspect and activate the catalogue.
+        self.registry = registry
 
     # -- execution ------------------------------------------------------------
     async def _dispatch(self, **kwargs: Any) -> RawData:
@@ -92,7 +100,9 @@ class BaseTool(ABC):
 
     # -- rendering ------------------------------------------------------------
     def render(self, raw: RawData) -> tuple[str, list[RawData]]:
-        """Default: trim the frame to markdown and pass the frame through."""
+        """Default: trim frames to markdown; pass text payloads through as-is."""
+        if raw.kind == "text" or (raw.df is None and raw.text is not None):
+            return (raw.text or "（无数据）"), [raw]
         text = self.trim_dataframe(raw.df)
         return text, ([] if raw.df is None else [raw])
 

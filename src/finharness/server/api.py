@@ -13,18 +13,23 @@ from pydantic import BaseModel
 from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
 from finharness.config.store import ConfigStore
+from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
 from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
+from finharness.hooks.audit import AuditHook, AuditLogWriter, summarize_args
+from finharness.hooks.base import HookChain
+from finharness.permissions.gate import PermissionGate
 from finharness.provider.fake import FakeProvider
 from finharness.provider.registry import build_provider
 from finharness.provider.resolver import NotConfigured, ProviderResolver
 from finharness.server.config_api import create_config_router
+from finharness.server.confirm import ConfirmBus
 from finharness.server.sessions import SessionBusyError, SessionRegistry
 from finharness.server.sse import encode_event
-from finharness.tools.registry import ToolRegistry
+from finharness.tools.registry import ALL_TOOL_CLASSES, ToolRegistry
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are FinHarness, a careful financial research copilot. "
@@ -36,6 +41,11 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
     mode: str = "default"
+
+
+class RespondRequest(BaseModel):
+    request_id: str
+    response: str
 
 
 class QueueSink:
@@ -82,27 +92,64 @@ def create_app(
         settings=settings,
     )
 
-    def make_registry() -> ToolRegistry:
-        return ToolRegistry(shared_data)
-    tool_registry = make_registry()
+    # Governance: one confirm bus bridges every session's interactive requests.
+    confirm_bus = ConfirmBus(ttl_s=settings.server.confirm_ttl_s)
+    # Exposed so tests and operators can inspect pending interactive requests.
+    application.state.confirm_bus = confirm_bus
     session_citations: dict[str, CitationRegistry] = {}
+    session_contexts: dict[str, ResearchContext] = {}
     fallback_provider = provider
+
     def loop_factory(session_id: str | None = None) -> AgentLoop:
         if fallback_provider is not None:
             selected = fallback_provider
         else:
             selected = resolver.current()
         citations = CitationRegistry()
+        ctx = ResearchContext(cite=citations, settings=settings)
         if session_id:
             session_citations[session_id] = citations
-        return AgentLoop(
+            session_contexts[session_id] = ctx
+
+        # Tool schemas are generated per session because lazy activation is
+        # session-scoped; ctx and registry are wired to each other.
+        registry_for_session = ToolRegistry(shared_data, ctx=ctx, settings=settings)
+        audit = AuditHook(
+            AuditLogWriter(settings.audit.log_path), session_id=session_id or "local"
+        )
+        gate = PermissionGate(
+            settings=settings,
+            confirm=lambda name, args: _ask(
+                "confirm", f"工具 {name} 将执行，入参：{summarize_args(args)}", ["y", "n"]
+            ),
+        )
+        loop = AgentLoop(
             provider=selected,
-            registry=make_registry(),
+            registry=registry_for_session,
             settings=settings,
             system=DEFAULT_SYSTEM_PROMPT,
             cite=citations,
             session_id=session_id,
+            ctx=ctx,
+            gate=gate,
+            hooks=HookChain([audit]),
         )
+
+        async def _ask(kind: str, prompt: str, options: list[str]):
+            """Announce the request over SSE, then await the client's answer."""
+            _, answer = await confirm_bus.request(
+                session_id=session_id or "local",
+                kind=kind,
+                prompt=prompt,
+                options=options,
+                announce=lambda payload: loop._emit("interactive_request", payload),
+            )
+            return answer
+
+        # Injected after construction so the callback can emit through this loop.
+        loop.interactive = _ask
+        loop.audit = audit
+        return loop
 
     registry = SessionRegistry(loop_factory, ttl_s=settings.server.session_ttl_s)
     application.include_router(
@@ -122,8 +169,25 @@ def create_app(
         return {"status": "ok"}
 
     @application.get("/v1/tools")
-    async def tools() -> dict[str, list]:
-        return {"tools": tool_registry.names()}
+    async def tools(session_id: str | None = None) -> dict:
+        """List the catalogue; with a session id, report its activation state."""
+        if session_id and session_id in registry.sessions:
+            reg = registry.sessions[session_id].loop.registry
+            return {
+                "tools": reg.names(),
+                "resident": reg.resident_names(),
+                "lazy": reg.lazy_names(),
+                "active": [name for name in reg.names() if reg.is_active(name)],
+            }
+        return {"tools": [cls.name for cls in ALL_TOOL_CLASSES]}
+
+    @application.post("/v1/chat/respond")
+    async def chat_respond(body: RespondRequest) -> dict:
+        """Answer a pending interactive request (write confirmation / ask_user)."""
+        ok = confirm_bus.respond(request_id=body.request_id, value=body.response)
+        if not ok:
+            raise HTTPException(status_code=404, detail="请求不存在或已超时")
+        return {"ok": True}
 
     @application.get("/v1/cache/stats")
     async def cache_stats() -> dict:
@@ -182,6 +246,13 @@ def create_app(
         sink = QueueSink()
         session.loop.output = sink
         session.busy = True
+        audit = getattr(session.loop, "audit", None)
+        if audit is not None:
+            audit.session_start(
+                mode=settings.permission.default_mode,
+                provider=type(session.loop.provider).__name__,
+                model=getattr(session.loop.provider, "model", ""),
+            )
         task = asyncio.create_task(session.loop.run(request.message))
 
         async def events() -> AsyncIterator[str]:
@@ -194,12 +265,22 @@ def create_app(
                     data = event.data
                     if event.kind == "done":
                         data = {**data, "session_id": session.session_id}
+                    # The request_id belongs to the confirm bus, not the engine
+                    # payload shape, so it is added at the transport edge.
                     yield encode_event(_event_name(event.kind), data)
                     if event.kind == "done":
                         break
                 await task
+                if audit is not None:
+                    snapshot = session.loop.stats.snapshot()
+                    audit.session_end(
+                        total_tokens=snapshot.input_tokens + snapshot.output_tokens,
+                        tool_calls=snapshot.tool_calls,
+                    )
             except (asyncio.CancelledError, GeneratorExit):
                 task.cancel()
+                # A dropped stream must not leave the model waiting forever.
+                confirm_bus.cancel_session(session.session_id)
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
                 raise

@@ -7,9 +7,13 @@ import json
 from typing import Any
 
 from finharness.config.settings import Settings
+from finharness.context.session import ResearchContext
 from finharness.data.citation import CitationRegistry, fingerprint_frame
 from finharness.engine.cost import SessionStats
 from finharness.engine.retry import RetryPolicy, stream_with_retry
+from finharness.hooks.base import HookChain
+from finharness.permissions.gate import ReadOnlyGate
+from finharness.permissions.modes import Verdict
 from finharness.provider.base import Provider
 from finharness.tools.registry import ToolRegistry
 from finharness.types import (
@@ -41,6 +45,10 @@ class AgentLoop:
         stats: SessionStats | None = None,
         cite: CitationRegistry | None = None,
         session_id: str | None = None,
+        ctx: ResearchContext | None = None,
+        gate: Any | None = None,
+        hooks: HookChain | None = None,
+        interactive: Any | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -51,14 +59,22 @@ class AgentLoop:
         self.stats = stats if stats is not None else SessionStats()
         self.cite = cite if cite is not None else CitationRegistry()
         self.session_id = session_id or "local"
+        self.ctx = ctx if ctx is not None else ResearchContext(cite=self.cite, settings=settings)
+        # Defaults keep pre-governance behaviour for callers that inject nothing.
+        self.gate = gate if gate is not None else ReadOnlyGate()
+        self.hooks = hooks if hooks is not None else HookChain()
+        self.interactive = interactive
         self.messages: list[Msg] = []
         self.usage = ModelUsage()
         self.turn = 0
-        self.active_tool_names: set[str] = set(registry.names())
 
     async def _emit(self, kind: str, data: dict[str, Any]) -> None:
         if self.output is not None:
             await self.output.emit(EngineEvent(kind, data))
+
+    def _system_prompt(self) -> str:
+        """Base prompt plus the session's research state (docs 03.6.2)."""
+        return self.system + self.ctx.state_block()
 
     def _done_payload(self, *, succeeded: bool, reason: str | None, tool_calls: int) -> dict[str, Any]:
         snapshot = self.stats.snapshot()
@@ -113,9 +129,9 @@ class AgentLoop:
             try:
                 async for chunk in stream_with_retry(
                     lambda: self.provider.stream(
-                        system=self.system,
+                        system=self._system_prompt(),
                         messages=self.messages,
-                        tools=self.registry.schemas(self.active_tool_names),
+                        tools=self.registry.schemas(),
                         usage=self.usage,
                     ),
                     policy=self.retry_policy,
@@ -241,30 +257,55 @@ class AgentLoop:
         tool = self.registry.resolve(tool_use.name)
         if tool is None:
             return await self._reject(tool_use, f"unknown tool: {tool_use.name}")
-        if not self.registry.is_read_only(tool_use.name):
-            return await self._reject(tool_use, f"tool is not read-only: {tool_use.name}")
+
+        # Governance chain (docs 03.3.3): permission verdict, then pre-hooks.
+        decision = await self.gate.check(tool, tool_use.args)
+        if decision.verdict is Verdict.DENY:
+            await self._audit(tool, tool_use.args, action="denied", verdict="deny")
+            return await self._reject(tool_use, decision.reason or f"tool denied: {tool_use.name}")
+        if not await self.hooks.pre(tool, tool_use.args, turn=self.turn):
+            await self._audit(tool, tool_use.args, action="denied", verdict="blocked")
+            return await self._reject(tool_use, f"tool blocked by hook: {tool_use.name}")
 
         await self._emit(
             "tool_status",
             {"call_id": tool_use.call_id, "name": tool_use.name, "status": "started"},
         )
+        # Operator override wins; otherwise the tool's declared budget, falling
+        # back to the global default when it declares none (docs 03.3.3).
+        default_timeout = self.settings.tools.timeout_default_s
         timeout = self.settings.tools.timeout_overrides.get(
-            tool_use.name, self.settings.tools.timeout_default_s
+            tool_use.name, tool.timeout or default_timeout
         )
         started_at = self.stats.now()
+        if getattr(tool, "needs_interactive", False) and self.interactive is not None:
+            tool.interactive = self.interactive
         try:
             result = await asyncio.wait_for(tool.run(**tool_use.args), timeout)
         except TimeoutError:
             duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
+            await self._audit(
+                tool, tool_use.args, action="run", verdict=decision.verdict.value,
+                ok=False, duration_ms=duration_ms,
+            )
             return await self._reject(
                 tool_use, f"tool timeout after {timeout}s: {tool_use.name}", duration_ms=duration_ms
             )
         except Exception as exc:
             duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
+            await self._audit(
+                tool, tool_use.args, action="run", verdict=decision.verdict.value,
+                ok=False, duration_ms=duration_ms,
+            )
             return await self._reject(tool_use, f"tool failed: {exc}", duration_ms=duration_ms)
 
         duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
         result.citations = self._register_citations(tool_use, result)
+        await self._audit(
+            tool, tool_use.args, action="run", verdict=decision.verdict.value,
+            ok=bool(result.ok), duration_ms=duration_ms, citations=result.citations,
+            result=result,
+        )
         await self._emit(
             "tool_status",
             {
@@ -277,6 +318,39 @@ class AgentLoop:
             },
         )
         return tool_use.call_id, self._encode(result)
+
+    async def _audit(
+        self,
+        tool,
+        args: dict,
+        *,
+        action: str,
+        verdict: str,
+        ok: bool = True,
+        duration_ms: float = 0.0,
+        citations: list[str] | None = None,
+        result: ToolResult | None = None,
+    ) -> None:
+        """Emit an audit record; governance failures must never break a turn."""
+        if not self.hooks.hooks:
+            return
+        endpoint, rows, cols = "", 0, 0
+        sources = getattr(result, "sources", None) if result is not None else None
+        if sources:
+            first = sources[0]
+            endpoint = getattr(first, "endpoint", "") or ""
+            df = getattr(first, "df", None)
+            if df is not None:
+                rows, cols = int(len(df)), int(len(df.columns))
+        try:
+            await self.hooks.post(
+                tool, args, result if result is not None else ToolResult(content="", ok=ok),
+                action=action, verdict=verdict, duration_ms=duration_ms,
+                citations=list(citations or []), turn=self.turn,
+                endpoint=endpoint, rows=rows, cols=cols,
+            )
+        except Exception:  # noqa: BLE001 - auditing is best-effort
+            pass
 
     def _register_citations(self, tool_use: ToolUse, result: ToolResult) -> list[str]:
         """Turn a tool's raw payloads into session-tracked citation ids."""

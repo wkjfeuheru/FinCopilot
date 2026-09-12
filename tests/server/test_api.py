@@ -238,6 +238,15 @@ def test_tools_endpoint_lists_m1_financial_tools() -> None:
             "get_peers",
             "get_market_news",
             "get_announcements",
+            "calc_metrics",
+            "read_file",
+            "write_file",
+            "research_plan",
+            "search_tools",
+            "list_skills",
+            "load_skill",
+            "load_tool",
+            "ask_user",
         ]
     }
 

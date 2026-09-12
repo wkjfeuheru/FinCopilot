@@ -7,6 +7,9 @@ from finharness.config.settings import ContextSettings, Settings, ToolSettings
 from finharness.engine.cost import SessionStats
 from finharness.engine.loop import AgentLoop
 from finharness.engine.retry import RetryPolicy
+from finharness.permissions.modes import PermissionMode, Verdict
+from finharness.permissions.gate import PermissionGate, ReadOnlyGate
+from finharness.tools.base import PermissionLevel
 from finharness.provider.base import Provider
 from finharness.provider.errors import RateLimitError
 from finharness.provider.fake import FakeProvider
@@ -109,6 +112,9 @@ class ChunkThenErrorProvider(Provider):
 class RecordingTool:
     """Read-only tool double that records arguments and can fail, stall or raise."""
 
+    permission = PermissionLevel.READ
+    timeout = None  # inherit settings.tools.timeout_default_s
+
     def __init__(
         self,
         name: str,
@@ -118,6 +124,7 @@ class RecordingTool:
         error: str | None = None,
         exc: Exception | None = None,
         delay: float = 0.0,
+        permission: PermissionLevel = PermissionLevel.READ,
     ):
         self.name = name
         self.content = content
@@ -125,6 +132,7 @@ class RecordingTool:
         self.error = error
         self.exc = exc
         self.delay = delay
+        self.permission = permission
         self.calls: list[dict] = []
 
     async def run(self, **kwargs) -> ToolResult:
@@ -171,6 +179,9 @@ class GatedTool(RecordingTool):
 
 class CancellableTool:
     """Signals when it starts and records whether it observed cancellation."""
+
+    permission = PermissionLevel.READ
+    timeout = None
 
     def __init__(self, name: str):
         self.name = name
@@ -402,7 +413,7 @@ def test_read_only_tools_run_concurrently_and_backfill_in_tool_use_order():
 def test_unknown_and_non_read_only_tools_backfill_failures_and_keep_going():
     async def run():
         sink = Sink()
-        writer = RecordingTool("write_note")
+        writer = RecordingTool("write_note", permission=PermissionLevel.WRITE)
         reader = RecordingTool("get_quote", content="报价")
         registry = StubRegistry({"get_quote": reader, "write_note": writer}, read_only={"get_quote"})
         provider = ScriptedProvider(
@@ -792,7 +803,11 @@ def test_tool_timing_and_accumulated_stats_reach_the_done_event():
 def test_unknown_and_denied_tools_count_as_requests_without_duration():
     async def run():
         sink = Sink()
-        registry = StubRegistry({"get_quote": RecordingTool("get_quote")}, read_only=set())
+        # A write-permission tool is denied by the default ReadOnlyGate; the
+        # point is that the request still counts with no execution time.
+        registry = StubRegistry(
+            {"get_quote": RecordingTool("get_quote", permission=PermissionLevel.WRITE)}
+        )
         provider = ScriptedProvider(
             [
                 tool_round(

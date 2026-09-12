@@ -153,7 +153,9 @@ class ServerSettings(FrozenModel):
 class PathSettings(FrozenModel):
     output_dir: Path = Path("output")
     memory_db: Path = Path("data_cache/memory.db")
-    skills_dir: Path = Path("skills")
+    # Skills ship with the package (docs 03.8): resolve from this file so the
+    # catalogue is found regardless of the working directory.
+    skills_dir: Path = Path(__file__).resolve().parent.parent / "skills"
 
 
 def _default_providers() -> dict[str, ProviderSettings]:

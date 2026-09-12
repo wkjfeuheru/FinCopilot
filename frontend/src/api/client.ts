@@ -33,3 +33,15 @@ export async function streamChat(
     if (done) break;
   }
 }
+
+/** Answer a mid-turn request (write confirmation or a model question). */
+export async function respondChat(requestId: string, response: string): Promise<void> {
+  const reply = await fetch("/v1/chat/respond", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request_id: requestId, response }),
+  });
+  if (!reply.ok) {
+    throw new Error((await reply.text()) || `Request failed: ${reply.status}`);
+  }
+}
