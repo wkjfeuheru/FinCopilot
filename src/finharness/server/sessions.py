@@ -28,6 +28,7 @@ class SessionRegistry:
 
     async def ensure(self, session_id: str | None) -> ServerSession:
         now = time.monotonic()
+        self._evict_expired(now)
         if session_id:
             session = self.sessions.get(session_id)
             if session and now - session.last_active <= self.ttl_s:
@@ -39,6 +40,23 @@ class SessionRegistry:
         session = ServerSession(session_id, self.loop_factory(session_id), now, now)
         self.sessions[session_id] = session
         return session
+
+    def _evict_expired(self, now: float) -> int:
+        """Drop sessions past their TTL.
+
+        Without this the registry only ever grew: an expired entry stayed in the
+        dict forever, holding its loop and transcript. Conversations now persist
+        in the memory store, so discarding the in-memory session costs nothing
+        and the entry can be released.
+        """
+        expired = [
+            session_id
+            for session_id, session in self.sessions.items()
+            if not session.busy and now - session.last_active > self.ttl_s
+        ]
+        for session_id in expired:
+            del self.sessions[session_id]
+        return len(expired)
 
     def release(self, session: ServerSession) -> None:
         session.busy = False

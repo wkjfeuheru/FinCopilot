@@ -9,6 +9,8 @@ from typing import Any
 
 from finharness.config.settings import Settings
 from finharness.context.compaction import AutoCompactor, CompactionResult
+from finharness.context.memory.short_term import Episode, ShortTermMemory
+from finharness.context.memory.summary import SummaryLayer
 from finharness.context.memory.working import WorkingMemory
 from finharness.context.session import ResearchContext
 from finharness.data.cache import make_lookup_key
@@ -77,6 +79,8 @@ class AgentLoop:
         hooks: HookChain | None = None,
         interactive: Any | None = None,
         counter: Any | None = None,
+        conversation_id: str | None = None,
+        store: Any | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -97,6 +101,24 @@ class AgentLoop:
         self.memory = WorkingMemory(ctx=self.ctx, settings=settings, counter=counter)
         # Let ctx.append_user/append_tool_result forward here (docs 03.6.2).
         self.ctx.memory = self.memory
+        # Conversation memory (docs 03.6.4): the transcript and the memory built
+        # on it persist per conversation, so a restart can resume without
+        # re-summarising. Absent a store, the loop is memory-less as before.
+        self.conversation_id = conversation_id or session_id or "local"
+        self.store = store
+        self.short_term = ShortTermMemory(cap=settings.context.short_mem_cap)
+        self.summary = SummaryLayer.load(
+            conversation_id=self.conversation_id,
+            store=store,
+            counter=self.memory.counter,
+            budget_tokens=int(
+                settings.context.context_window_tokens * settings.context.summary_budget_ratio
+            ),
+        )
+        self.ctx.short_term = self.short_term
+        self.ctx.summary = self.summary
+        self.ctx.store = store
+        self._memory_loaded = False
         self.usage = ModelUsage()
         self.turn = 0
         self.compactions: list[CompactionResult] = []
@@ -118,6 +140,90 @@ class AgentLoop:
         """Base prompt plus the session's research state (docs 03.6.2)."""
         return self.system + self.ctx.state_block()
 
+    # -- conversation memory (docs 03.6.4) ------------------------------------
+    async def _load_memory_if_first_turn(self, user_msg: str) -> None:
+        """Load persisted memory once, before the first prompt of this loop.
+
+        Everything loaded here is held on ``ctx`` so subsequent turns render the
+        same text — the prompt is measured three times per turn and those
+        measurements must agree, which a re-query could break.
+        """
+        if self._memory_loaded or self.store is None:
+            return
+        self._memory_loaded = True
+
+        self.store.ensure_conversation(self.conversation_id, title=_title_from(user_msg))
+        # Transcript, so the model resumes mid-thread rather than from nothing.
+        # track=False: replayed history is already stored; buffering it would
+        # write it again under duplicate sequence numbers.
+        for message in self.store.load_messages(self.conversation_id):
+            self.memory.append(message, track=False)
+        # Citations must keep their ids: stored summaries name them.
+        self.cite.restore(self.store.load_citations(self.conversation_id))
+        self.ctx.prior_conclusions = self.store.load_conclusions(self.conversation_id)
+        self.ctx.notes = self.store.get_notes()
+        for symbol in self.store.load_symbols(self.conversation_id):
+            self.ctx.remember_symbol(symbol)
+        self.summary = SummaryLayer.load(
+            conversation_id=self.conversation_id,
+            store=self.store,
+            counter=self.memory.counter,
+            budget_tokens=int(
+                self.settings.context.context_window_tokens
+                * self.settings.context.summary_budget_ratio
+            ),
+        )
+        self.ctx.summary = self.summary
+        self.ctx.refresh_recall()
+
+    def _persist_turn(self) -> None:
+        """Write this turn's messages and memory in one transaction.
+
+        Batching at turn end (rather than per message) keeps writes cheap; a
+        crash costs at most the current turn, which is acceptable for process
+        memory that is meant to aid, not audit.
+        """
+        pending = self.memory.pending
+        if self.store is None or not pending:
+            return
+        self.store.append_messages(self.conversation_id, pending)
+        self.memory.pending = []
+        self.store.save_citations(self.conversation_id, self.cite.all())
+        for symbol in self.ctx.symbols:
+            self.store.upsert_symbol(self.conversation_id, symbol)
+        for conclusion in self.ctx.conclusions:
+            self.store.save_conclusion(
+                self.conversation_id,
+                subject=self._conclusion_subject(conclusion.cids),
+                text=conclusion.text,
+                cids=conclusion.cids,
+            )
+        self.store.touch_conversation(self.conversation_id)
+
+    def _conclusion_subject(self, cids: list[str]) -> str:
+        """Recall key from the cited data's symbol, so one fact keys stably."""
+        for cid in cids:
+            citation = self.cite.get(cid)
+            if citation is not None and citation.symbol:
+                return str(citation.symbol)
+        return self.conversation_id
+
+    def _remember_episode(
+        self, *, kind: str, subject: str, summary: str, ref: dict | None = None
+    ) -> None:
+        """Record a structured event for L2 recall."""
+        if not subject:
+            return
+        self.short_term.add(
+            Episode(kind=kind, subject=subject, summary=summary, ref=dict(ref or {}))
+        )
+        # Keep the symbol pool in step with what was actually fetched. Deriving
+        # it from citations alone would miss fetches that produced no citation
+        # (text payloads), leaving recall with no subjects to search.
+        if kind == "data":
+            self.ctx.remember_symbol(subject)
+        self.ctx.refresh_recall()
+
     async def _maybe_compact(self) -> None:
         """Fold history when the next request would exceed the window budget."""
         compactor = AutoCompactor(
@@ -126,6 +232,7 @@ class AgentLoop:
             settings=self.settings,
             system=self._system_prompt(),
             tools=self.registry.schemas(),
+            summary=self.summary,
         )
         if not compactor.needs_compaction():
             return
@@ -287,6 +394,14 @@ class AgentLoop:
         )
 
     async def run(self, user_msg: str) -> AgentTurnOutcome:
+        # On the conversation's first turn, load persisted memory before the
+        # prompt is built. Later turns reuse it (see ctx) rather than re-querying:
+        # the system prompt is measured three times per turn and those
+        # measurements must agree.
+        await self._load_memory_if_first_turn(user_msg)
+        # Open this turn's write buffer before appending, so the user message is
+        # buffered for persistence rather than discarded by the reset.
+        self.memory.pending = []
         if user_msg:
             self.memory.append_user(user_msg)
 
@@ -295,6 +410,11 @@ class AgentLoop:
         self._call_counts = {}
         self._reminded = set()
 
+        outcome = await self._run_turns()
+        self._persist_turn()
+        return outcome
+
+    async def _run_turns(self) -> AgentTurnOutcome:
         tool_calls_total = 0
         for _ in range(self.settings.context.max_turns):
             self.turn += 1
@@ -609,4 +729,23 @@ class AgentLoop:
                 parquet_path=getattr(source, "parquet_path", None),
             )
             cids.append(citation.cid)
+        # L2: record that this data was fetched, with a pointer to it, so a later
+        # follow-up can reuse it rather than fetching again. Recorded per call
+        # rather than per source, because a fetch happened even when the payload
+        # is text (no DataFrame) rather than tabular.
+        if symbol and result.ok:
+            self._remember_episode(
+                kind="data",
+                subject=str(symbol),
+                summary=f"{tool_use.name} 已取数" + (f"（{len(cids)} 份）" if cids else ""),
+                ref={"cids": list(cids)},
+            )
         return cids
+
+
+def _title_from(user_msg: str) -> str | None:
+    """Derive a conversation title from its opening message."""
+    text = (user_msg or "").strip()
+    if not text:
+        return None
+    return text[:40]

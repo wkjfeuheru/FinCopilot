@@ -250,6 +250,7 @@ def test_tools_endpoint_lists_m1_financial_tools() -> None:
             "load_skill",
             "load_tool",
             "ask_user",
+            "remember_preference",
         ]
     }
 

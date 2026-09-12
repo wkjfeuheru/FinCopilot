@@ -32,6 +32,12 @@ class Citation:
         )
 
 
+def _cid_ordinal(cid: str) -> int:
+    """Numeric part of a ``cit_%06d`` id; 0 when the shape is unexpected."""
+    _, _, suffix = cid.partition("_")
+    return int(suffix) if suffix.isdigit() else 0
+
+
 def fingerprint_series(records: Any) -> str:
     """Stable digest of tabular content, independent of column order noise."""
     payload = json.dumps(records, ensure_ascii=False, sort_keys=True, default=str)
@@ -53,6 +59,20 @@ class CitationRegistry:
         self._items: list[Citation] = []
         self._by_id: dict[str, Citation] = {}
         self._counter = 0
+
+    def restore(self, citations: list[Citation]) -> None:
+        """Reinstate previously issued citations, keeping their original ids.
+
+        Id stability matters once conversations persist: a stored summary or
+        conclusion names ``cit_000005``, so renumbering on reload would silently
+        point those references at different data.
+        """
+        for citation in citations:
+            if citation.cid in self._by_id:
+                continue
+            self._items.append(citation)
+            self._by_id[citation.cid] = citation
+            self._counter = max(self._counter, _cid_ordinal(citation.cid))
 
     def register(
         self,

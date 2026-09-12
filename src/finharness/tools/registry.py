@@ -29,6 +29,7 @@ from finharness.tools.generic.files import ReadFileTool, WriteFileTool
 from finharness.tools.meta.ask import AskUserTool
 from finharness.tools.meta.discovery import LoadToolTool, SearchToolsTool
 from finharness.tools.meta.plan import ResearchPlanTool
+from finharness.tools.meta.preference import RememberPreferenceTool
 from finharness.tools.meta.skills import ListSkillsTool, LoadSkillTool
 
 # docs 03.4.1 权威口径：resident=20、lazy=4。Every name here must resolve to a
@@ -66,6 +67,7 @@ ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
     LoadSkillTool,
     LoadToolTool,
     AskUserTool,
+    RememberPreferenceTool,
 )
 
 FINANCIAL_DATA_TOOLS = ALL_TOOL_CLASSES

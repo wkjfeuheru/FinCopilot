@@ -142,10 +142,20 @@ class ContextSettings(FrozenModel):
     # because a repeated identical call is never informative: its result is
     # already in the transcript and in the cache.
     max_identical_tool_calls: Annotated[int, Field(ge=2, le=10)] = 3
-    # Consumed once L2/L3 memory lands; unused today.
+    # --- memory (docs 03.6.4) ---
+    # L2 event ring cap; over it, the oldest *data* episodes are dropped first
+    # (recoverable from the cache) rather than conclusions.
     short_mem_cap: PositiveInt = 200
     recall_max_tokens: PositiveInt = 400
     ltm_inject_max_tokens: PositiveInt = 600
+    # Share of the window reserved for summary segments; the rest keeps recent
+    # turns verbatim, because those describe what is happening right now.
+    summary_budget_ratio: Annotated[float, Field(gt=0, le=0.5)] = 0.2
+    # At least this many recent rounds stay verbatim regardless of the budget.
+    min_recent_rounds: Annotated[int, Field(ge=1, le=10)] = 2
+    # Retention bounds for persisted conversations; whichever comes first prunes.
+    retention_conversations: PositiveInt = 200
+    retention_days: PositiveInt = 180
 
 
 class AuditSettings(FrozenModel):
@@ -445,6 +455,10 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_CONTEXT_MAX_RESULT_TOKENS": (("context", "max_result_tokens"), int),
     "FINH_CONTEXT_MAX_TOOL_SCHEMA_TOKENS": (("context", "max_tool_schema_tokens"), int),
     "FINH_CONTEXT_MAX_IDENTICAL_TOOL_CALLS": (("context", "max_identical_tool_calls"), int),
+    "FINH_CONTEXT_SUMMARY_BUDGET_RATIO": (("context", "summary_budget_ratio"), float),
+    "FINH_CONTEXT_MIN_RECENT_ROUNDS": (("context", "min_recent_rounds"), int),
+    "FINH_CONTEXT_RETENTION_CONVERSATIONS": (("context", "retention_conversations"), int),
+    "FINH_CONTEXT_RETENTION_DAYS": (("context", "retention_days"), int),
     "FINH_CONTEXT_SHORT_MEM_CAP": (("context", "short_mem_cap"), int),
     "FINH_CONTEXT_RECALL_MAX_TOKENS": (("context", "recall_max_tokens"), int),
     "FINH_CONTEXT_LTM_INJECT_MAX_TOKENS": (("context", "ltm_inject_max_tokens"), int),

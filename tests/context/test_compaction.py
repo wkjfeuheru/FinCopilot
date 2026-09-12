@@ -108,31 +108,36 @@ def test_summary_replaces_the_middle_and_keeps_recent_rounds(tmp_path):
 
     loop = asyncio.run(run())
 
-    digest_bodies = [m.content for m in loop.memory.raw if m.content and "摘要内容" in m.content]
-    assert digest_bodies, "the digest should be in the window"
-    # The oldest history must be gone from the window.
+    # No digest message: earlier history moved to the summary layer, which is
+    # injected through the system prompt instead of masquerading as user input.
     contents = [m.content or "" for m in loop.memory.raw]
-    assert not any("历史问题0" in text for text in contents)
+    assert not any("摘要内容" in text for text in contents)
+    assert not any("历史问题0" in text for text in contents), "oldest history left the window"
+    assert loop.summary is not None
+    assert loop.summary.segments, "folded history becomes a summary segment"
 
 
-def test_digest_notes_that_data_remains_traceable(tmp_path):
-    """Compaction removes data from the window, not from the session."""
-    cite = CitationRegistry()
-    cid = cite.register(
-        tool="get_quote", endpoint="e", symbol="600519", params={},
-        rows=1, cols=1, fingerprint="x",
-    ).cid
+def test_summary_segment_carries_a_data_ledger(tmp_path):
+    """Compaction removes the tool results, so the ledger is how the model still
+    knows a fetch already happened."""
     settings = make_settings(tmp_path)
-    ctx = ResearchContext(cite=cite, settings=settings)
+    ctx = ResearchContext(cite=CitationRegistry(), settings=settings)
     memory = WorkingMemory(ctx=ctx, settings=settings, counter=COUNTER)
+    memory.append_user("问题")
+    for index in range(10):
+        memory.append_assistant(
+            Msg(role="assistant", content=None, tool_uses=[ToolUse(f"c{index}", "get_quote", {"symbol": "600519"})])
+        )
+        memory.append(Msg(role="tool_result", content=None, tool_results=[(f"c{index}", "结果" * 20)]))
+
     compactor = AutoCompactor(
-        provider=ScriptedProvider([text_round("摘要")]), memory=memory, settings=settings
+        provider=ScriptedProvider([text_round("摘要内容")]), memory=memory, settings=settings
     )
+    result = asyncio.run(compactor.compact())
 
-    header = compactor._digest_header([])
-
-    assert cid in header
-    assert "缓存" in header
+    assert result.compacted is True
+    assert "get_quote(600519)" in result.ledger
+    assert result.seq_from >= 1 and result.seq_to >= result.seq_from
 
 
 def test_summarizer_failure_degrades_without_blocking(tmp_path):

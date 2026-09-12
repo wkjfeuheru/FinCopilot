@@ -92,6 +92,7 @@ def test_registry_covers_the_documented_catalogue(tmp_path):
         "calc_metrics", "calc_valuation", "make_chart", "write_report",
         "read_file", "write_file", "research_plan",
         "search_tools", "list_skills", "load_skill", "load_tool", "ask_user",
+        "remember_preference",
     }
     assert set(registry.names()) == expected
     assert set(registry.names()) == {cls.name for cls in ALL_TOOL_CLASSES}

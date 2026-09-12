@@ -62,6 +62,19 @@ class ResearchContext:
         # docs 03.6.2's append_* surface is available without ctx owning the
         # transcript.
         self.memory: object | None = None
+        # Memory surfaces injected by the loop on the conversation's first turn.
+        # Held here so every turn renders the same text: the system prompt is
+        # measured three times per turn (build, window check, compaction) and
+        # those measurements must agree.
+        self.summary: object | None = None          # SummaryLayer
+        self.short_term: object | None = None       # ShortTermMemory
+        self.recalled: list[object] = []
+        self.prior_conclusions: list[object] = []
+        self.notes: dict[str, str] = {}
+        self._remembered_symbols: list[str] = []
+        # Set by the loop when conversation memory is available; lets meta tools
+        # write global memory (preferences) without knowing the store's shape.
+        self.store: object | None = None
 
     # -- transcript forwarding (docs 03.6.2) ----------------------------------
     def append_user(self, text: str) -> None:
@@ -75,11 +88,34 @@ class ResearchContext:
         if memory is not None:
             memory.append_tool_result(call_id, content)  # type: ignore[attr-defined]
 
+    def refresh_recall(self) -> None:
+        """Recompute recalled events from the conversation's own symbol pool.
+
+        Skip anything already visible as a conclusion, or recall would spend the
+        budget restating facts already on screen.
+        """
+        short_term = self.short_term
+        if short_term is None:
+            return
+        visible = [item.text for item in self.conclusions[-6:]]
+        self.recalled = short_term.recall(  # type: ignore[attr-defined]
+            self.symbols, exclude_summaries=visible
+        )
+
     # -- symbols --------------------------------------------------------------
     @property
     def symbols(self) -> list[str]:
-        """Covered-symbol pool, derived from the citation registry."""
-        return self.cite.resolve_symbols()
+        """Covered-symbol pool: citations plus any symbol explicitly remembered."""
+        seen = self.cite.resolve_symbols()
+        for symbol in self._remembered_symbols:
+            if symbol not in seen:
+                seen.append(symbol)
+        return seen
+
+    def remember_symbol(self, symbol: str) -> None:
+        """Record a covered symbol (used when reloading a conversation)."""
+        if symbol and symbol not in self._remembered_symbols:
+            self._remembered_symbols.append(symbol)
 
     # -- plan -----------------------------------------------------------------
     def set_plan(self, goal: str, steps: list[PlanStep]) -> Plan:
@@ -149,19 +185,79 @@ class ResearchContext:
 
     # -- system injection -----------------------------------------------------
     def state_block(self) -> str:
-        """Research-state section appended to the system prompt (docs 03.6.2)."""
+        """Research-state section appended to the system prompt (docs 03.6.2).
+
+        Composes four distinct surfaces, in order of how immediately the model
+        needs them: the active plan, this conversation's conclusions, recalled
+        events, then the segmented history summary. Each has a different shape on
+        purpose — see the memory package docstrings.
+        """
         parts: list[str] = []
         digest = self.plan_digest()
         if digest:
             parts.append(digest)
         if self.loaded_skills:
             parts.append("已加载方法论：" + "、".join(self.loaded_skills))
-        if self.conclusions:
-            recent = self.conclusions[-3:]
-            rendered = "\n".join(
-                f"  - {item.text}（依据 {'、'.join(item.cids) or '无'}）" for item in recent
+
+        conclusion_lines = self._conclusion_lines()
+        if conclusion_lines:
+            parts.append("本对话已形成结论：\n" + "\n".join(conclusion_lines))
+
+        recalled = self._recalled_lines()
+        if recalled:
+            parts.append("相关历史事件：\n" + "\n".join(recalled))
+
+        prior = self._prior_conclusion_lines()
+        if prior:
+            parts.append(
+                "历史结论（来自本对话更早的轮次，时间敏感数据请重新核对）：\n"
+                + "\n".join(prior)
             )
-            parts.append("已形成结论：\n" + rendered)
+
+        summary = self._summary_text()
+        if summary:
+            parts.append(summary)
+
+        preferences = self._preference_lines()
+        if preferences:
+            parts.append("用户偏好（所有对话共享）：\n" + "\n".join(preferences))
+
         if not parts:
             return ""
         return "\n\n【会话研究状态】\n" + "\n".join(parts)
+
+    # -- injection helpers ----------------------------------------------------
+    def _conclusion_lines(self) -> list[str]:
+        return [
+            f"  - {item.text}（依据 {'、'.join(item.cids) or '无'}）"
+            for item in self.conclusions[-3:]
+        ]
+
+    def _recalled_lines(self) -> list[str]:
+        lines: list[str] = []
+        for episode in self.recalled:
+            kind = getattr(episode, "kind", "data")
+            marker = "数据" if kind == "data" else "结论"
+            lines.append(f"  - [{marker}] {getattr(episode, 'subject', '')}：{getattr(episode, 'summary', '')}")
+        return lines
+
+    def _prior_conclusion_lines(self) -> list[str]:
+        """Conclusions reloaded from the store; dated so staleness is visible."""
+        lines: list[str] = []
+        for record in self.prior_conclusions:
+            text = getattr(record, "text", "")
+            if any(text == item.text for item in self.conclusions):
+                continue
+            formed = str(getattr(record, "ts", ""))[:10]
+            subject = getattr(record, "subject", "")
+            lines.append(f"  - {text}（{subject}，形成于 {formed}）")
+        return lines[:5]
+
+    def _summary_text(self) -> str:
+        summary = self.summary
+        if summary is None:
+            return ""
+        return summary.render(max_tokens=self.settings.context.ltm_inject_max_tokens)  # type: ignore[attr-defined]
+
+    def _preference_lines(self) -> list[str]:
+        return [f"  - {key}：{value}" for key, value in sorted(self.notes.items())]

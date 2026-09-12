@@ -73,18 +73,18 @@ def test_squash_keeps_the_recent_rounds_and_returns_removed_count(tmp_path):
         memory.append_user(f"问题{index}")
         memory.append_assistant(Msg(role="assistant", content=f"回答{index}"))
 
-    removed = memory.squash(digest=Msg.user("摘要"))
+    removed, discarded = memory.squash(keep_rounds=2)
 
     assert removed > 0
-    # The digest leads the window, and the most recent exchange survives.
-    assert memory.raw[0].content == "摘要"
+    # No digest is injected: earlier history lives in the summary layer.
+    assert "摘要" not in [m.content for m in memory.raw if m.role == "user"]
     assert "问题4" in [m.content for m in memory.raw if m.role == "user"]
     assert "问题0" not in [m.content for m in memory.raw if m.role == "user"]
     # Two assistant frames survive: one per kept round.
     assistants = [m for m in memory.raw if m.role == "assistant"]
     assert len(assistants) == KEEP_RECENT_ROUNDS
     # The kept window starts with an assistant frame, so tool calls stay paired.
-    assert memory.raw[1].role == "assistant"
+    assert memory.raw[0].role == "assistant"
 
 
 def test_squash_leaves_cumulative_spend_untouched(tmp_path):
@@ -94,7 +94,7 @@ def test_squash_leaves_cumulative_spend_untouched(tmp_path):
         memory.append_user(f"问题{index}")
     before = memory.used_tokens
 
-    memory.squash(digest=Msg.user("摘要"))
+    memory.squash(keep_rounds=2)
 
     assert memory.used_tokens == before
 
@@ -107,7 +107,7 @@ def test_squash_reduces_the_window(tmp_path):
         memory.append_assistant(Msg(role="assistant", content="很长的阶段回答" * 20))
     before = memory.request_tokens(system="s", tools=[])
 
-    memory.squash(digest=Msg.user("摘要"))
+    memory.squash(keep_rounds=2)
 
     assert memory.request_tokens(system="s", tools=[]) < before
 
@@ -118,7 +118,7 @@ def test_squash_with_nothing_to_fold_is_a_noop(tmp_path):
     memory.append_assistant(Msg(role="assistant", content="唯一回答"))
     before = len(memory.raw)
 
-    removed = memory.squash(digest=Msg.user("摘要"))
+    removed, _ = memory.squash(keep_rounds=2)
 
     assert removed == 0
     assert len(memory.raw) == before
@@ -146,10 +146,10 @@ def test_rounds_are_counted_by_exchange_not_by_user_message(tmp_path):
             Msg(role="tool_result", content=None, tool_results=[(f"c{index}", "数据" * 10)])
         )
 
-    removed = memory.squash(digest=Msg.user("摘要"))
+    removed, _ = memory.squash(keep_rounds=2)
 
     assert removed > 0, "a single-question long session must still be foldable"
-    assert memory.raw[0].content == "摘要"
+    assert memory.raw[0].role == "assistant"
 
 
 def test_squash_never_orphans_a_tool_result(tmp_path):
@@ -173,7 +173,7 @@ def test_squash_never_orphans_a_tool_result(tmp_path):
             Msg(role="tool_result", content=None, tool_results=[(f"c{index}", "结果")])
         )
 
-    memory.squash(digest=Msg.user("摘要"))
+    memory.squash(keep_rounds=2)
 
     announced: set[str] = set()
     for message in memory.raw:
@@ -181,4 +181,4 @@ def test_squash_never_orphans_a_tool_result(tmp_path):
             announced.add(tool_use.call_id)
         for call_id, _ in message.tool_results:
             assert call_id in announced, f"tool_result {call_id} has no assistant frame"
-    assert memory.raw[1].role == "assistant", "the kept window must start with a tool call"
+    assert memory.raw[0].role == "assistant", "the kept window must start with a tool call"

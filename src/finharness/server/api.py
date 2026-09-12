@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
 from finharness.config.store import ConfigStore
+from finharness.context.memory.store import MemoryStore
 from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
@@ -100,6 +101,15 @@ def create_app(
     session_contexts: dict[str, ResearchContext] = {}
     fallback_provider = provider
 
+    # Conversation memory: one store serves every conversation; the transcript,
+    # citations, conclusions and summary segments are keyed by conversation id.
+    memory_store = MemoryStore(settings.paths.memory_db)
+    application.state.memory_store = memory_store
+    memory_store.prune(
+        max_conversations=settings.context.retention_conversations,
+        max_age_days=settings.context.retention_days,
+    )
+
     def loop_factory(session_id: str | None = None) -> AgentLoop:
         if fallback_provider is not None:
             selected = fallback_provider
@@ -133,6 +143,8 @@ def create_app(
             ctx=ctx,
             gate=gate,
             hooks=HookChain([audit]),
+            conversation_id=session_id,
+            store=memory_store,
         )
 
         async def _ask(kind: str, prompt: str, options: list[str]):
@@ -197,6 +209,40 @@ def create_app(
             "hits": snapshot.hits,
             "misses": snapshot.misses,
             "hit_ratio": snapshot.hit_ratio,
+        }
+
+    @application.get("/v1/memory")
+    async def memory_view(conversation_id: str | None = None, limit: int = 20) -> dict:
+        """Read-only view of accumulated memory.
+
+        Replaces the MEMORY.md file view the design once proposed: the web layer
+        is where a human reads this, and it stays structured rather than being
+        rewritten to a file on every turn.
+        """
+        return {
+            "notes": memory_store.get_notes(),
+            "conversations": [
+                {
+                    "conversation_id": record.conversation_id,
+                    "title": record.title,
+                    "created_at": record.created_at,
+                    "last_active_at": record.last_active_at,
+                }
+                for record in memory_store.list_conversations(limit=limit)
+            ],
+            "conclusions": (
+                [
+                    {
+                        "subject": item.subject,
+                        "text": item.text,
+                        "cids": list(item.cids),
+                        "ts": item.ts,
+                    }
+                    for item in memory_store.load_conclusions(conversation_id, limit=limit)
+                ]
+                if conversation_id
+                else []
+            ),
         }
 
     @application.get("/v1/artifacts")

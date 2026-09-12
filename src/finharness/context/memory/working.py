@@ -14,8 +14,10 @@ from finharness.config.settings import Settings
 from finharness.context.tokens import TokenCounter
 from finharness.types import Msg
 
-# How many of the most recent rounds survive compaction verbatim.
+# How many of the most recent rounds survive compaction verbatim when no
+# explicit keep count is given (the budget usually decides; this is the floor).
 KEEP_RECENT_ROUNDS = 2
+WORKING_WINDOW_FLOOR = KEEP_RECENT_ROUNDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,10 +44,23 @@ class WorkingMemory:
         self.raw: list[Msg] = []
         self.used_tokens = 0
         self._exact = True
+        # Messages folded out of the window so far; the next transcript row's
+        # sequence number, used to key summary segments to a message range.
+        self.discarded = 0
+        # Optional sink for messages appended during this turn, so the loop can
+        # persist them in one batch instead of writing per message.
+        self.pending: list[Msg] = []
 
     # -- writes (the only mutation points) ------------------------------------
-    def append(self, message: Msg) -> None:
+    def append(self, message: Msg, *, track: bool = True) -> None:
+        """Append a message; ``track=False`` for replayed history.
+
+        Messages loaded back from the store must not be buffered as pending, or
+        the next persist would write them again with duplicate sequence numbers.
+        """
         self.raw.append(message)
+        if track:
+            self.pending.append(message)
         self._account([message])
 
     def append_user(self, text: str) -> None:
@@ -101,18 +116,63 @@ class WorkingMemory:
         return self.request_tokens(system=system, tools=tools) >= threshold
 
     # -- window maintenance ---------------------------------------------------
-    def squash(self, *, digest: Msg, keep_rounds: int = KEEP_RECENT_ROUNDS) -> int:
-        """Replace everything but the last ``keep_rounds`` rounds with a digest.
+    def squash(self, *, keep_rounds: int | None = None) -> tuple[int, int]:
+        """Discard all but the most recent rounds, returning ``(removed, discarded)``.
 
-        Returns how many messages were folded away. Cumulative ``used_tokens`` is
-        deliberately left untouched: the tokens were still spent.
+        ``removed`` counts messages folded away and ``discarded`` counts only
+        tool results, which is what the caller reports. Recent rounds are chosen
+        by token budget with a round-count floor (docs 03.6.4): round size varies
+        by an order of magnitude, so a fixed round count either wastes budget or
+        overruns it, but dropping below the floor would cut the round the model
+        is currently working on.
+
+        No digest message is inserted here. Earlier history lives in the summary
+        layer and is injected through the system prompt, so it is not disguised
+        as something the user said — and it cannot be re-summarised next time.
         """
-        boundary = _recent_boundary(self.raw, keep_rounds)
+        keep = self._rounds_to_keep() if keep_rounds is None else keep_rounds
+        boundary = _recent_boundary(self.raw, keep)
         if boundary <= 0:
-            return 0
-        removed = boundary
-        self.raw = [digest, *self.raw[boundary:]]
-        return removed
+            return (0, 0)
+        discarded = sum(len(message.tool_results) for message in self.raw[:boundary])
+        self.raw = self.raw[boundary:]
+        self.discarded += boundary
+        return (boundary, discarded)
+
+    def _rounds_to_keep(self) -> int:
+        """How many recent rounds fit the budget, never below the floor."""
+        floor = self.settings.context.min_recent_rounds
+        if not self.raw:
+            return floor
+        budget = self.settings.context.context_window_tokens * (
+            1.0 - self.settings.context.summary_budget_ratio
+        )
+        assistant_positions = [
+            index for index, message in enumerate(self.raw) if message.role == "assistant"
+        ]
+        kept = 0
+        used = 0
+        # Walk backwards from the newest round, accumulating until it no longer fits.
+        for position in reversed(assistant_positions):
+            chunk = self.raw[position:]
+            chunk_tokens = sum(
+                self.counter.count(text).tokens
+                for message in chunk
+                for text in _message_texts(message)
+            )
+            if kept >= floor and used + chunk_tokens > budget:
+                break
+            used += chunk_tokens
+            kept += 1
+        return max(kept, floor)
+
+    def round_count(self) -> int:
+        """Rounds held verbatim; the compactor uses this to bound its range."""
+        return sum(1 for message in self.raw if message.role == "assistant")
+
+    def window_floor(self) -> int:
+        """Sequence index of the oldest message currently in the window."""
+        return self.discarded
 
 
 def _recent_boundary(messages: list[Msg], keep_rounds: int) -> int:

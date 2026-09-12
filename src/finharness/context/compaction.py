@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 
 from finharness.config.settings import Settings
+from finharness.context.memory.summary import SummaryLayer
 from finharness.context.memory.working import KEEP_RECENT_ROUNDS, WorkingMemory
 from finharness.provider.base import Provider
 from finharness.types import Msg, ModelUsage, StreamEvent
@@ -35,6 +36,9 @@ class CompactionResult:
     degraded: bool = False
     warning: str | None = None
     duration_ms: int = 0
+    seq_from: int = 0
+    seq_to: int = 0
+    ledger: tuple[str, ...] = ()
 
 
 class AutoCompactor:
@@ -48,12 +52,16 @@ class AutoCompactor:
         settings: Settings,
         system: str = "",
         tools: list[dict] | None = None,
+        summary: SummaryLayer | None = None,
     ) -> None:
         self.provider = provider
         self.memory = memory
         self.settings = settings
         self.system = system
         self.tools = tools or []
+        # When present, folded history becomes a summary segment rather than a
+        # synthetic user message (docs 03.6.4).
+        self.summary = summary
 
     def needs_compaction(self) -> bool:
         return self.memory.over_budget(system=self.system, tools=self.tools)
@@ -75,29 +83,39 @@ class AutoCompactor:
         degraded = False
         warning: str | None = None
         try:
-            digest_text = await self._summarize(foldable)
+            summary_text = await self._summarize(foldable)
         except Exception as exc:  # noqa: BLE001 - compaction must not block a turn
             degraded = True
-            warning = f"摘要生成失败，已降级为丢弃最早的工具结果：{exc}"
-            digest_text = self._fallback_digest(foldable)
+            warning = f"摘要生成失败，已降级为计数式摘要：{exc}"
+            summary_text = self._fallback_digest(foldable)
 
-        removed = self.memory.squash(
-            digest=Msg.user(digest_text), keep_rounds=KEEP_RECENT_ROUNDS
-        )
+        ledger = self._ledger(foldable)
+        # The messages being folded occupy the sequence range starting after
+        # whatever was already discarded.
+        seq_from = self.memory.discarded + 1
+        seq_to = self.memory.discarded + boundary
+
+        removed, _discarded = self.memory.squash()
         after = self.memory.request_tokens(system=self.system, tools=self.tools)
 
-        # Keeping the recent rounds may not be enough when those rounds are
-        # themselves large; tighten until the window is back inside the budget
-        # rather than leaving the next request over it.
+        # Keeping the recent rounds may not suffice when those rounds are large;
+        # tighten until the window is inside budget rather than leaving the next
+        # request over it.
         threshold = self.settings.context.compaction_ratio * self.settings.context.context_window_tokens
-        for keep in (1, 0):
-            if after < threshold:
-                break
-            extra = self.memory.squash(digest=Msg.user(digest_text), keep_rounds=keep)
+        while after >= threshold:
+            extra, _ = self.memory.squash(keep_rounds=1)
             if extra == 0:
                 break
             removed += extra
             after = self.memory.request_tokens(system=self.system, tools=self.tools)
+
+        if self.summary is not None and removed > 0:
+            self.summary.add(
+                seq_from=seq_from,
+                seq_to=seq_to,
+                text=summary_text,
+                ledger=list(ledger),
+            )
 
         return CompactionResult(
             compacted=removed > 0,
@@ -107,7 +125,26 @@ class AutoCompactor:
             degraded=degraded,
             warning=warning,
             duration_ms=_ms(started),
+            seq_from=seq_from if removed else 0,
+            seq_to=seq_to if removed else 0,
+            ledger=ledger if removed else (),
         )
+
+    def _ledger(self, foldable: list[Msg]) -> tuple[str, ...]:
+        """Structured record of what data was fetched in the folded range.
+
+        Compaction removes the tool results from the window, so this is the only
+        way the model can still tell that a fetch already happened — which is
+        what keeps "don't fetch it twice" actionable.
+        """
+        entries: list[str] = []
+        for message in foldable:
+            for tool_use in message.tool_uses:
+                symbol = (tool_use.args or {}).get("symbol")
+                label = f"{tool_use.name}({symbol})" if symbol else tool_use.name
+                if label not in entries:
+                    entries.append(label)
+        return tuple(entries)
 
     # -- summarisation --------------------------------------------------------
     async def _summarize(self, messages: list[Msg]) -> str:
@@ -130,41 +167,31 @@ class AutoCompactor:
         summary = "".join(collected).strip()
         if not summary:
             raise RuntimeError("摘要调用未返回任何内容")
-        return self._digest_header(messages) + summary
-
-    def _digest_header(self, foldable: list[Msg]) -> str:
-        """Keep the traceability note: data is gone from the window, not lost."""
-        citations = self.memory.ctx.cite.all() if self.memory.ctx is not None else []
-        if not citations:
-            return "【已压缩的历史研究过程】\n"
-        cids = "、".join(item.cid for item in citations[:12])
-        return (
-            f"【已压缩的历史研究过程】此前已取过 {len(citations)} 份数据"
-            f"（引用 {cids}），完整数据仍在缓存中，可精读或引用。\n"
-        )
+        return summary
 
     def _fallback_digest(self, foldable: list[Msg]) -> str:
-        """Minimal stand-in digest: counts, not a restatement.
+        """Minimal stand-in summary: counts, not a restatement.
 
         The fallback exists to shrink the window, so it must be smaller than what
         it replaces. Keeping every turn's text would defeat that, so only the
-        original goal and the shape of the research survive.
+        original goal and the shape of the research survive. The data ledger
+        travels separately and is attached by ``compact`` regardless.
         """
         questions = [m.content for m in foldable if m.role == "user" and m.content]
         answers = sum(1 for m in foldable if m.role == "assistant" and m.content)
         dropped = sum(len(message.tool_results) for message in foldable)
-        lines = [self._digest_header(foldable).rstrip()]
+        lines: list[str] = []
         if questions:
             goal = questions[0] or ""
-            lines.append(f"- 起始目标：{goal[:120]}")
-        lines.append(f"- 已完成 {answers} 轮分析与 {dropped} 次数据获取")
+            lines.append(f"起始目标：{goal[:120]}")
+        lines.append(f"已完成 {answers} 轮分析与 {dropped} 次数据获取")
         if dropped:
-            lines.append("- 这些数据仍可从引用中精读，无需重新获取")
-        return "\n".join(lines)
+            lines.append("数据仍可从引用中精读，无需重新获取")
+        return "；".join(lines)
 
 
 def _foldable_boundary(messages: list[Msg]) -> int:
-    """Everything before the last KEEP_RECENT_ROUNDS rounds may be folded."""
+    """Everything before the rounds the budget keeps may be folded."""
     from finharness.context.memory.working import _recent_boundary
 
     return _recent_boundary(messages, KEEP_RECENT_ROUNDS)

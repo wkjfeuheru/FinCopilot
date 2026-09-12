@@ -72,3 +72,32 @@ class TokenCounter:
 
     def count_many(self, texts) -> int:
         return sum(self.count(text).tokens for text in texts)
+
+
+def truncate_to_tokens(
+    text: str, counter: "TokenCounter", limit: int, *, marker: str = "…"
+) -> str:
+    """Cut text to a token budget, landing on a character boundary.
+
+    Used wherever a memory layer must fit an injection budget (summary segments,
+    recall, long-term recall). The marker is charged *against* the budget, so the
+    result never exceeds the limit — otherwise a caller sizing content exactly to
+    the budget would overflow by the marker's length and trigger another round.
+    """
+    if limit <= 0 or counter.count(text).tokens <= limit:
+        return text
+    marker_tokens = counter.count(marker).tokens
+    body_budget = max(limit - marker_tokens, 0)
+    low, high = 0, len(text)
+    # Counting is monotone in prefix length, so the longest fitting prefix is
+    # found by bisection.
+    while low < high:
+        middle = (low + high + 1) // 2
+        if counter.count(text[:middle]).tokens <= body_budget:
+            low = middle
+        else:
+            high = middle - 1
+    prefix = text[:low].rstrip()
+    if len(prefix) < len(text):
+        return prefix + marker
+    return prefix
