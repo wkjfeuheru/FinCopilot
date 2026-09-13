@@ -81,6 +81,69 @@ def test_prompt_states_output_discipline():
     assert "买卖建议" in text
 
 
+# --- role, capability boundary and refusal policy (prompt design pass) --------
+
+def test_prompt_defines_a_specific_role_and_capability_boundary():
+    """A vague "you are an assistant" leaves the model free to improvise."""
+    text = system_prompt()
+
+    assert "角色与能力边界" in text
+    assert "A 股" in text
+    # Both sides must be stated, or the model cannot tell what to decline.
+    assert "你能做" in text or "能做" in text
+    assert "不能做" in text or "不能" in text
+    # The named gaps are what makes the boundary operational.
+    assert "港股" in text or "美股" in text
+    assert "预测" in text
+
+
+def test_prompt_states_the_knowledge_boundary():
+    """Params carry data; the model's own memory must not be a number source."""
+    text = system_prompt()
+
+    assert "知识边界" in text
+    assert "本次取数" in text
+
+
+def test_prompt_shows_the_citation_format_by_example():
+    """A bare description is weaker than description + a concrete example."""
+    text = system_prompt()
+
+    assert "正确示例" in text
+    assert "错误示例" in text
+    # The examples must actually use the placeholder syntax they teach.
+    assert text.count("{cite:") >= 3
+
+
+def test_prompt_report_example_matches_the_real_schema():
+    """The JSON example must keep validating against ReportInput.
+
+    An example that drifts from the schema teaches the model a shape the tool
+    will reject, which is worse than having no example at all.
+    """
+    import json
+    import re
+
+    from finharness.tools.fin.writer import ReportInput
+
+    blocks = re.findall(r"```json\n(.*?)```", system_prompt(), re.DOTALL)
+    assert blocks, "the prompt should carry a JSON example for write_report"
+
+    for block in blocks:
+        ReportInput.model_validate(json.loads(block))
+
+
+def test_prompt_has_a_refusal_policy():
+    """Without this the model answers out of range instead of declining."""
+    text = system_prompt()
+
+    assert "超出能力范围" in text
+    assert "不要勉强" in text or "不硬撑" in text
+    # The anti-hallucination rule, stated as the bottom line.
+    assert "不得猜测" in text or "不得编造" in text
+    assert "取不到" in text
+
+
 def test_missing_asset_raises(tmp_path):
     with pytest.raises(PromptNotFoundError):
         system_prompt(tmp_path / "nope.md")
