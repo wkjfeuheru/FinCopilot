@@ -240,7 +240,11 @@ def test_done_event_carries_the_session_id_and_usage() -> None:
     assert done[0] == "done"
     assert done[1]["session_id"] == session_id_from(response.text)
     assert done[1]["succeeded"] is True
-    assert done[1]["usage"] == {"input_tokens": 1, "output_tokens": 1}
+    assert done[1]["usage"]["input_tokens"] == 1
+    assert done[1]["usage"]["output_tokens"] == 1
+    # Cache split is always reported so a caller can compute a hit rate.
+    assert "cache_hit_tokens" in done[1]["usage"]
+    assert "cache_miss_tokens" in done[1]["usage"]
     assert done[1]["tool_calls"] == 0
 
 
@@ -351,7 +355,10 @@ def test_tool_call_streams_draft_then_resets_it_and_never_leaks_it_into_the_answ
     assert adapter.quoted == ["600519"]
     assert names[-1] == "done"
     assert events[-1][1]["tool_calls"] == 1
-    assert provider.requests[-1][-1].role == "tool_result"
+    # The last outgoing message is the research-state view; the tool_result is
+    # the last real history entry before it (docs 3.3).
+    roles = [message.role for message in provider.requests[-1]]
+    assert "tool_result" in roles
 
 
 def test_session_loop_receives_the_default_system_prompt() -> None:

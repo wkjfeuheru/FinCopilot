@@ -185,8 +185,34 @@ class AgentLoop:
             await self.output.emit(EngineEvent(kind, data))
 
     def _system_prompt(self) -> str:
-        """Base prompt plus the session's research state (docs 03.6.2)."""
-        return self.system + self.ctx.state_block()
+        """The static system prompt (docs 03.3).
+
+        Deliberately free of per-turn content: it is byte-identical across every
+        request so the provider's prefix cache can retain it along with the
+        growing message history. The session's research state used to be
+        concatenated here, which moved the cache boundary to the front of the
+        conversation and made every turn re-process the whole history.
+        """
+        return self.system
+
+    def _state_text(self) -> str:
+        """The session's research state, rendered fresh for this request (docs 03.6.2)."""
+        return self.ctx.state_block()
+
+    def _request_messages(self) -> list[Msg]:
+        """History plus the research state as a trailing message.
+
+        The state goes last, not first, for two reasons: it keeps the history a
+        stable prefix the cache can reuse, and it puts the most current state
+        where the model attends to it most. It is never appended to ``raw`` — it
+        is a view of this request, not a transcript entry that persists or gets
+        summarised.
+        """
+        messages = self.memory.snapshot()
+        state = self._state_text()
+        if state:
+            messages.append(Msg(role="user", content=state))
+        return messages
 
     # -- conversation memory (docs 03.6.4) ------------------------------------
     async def _load_memory_if_first_turn(self, user_msg: str) -> None:
@@ -283,6 +309,7 @@ class AgentLoop:
             system=self._system_prompt(),
             tools=self.registry.schemas(),
             summary=self.summary,
+            state_text=self._state_text(),
         )
         if not compactor.needs_compaction():
             return
@@ -334,7 +361,9 @@ class AgentLoop:
 
     def _window_tokens(self) -> int:
         return self.memory.request_tokens(
-            system=self._system_prompt(), tools=self.registry.schemas()
+            system=self._system_prompt(),
+            tools=self.registry.schemas(),
+            extra_text=self._state_text(),
         )
 
     # -- loop guard -----------------------------------------------------------
@@ -410,6 +439,11 @@ class AgentLoop:
             "usage": {
                 "input_tokens": self.usage.input_tokens,
                 "output_tokens": self.usage.output_tokens,
+                # Prefix-cache split of the input above, when the provider
+                # reports it; the optimization's effect is only checkable here.
+                "cache_hit_tokens": snapshot.cache_hit_tokens,
+                "cache_miss_tokens": snapshot.cache_miss_tokens,
+                "cache_hit_ratio": self.stats.cache_hit_ratio(),
             },
             # Distinct from the cumulative usage above: this is how full the
             # window is now, which compaction is supposed to reduce.
@@ -492,7 +526,7 @@ class AgentLoop:
                 async for chunk in stream_with_retry(
                     lambda: self.provider.stream(
                         system=self._system_prompt(),
-                        messages=self.memory.snapshot(),
+                        messages=self._request_messages(),
                         tools=self.registry.schemas(),
                         usage=self.usage,
                     ),
@@ -512,8 +546,13 @@ class AgentLoop:
                         tool_uses = list(chunk.data.tool_uses)
                         self.usage.input_tokens += chunk.data.input_tokens
                         self.usage.output_tokens += chunk.data.output_tokens
+                        self.usage.cache_hit_tokens += chunk.data.cache_hit_tokens
+                        self.usage.cache_miss_tokens += chunk.data.cache_miss_tokens
                         self.stats.add_usage(
-                            chunk.data.input_tokens, chunk.data.output_tokens
+                            chunk.data.input_tokens,
+                            chunk.data.output_tokens,
+                            cache_hit_tokens=chunk.data.cache_hit_tokens,
+                            cache_miss_tokens=chunk.data.cache_miss_tokens,
                         )
             except Exception as exc:
                 return await self._fail(

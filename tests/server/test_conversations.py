@@ -12,7 +12,7 @@ from finharness.config.settings import Settings
 from finharness.data.access import DataAccess
 from finharness.provider.fake import FakeProvider
 from finharness.server.api import create_app
-from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent
+from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUse
 
 
 class EchoProvider(FakeProvider):
@@ -32,8 +32,47 @@ class EchoProvider(FakeProvider):
         )
 
 
-def make_client(tmp_path) -> tuple[TestClient, EchoProvider]:
-    provider = EchoProvider()
+class PlannedProvider(EchoProvider):
+    """Runs one planning tool before returning the final answer."""
+
+    async def stream(self, *, system, messages, tools, usage: ModelUsage):
+        if not any(message.role == "tool_result" for message in messages):
+            yield StreamChunk(
+                StreamEvent.MESSAGE_END,
+                ModelUsage(
+                    input_tokens=2,
+                    output_tokens=1,
+                    tool_uses=[
+                        ToolUse(
+                            "plan-1",
+                            "research_plan",
+                            {
+                                "goal": "完成公司研究",
+                                "steps": [
+                                    {
+                                        "seq": 1,
+                                        "action": "分析财务数据",
+                                        "tool_hint": [],
+                                        "skill_hint": [],
+                                        "dep": [],
+                                    }
+                                ],
+                            },
+                        )
+                    ],
+                ),
+            )
+            return
+        yield StreamChunk(StreamEvent.TEXT_DELTA, "规划任务已完成")
+        yield StreamChunk(
+            StreamEvent.MESSAGE_END, ModelUsage(input_tokens=3, output_tokens=2)
+        )
+
+
+def make_client(
+    tmp_path, provider: EchoProvider | None = None
+) -> tuple[TestClient, EchoProvider]:
+    provider = provider or EchoProvider()
     settings = Settings(
         paths={"memory_db": tmp_path / "memory.db", "output_dir": tmp_path / "output"},
         data={"cache_dir": tmp_path / "cache"},
@@ -76,14 +115,49 @@ def test_transcript_can_be_replayed(tmp_path):
     assert any(role == "assistant" for role, _ in roles)
 
 
+def test_replay_keeps_the_turn_trace_and_metrics_after_refresh(tmp_path):
+    """Reloading a stored answer must not discard its observable run metadata."""
+    client, _ = make_client(tmp_path)
+    first = client.post("/v1/chat/stream", json={"message": "第一问"})
+    cid = conversation_id_from(first.text)
+
+    messages = client.get(f"/v1/conversations/{cid}/messages").json()["messages"]
+    answer = next(message for message in messages if message["role"] == "assistant")
+
+    turn = answer["turn"]
+    assert turn["events"][-1]["event"] == "done"
+    usage = turn["events"][-1]["data"]["usage"]
+    assert usage["input_tokens"] == 1
+    assert usage["output_tokens"] == 1
+    assert turn["first_token_ms"] >= 0
+    assert turn["total_duration_ms"] >= turn["first_token_ms"]
+
+
+def test_replay_keeps_planning_tool_events_after_refresh(tmp_path):
+    client, _ = make_client(tmp_path, PlannedProvider())
+    first = client.post("/v1/chat/stream", json={"message": "执行复杂研究"})
+    cid = conversation_id_from(first.text)
+
+    messages = client.get(f"/v1/conversations/{cid}/messages").json()["messages"]
+    answer = next(message for message in messages if message["role"] == "assistant")
+    tool_events = [
+        event
+        for event in answer["turn"]["events"]
+        if event["event"] == "tool_status"
+    ]
+
+    assert [(event["data"]["name"], event["data"]["status"]) for event in tool_events] == [
+        ("research_plan", "started"),
+        ("research_plan", "completed"),
+    ]
+
+
 def test_replay_omits_tool_frames(tmp_path):
     """Only readable turns come back; working state is not shown to the reader."""
     client, _ = make_client(tmp_path)
     # Seed a conversation containing a tool round directly in the store.
     store = client.app.state.memory_store
     store.ensure_conversation("c_tools")
-    from finharness.types import ToolUse
-
     store.append_messages(
         "c_tools",
         [

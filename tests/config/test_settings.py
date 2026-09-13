@@ -308,9 +308,26 @@ def test_search_defaults_to_tavily_with_an_env_key(tmp_path):
 
     assert settings.search.kind == "tavily"
     assert settings.search.base_url == "https://api.tavily.com"
-    # The key lives in the environment; no secret field exists on the model.
+    # The environment variable is the recommended key source.
     assert settings.search.env_key == "TAVILY_API_KEY"
-    assert not hasattr(settings.search, "api_key")
+    # An inline key is permitted but absent by default, so nothing is stored.
+    assert settings.search.api_key is None
+
+
+def test_search_accepts_an_inline_api_key(tmp_path):
+    """A locally configured key must work without exporting an env var.
+
+    The key lives in settings.json, which is git-ignored; the environment
+    variable remains the recommended source.
+    """
+    path = write_settings(
+        tmp_path,
+        {"model": {"provider": "fake"}, "search": {"api_key": "tvly-dev-inline"}},
+    )
+
+    settings = Settings.from_file(path)
+
+    assert settings.search.api_key == "tvly-dev-inline"
 
 
 def test_search_section_is_configurable(tmp_path):

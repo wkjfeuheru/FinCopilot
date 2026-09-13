@@ -50,6 +50,25 @@ def _update_usage(final: ModelUsage, raw_usage: Any) -> None:
             raise NetworkError("Provider returned invalid usage token count")
     final.input_tokens = values["prompt_tokens"]
     final.output_tokens = values["completion_tokens"]
+    # Prefix-cache split, reported by providers that support it (DeepSeek sends
+    # prompt_cache_hit_tokens / prompt_cache_miss_tokens). Absent means the
+    # provider does not cache, so the split stays zero without being an error.
+    for source, target in (
+        ("prompt_cache_hit_tokens", "cache_hit_tokens"),
+        ("prompt_cache_miss_tokens", "cache_miss_tokens"),
+    ):
+        value = raw_usage.get(source)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            raise NetworkError("Provider returned invalid cache usage count")
+        if isinstance(value, int):
+            pass
+        elif isinstance(value, float) and value.is_integer():
+            value = int(value)
+        else:
+            raise NetworkError("Provider returned invalid cache usage count")
+        setattr(final, target, value)
 
 
 class OpenAICompatProvider(Provider):

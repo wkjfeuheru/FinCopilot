@@ -1,3 +1,6 @@
+import { useState } from "react";
+import type { StoredTurn } from "../api/client";
+
 export type TraceStatus = "running" | "done" | "error" | "info";
 
 export type AgentStep = {
@@ -36,6 +39,133 @@ const KIND_LABELS: Record<AgentStep["kind"], string> = {
   final: "汇总",
   system: "系统",
 };
+
+function storedKind(name: string): AgentStep["kind"] {
+  if (name === "research_plan") return "plan";
+  if (name === "load_skill" || name === "list_skills") return "skill";
+  return "tool";
+}
+
+function storedLabel(name: string): string {
+  if (name === "research_plan") return "制定研究计划";
+  if (name === "load_skill") return "加载研究 Skill";
+  if (name === "list_skills") return "检索可用 Skill";
+  if (name === "write_report") return "生成研报并执行风险终审";
+  if (name === "make_chart") return "绘制研究图表";
+  return `调用 ${name}`;
+}
+
+function storedAgentLabel(name: string): string {
+  return name === "risk" ? "风险审阅子代理" : `${name} 子代理`;
+}
+
+/** Rebuild the visible ledger from events persisted with a historical answer. */
+export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
+  let planned = false;
+  let status: TurnTrace["status"] = "done";
+  let steps: AgentStep[] = [
+    { key: "analysis", kind: "analysis", label: "理解问题并确定研究路径", status: "done" },
+  ];
+  let metrics: TurnMetrics | undefined;
+
+  const upsert = (next: AgentStep) => {
+    steps = steps.some((step) => step.key === next.key)
+      ? steps.map((step) => (step.key === next.key ? { ...step, ...next } : step))
+      : [...steps, next];
+  };
+
+  for (const event of turn.events ?? []) {
+    const data = event.data ?? {};
+    if (event.event === "tool_status") {
+      const name = String(data.name ?? "tool");
+      const callId = String(data.call_id ?? name);
+      const started = data.status === "started";
+      planned ||= name === "research_plan";
+      upsert({
+        key: callId,
+        kind: storedKind(name),
+        label: storedLabel(name),
+        status: started ? "running" : data.ok === false ? "error" : "done",
+        durationMs: started ? undefined : Number(data.duration_ms ?? 0) || undefined,
+        detail: data.ok === false ? String(data.error ?? "执行失败") : undefined,
+      });
+    }
+    if (event.event === "context_compacted") {
+      const before = Number(data.before_tokens ?? 0);
+      const after = Number(data.after_tokens ?? 0);
+      upsert({
+        key: `compact-${before}-${after}`,
+        kind: "system",
+        label: "压缩研究上下文",
+        status: "done",
+        detail: `${before.toLocaleString("zh-CN")} → ${after.toLocaleString("zh-CN")} Token${data.degraded ? " · 摘要降级" : ""}`,
+      });
+    }
+    if (event.event === "loop_guard") {
+      const aborted = data.action === "would_abort";
+      upsert({
+        key: `guard-${String(data.call_id ?? steps.length)}`,
+        kind: "system",
+        label: aborted ? "终止重复调用" : "跳过重复调用",
+        status: aborted ? "error" : "info",
+        detail: String(data.name ?? ""),
+      });
+    }
+    if (event.event === "interactive_request") {
+      upsert({
+        key: `ask-${String(data.request_id ?? steps.length)}`,
+        kind: "system",
+        label: data.kind === "confirm" ? "完成操作确认" : "完成补充信息",
+        status: "done",
+        detail: String(data.prompt ?? ""),
+      });
+    }
+    if (event.event === "done") {
+      const succeeded = data.succeeded !== false;
+      status = succeeded ? "done" : "error";
+      steps = steps.map((step) =>
+        step.status === "running"
+          ? { ...step, status: succeeded ? ("done" as const) : ("error" as const) }
+          : step,
+      );
+      const perAgent =
+        (data.per_agent as Record<string, Record<string, unknown>> | undefined) ?? {};
+      let agentRuns = 0;
+      Object.entries(perAgent).forEach(([name, value], index) => {
+        const runs = Number(value.runs ?? 0);
+        agentRuns += runs;
+        upsert({
+          key: `agent-${name}-${index}`,
+          kind: "agent",
+          label: storedAgentLabel(name),
+          status: "done",
+          detail: `运行 ${runs} 次`,
+          tokens: Number(value.input_tokens ?? 0) + Number(value.output_tokens ?? 0),
+        });
+      });
+      upsert({
+        key: "final",
+        kind: "final",
+        label: "整理研究结论",
+        status: succeeded ? "done" : "error",
+      });
+      const usage = (data.usage as Record<string, unknown> | undefined) ?? {};
+      const inputTokens = Number(usage.input_tokens ?? 0);
+      const outputTokens = Number(usage.output_tokens ?? 0);
+      metrics = {
+        totalTokens: inputTokens + outputTokens,
+        inputTokens,
+        outputTokens,
+        steps: Number(data.tool_calls ?? 0) + agentRuns + 1,
+        firstTokenMs: turn.first_token_ms,
+        totalDurationMs: Number(turn.total_duration_ms ?? 0),
+        toolDurationMs: Number(data.tool_duration_ms ?? 0),
+      };
+    }
+  }
+
+  return { planned, status, steps, metrics };
+}
 
 function formatDuration(value: number | null): string {
   if (value === null) return "—";
@@ -149,4 +279,3 @@ export function AgentTrace({ trace }: { trace: TurnTrace }) {
     </details>
   );
 }
-import { useState } from "react";

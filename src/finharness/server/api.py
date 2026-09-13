@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import os
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -61,9 +62,41 @@ class QueueSink:
         import asyncio
 
         self.queue = asyncio.Queue()
+        self.started_at = time.monotonic()
+        self.first_token_at: float | None = None
+        self.done_at: float | None = None
+        self.replay_events: list[dict] = []
 
     async def emit(self, event):
+        now = time.monotonic()
+        if event.kind == "text_delta" and self.first_token_at is None:
+            self.first_token_at = now
+        if event.kind == "done":
+            self.done_at = now
+        if event.kind in {
+            "tool_status",
+            "context_compacted",
+            "loop_guard",
+            "interactive_request",
+            "done",
+        }:
+            self.replay_events.append(
+                {"event": _event_name(event.kind), "data": dict(event.data)}
+            )
         await self.queue.put(event)
+
+    def turn_metadata(self) -> dict | None:
+        if self.done_at is None:
+            return None
+        return {
+            "events": self.replay_events,
+            "first_token_ms": (
+                round((self.first_token_at - self.started_at) * 1000)
+                if self.first_token_at is not None
+                else None
+            ),
+            "total_duration_ms": round((self.done_at - self.started_at) * 1000),
+        }
 
 
 def create_app(
@@ -100,8 +133,11 @@ def create_app(
             AkShareAdapter(throttle_seconds=settings.data.throttle_seconds),
             # Web access rides the same adapter chain and cache; an absent key is
             # fine at startup — the tools report "not configured" when called.
+            # An inline key in settings.json wins over the environment variable,
+            # so a locally configured key works without exporting anything.
             TavilyAdapter(
-                api_key=os.getenv(settings.search.env_key) if settings.search.env_key else None,
+                api_key=settings.search.api_key
+                or (os.getenv(settings.search.env_key) if settings.search.env_key else None),
                 base_url=settings.search.base_url,
                 timeout_s=settings.search.timeout_s,
             ),
@@ -378,7 +414,10 @@ def create_app(
             if message.role == "user" and message.content:
                 rendered.append({"role": "user", "text": message.content})
             elif message.role == "assistant" and message.content:
-                rendered.append({"role": "assistant", "text": message.content})
+                item = {"role": "assistant", "text": message.content}
+                if isinstance(message.metadata.get("turn"), dict):
+                    item["turn"] = message.metadata["turn"]
+                rendered.append(item)
         return {
             "conversation_id": conversation_id,
             "messages": rendered[-max(limit, 1) :],
@@ -449,6 +488,7 @@ def create_app(
         sink = QueueSink()
         session.loop.output = sink
         session.busy = True
+        persisted_before = memory_store.message_seq_range(session.conversation_id)[1]
         audit = getattr(session.loop, "audit", None)
         if audit is not None:
             audit.session_start(
@@ -480,6 +520,18 @@ def create_app(
                             "session_id": session.session_id,
                             "conversation_id": session.conversation_id,
                         }
+                        # The engine emits ``done`` just before it flushes the
+                        # final answer to memory. Finish that flush and attach
+                        # the replay record before the browser can observe
+                        # completion and refresh the page.
+                        await task
+                        turn_metadata = sink.turn_metadata()
+                        if turn_metadata is not None:
+                            memory_store.attach_latest_answer_metadata(
+                                session.conversation_id,
+                                metadata={"turn": turn_metadata},
+                                after_seq=persisted_before,
+                            )
                     # The request_id belongs to the confirm bus, not the engine
                     # payload shape, so it is added at the transport edge.
                     yield encode_event(_event_name(event.kind), data)

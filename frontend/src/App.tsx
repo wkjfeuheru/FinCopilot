@@ -6,6 +6,7 @@ import { ChatPanel } from "./components/ChatPanel";
 import type { ChatPanelHandle, ChatView } from "./components/ChatPanel";
 import { SessionBar } from "./components/SessionBar";
 import { SettingsModal } from "./components/SettingsModal";
+import { traceFromStoredTurn } from "./components/AgentTrace";
 import { SourceSidebar } from "./components/SourceSidebar";
 import type { Activity } from "./components/SourceSidebar";
 import { fetchConfig } from "./api/config";
@@ -61,8 +62,9 @@ function App() {
   const [citations, setCitations] = useState<Citation[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
   // Conversations this client has already rendered, keyed by conversation id.
-  // The server persists only readable turns, so the execution trace and produced
-  // files must be kept here or they vanish when the user switches away and back.
+  // Keep the fully rendered view while navigating. Historical answers can
+  // rebuild their traces from the server; locally produced file cards still
+  // benefit from this immediate in-memory restore.
   const viewCacheRef = useRef(new Map<string, ChatView>());
   const chatRef = useRef<ChatPanelHandle>(null);
 
@@ -171,8 +173,7 @@ function App() {
   function selectConversation(id: string) {
     if (id === conversationId) return;
     cacheCurrentView();
-    // Restore the trace/activity feed we kept for this conversation; the server
-    // transcript alone does not carry it.
+    // Restore the cached activity feed immediately while history is loading.
     setActivities(activitiesFromView(viewCacheRef.current.get(id)));
     rememberConversation(id);
     setSessionId(null);
@@ -195,7 +196,14 @@ function App() {
   const restoredMessages = useMemo(
     () =>
       historyConversationId === conversationId
-        ? history.map((item) => ({ role: item.role, text: item.text }))
+        ? history.map((item) => ({
+            role: item.role,
+            text: item.text,
+            trace:
+              item.role === "assistant" && item.turn
+                ? traceFromStoredTurn(item.turn)
+                : undefined,
+          }))
         : [],
     [history, historyConversationId, conversationId],
   );

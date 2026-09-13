@@ -157,7 +157,7 @@ def _now() -> str:
 
 
 def _encode_payload(message: Msg) -> str | None:
-    if not message.tool_uses and not message.tool_results:
+    if not message.tool_uses and not message.tool_results and not message.metadata:
         return None
     return json.dumps(
         {
@@ -166,6 +166,7 @@ def _encode_payload(message: Msg) -> str | None:
                 for item in message.tool_uses
             ],
             "tool_results": [[call_id, raw] for call_id, raw in message.tool_results],
+            "metadata": message.metadata,
         },
         ensure_ascii=False,
     )
@@ -183,6 +184,7 @@ def _decode_message(row: sqlite3.Row) -> Msg:
         content=row["content"],
         tool_uses=tool_uses,
         tool_results=tool_results,
+        metadata=dict(payload.get("metadata") or {}),
     )
 
 
@@ -326,6 +328,28 @@ class MemoryStore:
                 (conversation_id,),
             ).fetchall()
         return [_decode_message(row) for row in rows]
+
+    def attach_latest_answer_metadata(
+        self, conversation_id: str, *, metadata: dict, after_seq: int = 0
+    ) -> bool:
+        """Attach replay-only metadata to the newest persisted final answer."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, payload_json FROM messages "
+                "WHERE conversation_id = ? AND role = 'assistant' "
+                "AND content IS NOT NULL AND content != '' AND seq > ? "
+                "ORDER BY seq DESC LIMIT 1",
+                (conversation_id, int(after_seq)),
+            ).fetchone()
+            if row is None:
+                return False
+            payload = json.loads(row["payload_json"] or "{}")
+            payload["metadata"] = {**dict(payload.get("metadata") or {}), **metadata}
+            connection.execute(
+                "UPDATE messages SET payload_json = ? WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False), int(row["id"])),
+            )
+        return True
 
     def message_by_id(self, message_id: int) -> Msg | None:
         """Retrieve one message by its row id (Q8: internal retrieval by id)."""

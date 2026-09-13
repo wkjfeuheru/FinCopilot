@@ -186,15 +186,19 @@ class SearchSettings(FrozenModel):
     """External web search/fetch backend (docs 03.4).
 
     Configured like a provider: a ``kind`` picks the implementation and an
-    ``env_key`` names the variable holding the credential, so no key ever lands
-    in a config file. An absent key is not an error at load time — the tools
-    report "search not configured" when actually called.
+    ``env_key`` names the variable holding the credential. The recommended
+    source is that environment variable; ``api_key`` additionally allows an
+    inline key for local setups whose ``settings.json`` is untracked (it is
+    git-ignored), in which case the secret sits in plaintext on disk. An absent
+    key is not an error at load time — the tools report "search not configured"
+    when actually called.
     """
 
     kind: Literal["tavily"] = "tavily"
     base_url: str = "https://api.tavily.com"
     env_key: str = "TAVILY_API_KEY"
     timeout_s: Annotated[float, Field(gt=0)] = 30.0
+    api_key: str | None = None
 
 
 def _default_providers() -> dict[str, ProviderSettings]:
@@ -495,6 +499,7 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_SEARCH_BASE_URL": (("search", "base_url"), str),
     "FINH_SEARCH_ENV_KEY": (("search", "env_key"), str),
     "FINH_SEARCH_TIMEOUT_S": (("search", "timeout_s"), float),
+    "FINH_SEARCH_API_KEY": (("search", "api_key"), str),
 }
 
 

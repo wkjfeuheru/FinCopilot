@@ -53,23 +53,35 @@ class AutoCompactor:
         system: str = "",
         tools: list[dict] | None = None,
         summary: SummaryLayer | None = None,
+        state_text: str = "",
     ) -> None:
         self.provider = provider
         self.memory = memory
         self.settings = settings
         self.system = system
         self.tools = tools or []
+        # The research-state block rides the request as a trailing message rather
+        # than sitting in ``system`` (docs 3.3), so it must be counted explicitly
+        # or the window would read smaller than it is.
+        self.state_text = state_text
         # When present, folded history becomes a summary segment rather than a
         # synthetic user message (docs 03.6.4).
         self.summary = summary
 
+    def _count(self) -> int:
+        return self.memory.request_tokens(
+            system=self.system, tools=self.tools, extra_text=self.state_text
+        )
+
     def needs_compaction(self) -> bool:
-        return self.memory.over_budget(system=self.system, tools=self.tools)
+        return self.memory.over_budget(
+            system=self.system, tools=self.tools, extra_text=self.state_text
+        )
 
     async def compact(self) -> CompactionResult:
         """Reduce the window, degrading to a drop-oldest fallback on failure."""
         started = time.monotonic()
-        before = self.memory.request_tokens(system=self.system, tools=self.tools)
+        before = self._count()
         boundary = _foldable_boundary(self.memory.raw)
         if boundary <= 0:
             return CompactionResult(
@@ -96,7 +108,7 @@ class AutoCompactor:
         seq_to = self.memory.discarded + boundary
 
         removed, _discarded = self.memory.squash()
-        after = self.memory.request_tokens(system=self.system, tools=self.tools)
+        after = self._count()
 
         # Keeping the recent rounds may not suffice when those rounds are large;
         # tighten until the window is inside budget rather than leaving the next
@@ -107,7 +119,7 @@ class AutoCompactor:
             if extra == 0:
                 break
             removed += extra
-            after = self.memory.request_tokens(system=self.system, tools=self.tools)
+            after = self._count()
 
         if self.summary is not None and removed > 0:
             self.summary.add(

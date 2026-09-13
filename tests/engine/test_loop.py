@@ -341,7 +341,11 @@ def test_final_turn_emits_deltas_then_answer_then_done():
     done = events[3].data
     assert done["succeeded"] is True
     assert done["reason"] is None
-    assert done["usage"] == {"input_tokens": 1, "output_tokens": 2}
+    assert done["usage"]["input_tokens"] == 1
+    assert done["usage"]["output_tokens"] == 2
+    # The cache split is always present; zero means the provider reported none.
+    assert done["usage"]["cache_hit_tokens"] == 0
+    assert done["usage"]["cache_miss_tokens"] == 0
     assert done["tool_calls"] == 0
     assert [message.role for message in messages] == ["user", "assistant"]
     assert messages[1].content == "hello world"
@@ -439,7 +443,11 @@ def test_tool_round_streams_draft_then_resets_it_before_the_final_answer():
     ]
     assert [event.data["status"] for event in events[3:5]] == ["started", "completed"]
     assert events[4].data["call_id"] == "call_1"
-    assert provider.requests[1]["roles"] == ["user", "assistant", "tool_result"]
+    # The transcript prefix is the real history; the trailing 'user' is the
+    # research-state view appended for this request only (docs 3.3).
+    roles = provider.requests[1]["roles"]
+    assert roles[:3] == ["user", "assistant", "tool_result"]
+    assert all(role == "user" for role in roles[3:])
     assert outcome.answer == "正式答案"
     assert outcome.tool_calls == 1
     assert outcome.succeeded is True
@@ -714,7 +722,8 @@ def test_provider_error_reports_reason_and_emits_one_error_and_one_done():
     }
     assert events[1].data["succeeded"] is False
     assert events[1].data["reason"] == "provider_error"
-    assert events[1].data["usage"] == {"input_tokens": 0, "output_tokens": 0}
+    assert events[1].data["usage"]["input_tokens"] == 0
+    assert events[1].data["usage"]["output_tokens"] == 0
 
 
 def test_provider_error_after_a_tool_round_keeps_the_tool_call_count():
@@ -738,7 +747,8 @@ def test_provider_error_after_a_tool_round_keeps_the_tool_call_count():
     assert outcome.tool_calls == 1
     assert kinds(events) == ["tool_status", "tool_status", "error", "done"]
     assert events[-1].data["tool_calls"] == 1
-    assert events[-1].data["usage"] == {"input_tokens": 1, "output_tokens": 1}
+    assert events[-1].data["usage"]["input_tokens"] == 1
+    assert events[-1].data["usage"]["output_tokens"] == 1
     assert [message.role for message in messages] == [
         "user",
         "assistant",

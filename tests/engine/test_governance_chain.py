@@ -145,7 +145,13 @@ def test_write_tool_confirmation_flows_through_the_gate(tmp_path):
     assert "拒绝" in payload["error"]
 
 
-def test_context_state_is_injected_into_the_system_prompt():
+def test_context_state_is_injected_as_the_trailing_request_message():
+    """The state rides the request after the history, not in the system prompt.
+
+    Keeping it out of ``system`` is what lets the provider's prefix cache retain
+    the static prompt *and* the growing history; putting it first would move the
+    cache boundary to the front of the conversation (docs 3.3).
+    """
     from finharness.context.session import PlanStep
 
     async def run():
@@ -159,9 +165,15 @@ def test_context_state_is_injected_into_the_system_prompt():
 
     provider = asyncio.run(run())
 
-    system = provider.requests[0]["system"]
-    assert "研究计划" in system
-    assert "dupont-analysis" in system
+    request = provider.requests[0]
+    # The system prompt stays static...
+    assert "研究计划" not in request["system"]
+    assert "dupont-analysis" not in request["system"]
+    # ...and the state arrives as the last message instead.
+    assert request["roles"][-1] == "user"
+    state = request["messages"][-1].content
+    assert "研究计划" in state
+    assert "dupont-analysis" in state
 
 
 def test_tool_timeout_uses_the_declared_value_when_settings_has_no_override():

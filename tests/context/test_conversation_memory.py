@@ -108,7 +108,9 @@ def test_conclusions_are_scoped_to_their_conversation(tmp_path):
     other = asyncio.run(run())
 
     assert other.ctx.prior_conclusions == []
-    assert "甲的结论" not in other._system_prompt()
+    # The state rides the request as a trailing message rather than the system
+    # prompt, so isolation is asserted against that surface now.
+    assert "甲的结论" not in other._state_text()
 
 
 def test_preferences_are_shared_by_every_conversation(tmp_path):
@@ -125,7 +127,7 @@ def test_preferences_are_shared_by_every_conversation(tmp_path):
     loop = asyncio.run(run())
 
     assert loop.ctx.notes == {"report_style": "简洁"}
-    assert "简洁" in loop._system_prompt()
+    assert "简洁" in loop._state_text()
 
 
 # --- reload ------------------------------------------------------------------
@@ -247,7 +249,7 @@ def test_follow_up_on_the_same_symbol_reuses_recalled_data(tmp_path):
     # The recall surface names the symbol, so a follow-up has something to reuse.
     subjects = {episode.subject for episode in loop.short_term.episodes()}
     assert "600519" in subjects
-    rendered = loop._system_prompt()
+    rendered = loop._state_text()
     assert "600519" in rendered
     # And the second turn did not add a second fetch.
     assert len(tool.calls) == 1, "the follow-up must reuse the fetched data"

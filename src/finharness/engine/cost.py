@@ -21,6 +21,11 @@ class SessionStatsSnapshot:
     # also folded into input_tokens/output_tokens above, so the total stays
     # complete while this dimension shows where the spend went.
     per_agent: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+    # Prefix-cache split of input_tokens. cache_miss_tokens stays 0 for providers
+    # that do not report the split, so hit_ratio is only meaningful when at least
+    # one of the two is non-zero.
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
 
 
 class SessionStats:
@@ -31,13 +36,33 @@ class SessionStats:
         self.output_tokens = 0
         self.retry_count = 0
         self.tool_calls = 0
+        self.cache_hit_tokens = 0
+        self.cache_miss_tokens = 0
         self._clock = clock
         self._per_tool: dict[str, dict[str, int]] = {}
         self._per_agent: dict[str, dict[str, int]] = {}
 
-    def add_usage(self, input_tokens: int, output_tokens: int) -> None:
+    def add_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        cache_hit_tokens: int = 0,
+        cache_miss_tokens: int = 0,
+    ) -> None:
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
+        self.cache_hit_tokens += cache_hit_tokens
+        self.cache_miss_tokens += cache_miss_tokens
+
+    def cache_hit_ratio(self) -> float:
+        """Share of reported cacheable input served from the prefix cache.
+
+        Returns 0.0 when the provider reports no split, which is distinct from a
+        genuine 0% hit rate but is the honest answer: nothing was reported.
+        """
+        total = self.cache_hit_tokens + self.cache_miss_tokens
+        return (self.cache_hit_tokens / total) if total else 0.0
 
     def record_agent_usage(self, name: str, input_tokens: int, output_tokens: int) -> None:
         """Attribute usage to a sub-agent focus as a breakdown, not a second sum.
@@ -85,4 +110,6 @@ class SessionStats:
             per_agent=MappingProxyType(
                 {name: MappingProxyType(dict(entry)) for name, entry in self._per_agent.items()}
             ),
+            cache_hit_tokens=self.cache_hit_tokens,
+            cache_miss_tokens=self.cache_miss_tokens,
         )

@@ -50,6 +50,19 @@ def _update_usage(final: ModelUsage, raw_usage: Any) -> None:
         if not isinstance(value, int) or isinstance(value, bool):
             raise NetworkError("Provider returned invalid usage token count")
         setattr(final, field, value)
+    # Prompt-cache accounting. Anthropic splits input into read-from-cache and
+    # written-to-cache; both are reported only when caching is in play, so an
+    # absent field is normal rather than an error.
+    for source, target in (
+        ("cache_read_input_tokens", "cache_hit_tokens"),
+        ("cache_creation_input_tokens", "cache_miss_tokens"),
+    ):
+        value = raw_usage.get(source)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise NetworkError("Provider returned invalid cache usage count")
+        setattr(final, target, value)
 
 class AnthropicCompatProvider(Provider):
     def __init__(self, *, base_url: str, api_key: str, model: str, api_version: str = "2023-06-01", temperature: float = 0.1, max_tokens: int = 4096, client: httpx.AsyncClient, first_byte_timeout_s: float = 30.0, idle_timeout_s: float = 60.0):

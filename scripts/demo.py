@@ -61,6 +61,8 @@ class TurnResult:
     answer: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
     per_agent: dict = field(default_factory=dict)
     citations: list[str] = field(default_factory=list)
     tool_calls: int = 0
@@ -78,7 +80,13 @@ def summarize(result: TurnResult) -> str:
         f"  状态：{'成功' if result.ok else '失败'}"
         + (f"（{result.reason}）" if result.reason else ""),
         f"  耗时：{result.wall_s:.1f}s",
-        f"  token：输入 {result.input_tokens} / 输出 {result.output_tokens}",
+        f"  token：输入 {result.input_tokens} / 输出 {result.output_tokens}"
+        + (
+            f"（前缀缓存命中 {result.cache_hit_tokens} / 未命中 {result.cache_miss_tokens}，"
+            f"命中率 {result.cache_hit_tokens / (result.cache_hit_tokens + result.cache_miss_tokens):.0%}）"
+            if result.cache_hit_tokens + result.cache_miss_tokens
+            else ""
+        ),
         f"  工具调用：{result.tool_calls} 次"
         + (f"（{'、'.join(result.tools)}）" if result.tools else ""),
         f"  引用：{len(result.citations)} 条",
@@ -196,6 +204,8 @@ class DemoClient:
             usage = payload.get("usage") or {}
             result.input_tokens = int(usage.get("input_tokens", 0))
             result.output_tokens = int(usage.get("output_tokens", 0))
+            result.cache_hit_tokens = int(usage.get("cache_hit_tokens", 0))
+            result.cache_miss_tokens = int(usage.get("cache_miss_tokens", 0))
             result.per_agent = dict(payload.get("per_agent") or {})
             result.citations = list(payload.get("citations") or [])
             result.tool_calls = int(payload.get("tool_calls", 0))
@@ -367,6 +377,8 @@ def main(argv: list[str] | None = None) -> int:
                             "wall_s": round(r.wall_s, 1),
                             "input_tokens": r.input_tokens,
                             "output_tokens": r.output_tokens,
+                            "cache_hit_tokens": r.cache_hit_tokens,
+                            "cache_miss_tokens": r.cache_miss_tokens,
                             "per_agent": {k: dict(v) for k, v in r.per_agent.items()},
                             "citations": len(r.citations),
                             "tool_calls": r.tool_calls,

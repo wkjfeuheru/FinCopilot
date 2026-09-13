@@ -7,8 +7,18 @@ export type ConversationSummary = {
   last_active_at: string;
 };
 
-/** A restored message: user turns and final answers only (no tool frames). */
-export type HistoryMessage = { role: "user" | "assistant"; text: string };
+export type StoredTurn = {
+  events: ChatEvent[];
+  first_token_ms: number | null;
+  total_duration_ms: number;
+};
+
+/** A restored readable turn plus its optional observable execution record. */
+export type HistoryMessage = {
+  role: "user" | "assistant";
+  text: string;
+  turn?: StoredTurn;
+};
 
 /** Provenance for one piece of fetched data, shown in the source sidebar. */
 export type Citation = {

@@ -85,36 +85,48 @@ class WorkingMemory:
                 self.used_tokens += counted.tokens
                 self._exact = self._exact and counted.exact
 
-    def request_tokens(self, *, system: str, tools: list[dict]) -> int:
+    def request_tokens(self, *, system: str, tools: list[dict], extra_text: str = "") -> int:
         """Estimated size of the next request (the number compaction targets).
 
         Measured rather than inferred: the provider ignores the ``usage`` object
         it is handed and reports its own totals afterwards, so the only way to
         know how full the window is *before* sending is to count here.
+
+        ``extra_text`` carries content that rides the request but not ``raw`` —
+        notably the research-state block, appended to the outgoing messages each
+        iteration (docs 3.3). Omitting it would under-count the window and let a
+        request overflow before compaction noticed.
         """
         total = self.counter.count(system).tokens
         # _message_texts is a generator per message, so flatten before counting.
         for message in self.raw:
             total += self.counter.count_many(_message_texts(message))
+        if extra_text:
+            total += self.counter.count(extra_text).tokens
         for schema in tools:
             function = schema.get("function", {})
             total += self.counter.count(str(function.get("description", ""))).tokens
             total += self.counter.count(str(function.get("parameters", ""))).tokens
         return total
 
-    def usage(self, *, system: str, tools: list[dict]) -> WindowUsage:
+    def usage(self, *, system: str, tools: list[dict], extra_text: str = "") -> WindowUsage:
         return WindowUsage(
-            window_tokens=self.request_tokens(system=system, tools=tools),
+            window_tokens=self.request_tokens(
+                system=system, tools=tools, extra_text=extra_text
+            ),
             used_tokens=self.used_tokens,
             exact=self._exact,
         )
 
-    def over_budget(self, *, system: str, tools: list[dict]) -> bool:
+    def over_budget(self, *, system: str, tools: list[dict], extra_text: str = "") -> bool:
         window = self.settings.context.context_window_tokens
         if window <= 0:
             return False
         threshold = window * self.settings.context.compaction_ratio
-        return self.request_tokens(system=system, tools=tools) >= threshold
+        return (
+            self.request_tokens(system=system, tools=tools, extra_text=extra_text)
+            >= threshold
+        )
 
     # -- window maintenance ---------------------------------------------------
     def squash(self, *, keep_rounds: int | None = None) -> tuple[int, int]:

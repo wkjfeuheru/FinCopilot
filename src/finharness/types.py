@@ -28,6 +28,9 @@ class Msg:
     content: str | None
     tool_uses: list[ToolUse] = field(default_factory=list)
     tool_results: list[tuple[str, str]] = field(default_factory=list)
+    # Transport/UI metadata is persisted with the transcript but never sent to
+    # model providers. It lets a restored answer recover its observable run.
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def user(cls, content: str) -> "Msg":
@@ -46,6 +49,12 @@ class ModelUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     tool_uses: list[ToolUse] = field(default_factory=list)
+    # Prefix-cache accounting. Providers bill cached input far below fresh input,
+    # so the split is what makes "did the optimization work" answerable rather
+    # than a claim. Unreported stays 0; cache_miss_tokens is left at 0 when the
+    # provider does not distinguish (input_tokens remains the total).
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
 
 
 @dataclass(slots=True)
