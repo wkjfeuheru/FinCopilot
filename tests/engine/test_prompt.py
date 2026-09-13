@@ -134,14 +134,28 @@ def test_prompt_report_example_matches_the_real_schema():
 
 
 def test_prompt_has_a_refusal_policy():
-    """Without this the model answers out of range instead of declining."""
+    """Without this the model answers out of range instead of declining.
+
+    Declining is a consequence of the capability boundary, so the policy lives
+    inside that section rather than as a topic of its own; the test asserts that
+    placement, not just the wording's presence somewhere in the file.
+    """
+    text = system_prompt()
+    role_section = text.split("## 角色与能力边界", 1)[1].split("\n## ", 1)[0]
+
+    assert "做不到" in role_section
+    assert "不要勉强" in role_section or "不硬撑" in role_section
+    assert "ask_user" in role_section          # missing input -> clarify
+    # The anti-hallucination rule, stated as the bottom line.
+    assert "不得猜测" in role_section or "不得编造" in role_section
+    assert "取不到" in role_section
+
+
+def test_prompt_has_no_standalone_refusal_section():
+    """Guards the consolidation: the policy must not drift back out on its own."""
     text = system_prompt()
 
-    assert "超出能力范围" in text
-    assert "不要勉强" in text or "不硬撑" in text
-    # The anti-hallucination rule, stated as the bottom line.
-    assert "不得猜测" in text or "不得编造" in text
-    assert "取不到" in text
+    assert "## 超出能力范围时" not in text
 
 
 def test_missing_asset_raises(tmp_path):
