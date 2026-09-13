@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from finharness.context.memory.store import MemoryStore
 from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
+from finharness.data.adapters.tavily_adapter import TavilyAdapter
 from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
@@ -94,7 +96,16 @@ def create_app(
     # mutated here.
     data_cache = LocalCache(settings.data.cache_dir)
     shared_data = data_access or DataAccess(
-        [AkShareAdapter(throttle_seconds=settings.data.throttle_seconds)],
+        [
+            AkShareAdapter(throttle_seconds=settings.data.throttle_seconds),
+            # Web access rides the same adapter chain and cache; an absent key is
+            # fine at startup — the tools report "not configured" when called.
+            TavilyAdapter(
+                api_key=os.getenv(settings.search.env_key) if settings.search.env_key else None,
+                base_url=settings.search.base_url,
+                timeout_s=settings.search.timeout_s,
+            ),
+        ],
         cache=data_cache,
         settings=settings,
     )

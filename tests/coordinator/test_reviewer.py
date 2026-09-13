@@ -8,6 +8,7 @@ import pandas as pd
 
 from finharness.config.settings import ContextSettings, Settings
 from finharness.coordinator import Coordinator
+from finharness.coordinator.reviewer import REVIEW_MAX_TURNS
 from finharness.data.access import DataAccess
 from finharness.data.adapters.base import DataAdapter, FetchResult
 from finharness.data.cache import LocalCache
@@ -180,11 +181,12 @@ def test_review_leaves_no_conversation_memory_behind(tmp_path):
 
 def test_reviewer_turn_budget_is_tightened_without_touching_the_main_settings(tmp_path):
     settings = make_settings(tmp_path, max_turns=30)
-    # Four distinct calls: distinct arguments keep the loop guard out of the way,
-    # so the only thing that can stop the run is the reviewer's own turn budget.
+    # More distinct calls than the reviewer's budget: distinct arguments keep the
+    # loop guard out of the way, so the only thing that can stop the run is the
+    # reviewer's own turn budget.
     provider = ScriptedProvider(
         [
-            *[tool_round(ToolUse(f"c{i}", "get_quote", {"symbol": f"60000{i}"})) for i in range(4)],
+            *[tool_round(ToolUse(f"c{i}", "get_quote", {"symbol": f"60000{i}"})) for i in range(8)],
             text_round("done"),
         ]
     )
@@ -192,10 +194,15 @@ def test_reviewer_turn_budget_is_tightened_without_touching_the_main_settings(tm
 
     result = run(coordinator.review_risk(topic="t", markdown="body"))
 
-    assert len(provider.requests) == 3
-    assert result.turns == 3
+    assert len(provider.requests) == REVIEW_MAX_TURNS
+    assert result.turns == REVIEW_MAX_TURNS
     # The main session's budget is untouched.
     assert settings.context.max_turns == 30
+
+
+def test_reviewer_budget_leaves_room_to_verify_several_figures(tmp_path):
+    """The read plus several independent checks must fit, or reviews ship empty."""
+    assert REVIEW_MAX_TURNS >= 5
 
 
 # -- accounting ---------------------------------------------------------------

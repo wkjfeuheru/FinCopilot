@@ -115,6 +115,54 @@ def test_tool_reports_validation_failure_without_raising(tmp_path):
     assert "校验失败" in result.error
 
 
+def test_kline_states_the_actual_window_it_covered(tmp_path):
+    async def run():
+        return await GetKlineTool(make_access([Adapter()], tmp_path)).run(
+            symbol="600519", period="day", adjust=None, years=1
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert "数据区间" in result.content
+
+
+def test_kline_flags_a_window_much_shorter_than_requested(tmp_path):
+    """The Adapter history spans ~1 month; asking for a year must not pass silently."""
+    async def run():
+        return await GetKlineTool(make_access([Adapter()], tmp_path)).run(
+            symbol="600519", period="day", adjust=None, years=1
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    # A recent listing asked for a year must be told it only has weeks.
+    assert "明显短于请求的 1 年" in result.content
+    assert "近 1 年" in result.content
+
+
+def test_kline_full_history_has_no_short_window_warning(tmp_path):
+    class LongAdapter(DataAdapter):
+        name = "long"
+
+        def fetch_kline(self, symbol, period, adjust, years):
+            dates = pd.date_range("2023-01-01", periods=800, freq="D")
+            df = pd.DataFrame({"date": dates, "close": [100.0] * 800})
+            return FetchResult(df=df, interface="long_kline")
+
+    async def run():
+        return await GetKlineTool(make_access([LongAdapter()], tmp_path)).run(
+            symbol="600519", period="day", adjust=None, years=1
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert "数据区间" in result.content
+    assert "明显短于" not in result.content
+
+
 class FailingAdapter(DataAdapter):
     name = "boom"
 

@@ -67,6 +67,10 @@ def export_markdown_to_docx(markdown: str, *, out_path: str | Path, topic: str =
         image = IMAGE_RE.match(line)
         if image:
             caption, target = image.group(1), image.group(2).strip()
+            # Paths containing spaces are angle-bracket wrapped for Markdown
+            # validity; the brackets are syntax, not part of the filesystem path.
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1].replace("\\>", ">").strip()
             # Only local files are embedded; a missing one degrades to a note so
             # the rest of the document still exports.
             candidate = Path(target)

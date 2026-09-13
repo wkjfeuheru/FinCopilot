@@ -90,7 +90,7 @@ def test_registry_covers_the_documented_catalogue(tmp_path):
         "get_quote", "get_kline", "get_indicators", "get_financials",
         "get_valuation", "get_peers", "get_market_news", "get_announcements",
         "calc_metrics", "calc_valuation", "make_chart", "write_report",
-        "read_file", "write_file", "research_plan",
+        "read_file", "write_file", "web_search", "fetch_url", "research_plan",
         "search_tools", "list_skills", "load_skill", "load_tool", "ask_user",
         "remember_preference",
     }

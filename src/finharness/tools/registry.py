@@ -26,19 +26,25 @@ from finharness.tools.fin.valuation import GetValuationTool
 from finharness.tools.fin.valuation_calc import CalcValuationTool
 from finharness.tools.fin.writer import WriteReportTool
 from finharness.tools.generic.files import ReadFileTool, WriteFileTool
+from finharness.tools.generic.web import FetchUrlTool, WebSearchTool
 from finharness.tools.meta.ask import AskUserTool
 from finharness.tools.meta.discovery import LoadToolTool, SearchToolsTool
 from finharness.tools.meta.plan import ResearchPlanTool
 from finharness.tools.meta.preference import RememberPreferenceTool
 from finharness.tools.meta.skills import ListSkillsTool, LoadSkillTool
 
-# docs 03.4.1 权威口径：resident=20、lazy=4。Every name here must resolve to a
-# registered class — a lazy entry without an implementation would be listed by
-# lazy_names() while being unreachable, so run_backtest / read_pdf are omitted
-# until their tools exist.
+# Every name here must resolve to a registered class — a lazy entry without an
+# implementation would be listed by lazy_names() while being unreachable, so
+# run_backtest / read_pdf are omitted until their tools exist.
+#
+# Web access is lazy because most financial questions never need it, and a
+# resident schema is re-sent on every request; the system prompt names these so
+# discovery does not depend on the model choosing to search first.
 DEFAULT_LAZY_TOOLS: tuple[str, ...] = (
     "get_announcements",
     "calc_valuation",
+    "web_search",
+    "fetch_url",
 )
 
 ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
@@ -60,6 +66,8 @@ ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
     # 通用
     ReadFileTool,
     WriteFileTool,
+    WebSearchTool,
+    FetchUrlTool,
     # 元
     ResearchPlanTool,
     SearchToolsTool,
@@ -84,7 +92,7 @@ def review_tool_names() -> tuple[str, ...]:
     """The read-only subset a reviewer sub-agent is allowed to call.
 
     Derived from the contract rather than a hand-kept list, so a new read-only
-    data tool is available to the reviewer automatically. Three exclusions are
+    data tool is available to the reviewer automatically. Four exclusions are
     implicit in the rule and each matters:
 
     * ``PermissionLevel.WRITE`` — the reviewer must not be able to write.
@@ -93,6 +101,9 @@ def review_tool_names() -> tuple[str, ...]:
       reviewer widen its own catalogue.
     * ``needs_interactive`` — ``ask_user`` cannot work in a sub-agent, which has
       no interactive channel wired.
+    * ``review_eligible=False`` — web tools. A reviewer that starts searching
+      the internet spends tokens to pull untrusted text into a context whose
+      only job is checking the report against the session's own data.
     """
     return tuple(
         tool_cls.name
@@ -100,6 +111,7 @@ def review_tool_names() -> tuple[str, ...]:
         if tool_cls.permission is PermissionLevel.READ
         and tool_cls.group in REVIEW_TOOL_GROUPS
         and not tool_cls.needs_interactive
+        and tool_cls.review_eligible
     )
 
 

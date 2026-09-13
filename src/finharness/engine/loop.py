@@ -14,7 +14,7 @@ from finharness.context.memory.summary import SummaryLayer
 from finharness.context.memory.working import WorkingMemory
 from finharness.context.session import ResearchContext
 from finharness.data.cache import make_lookup_key
-from finharness.data.citation import CitationRegistry, fingerprint_frame
+from finharness.data.citation import CitationRegistry, fingerprint_frame, fingerprint_text
 from finharness.engine.cost import SessionStats
 from finharness.engine.retry import RetryPolicy, stream_with_retry
 from finharness.hooks.base import HookChain
@@ -845,7 +845,13 @@ class AgentLoop:
                 params=dict(getattr(source, "params", {}) or {}),
                 rows=int(len(df)) if df is not None else 0,
                 cols=int(len(df.columns)) if df is not None else 0,
-                fingerprint=fingerprint_frame(df),
+                # Text-only payloads have no frame to digest, so hash the text
+                # itself; otherwise every text citation shared one fingerprint.
+                fingerprint=(
+                    fingerprint_frame(df)
+                    if df is not None
+                    else fingerprint_text(getattr(source, "text", None))
+                ),
                 from_cache=bool(getattr(source, "from_cache", False)),
                 parquet_path=getattr(source, "parquet_path", None),
             )

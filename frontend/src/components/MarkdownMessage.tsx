@@ -8,6 +8,38 @@ function isLocalFile(src: string): boolean {
   return !/^(https?:|data:|blob:|javascript:|#)/i.test(src);
 }
 
+// react-markdown percent-encodes URLs before they reach here (normalizeUri:
+// `F:\a b.png` arrives as `F%3A%5Ca%20b.png`). The server needs the raw path to
+// resolve the artefact, so decode it back; a literal `%` that is not a valid
+// escape leaves decodeURIComponent undefined-behaviour-safe via the fallback.
+function decodeLocalPath(src: string): string {
+  try {
+    return decodeURIComponent(src);
+  } catch {
+    return src;
+  }
+}
+
+// A link destination may not contain an unescaped space, so a path like
+// `F:\python project\...png` makes the whole `![alt](path)` render as literal
+// text instead of an image. Angle brackets are the spec's escape hatch for such
+// destinations; wrap the local file paths so charts show up as images.
+const LOCAL_DESTINATION_RE = /(!?\[[^\]]*\]\()([^()<>\n]+)(\))/g;
+
+function wrapLocalDestinations(text: string): string {
+  return text.replace(
+    LOCAL_DESTINATION_RE,
+    (match: string, head: string, rawDest: string, tail: string) => {
+      const dest = rawDest.trim();
+      if (!dest || !/\s/.test(dest)) return match;
+      if (/^(https?:|data:|blob:|mailto:|tel:|#)/i.test(dest)) return match;
+      // Only paths are ours to reinterpret; prose links stay untouched.
+      if (!dest.includes("\\") && !dest.includes("/")) return match;
+      return `${head}<${dest}>${tail}`;
+    },
+  );
+}
+
 function scrollToSource(cid: string) {
   document.getElementById(`cite-${cid}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
@@ -32,7 +64,9 @@ export function MarkdownMessage({
           img({ src, alt }) {
             const value = typeof src === "string" ? src : "";
             if (!value) return null;
-            const resolved = isLocalFile(value) ? artifactUrl(value) : value;
+            const resolved = isLocalFile(value)
+              ? artifactUrl(decodeLocalPath(value))
+              : value;
             return <img src={resolved} alt={alt ?? ""} loading="lazy" />;
           },
           a({ href, children }) {
@@ -67,7 +101,7 @@ export function MarkdownMessage({
           },
         }}
       >
-        {renderCitations(text, citationOrder)}
+        {wrapLocalDestinations(renderCitations(text, citationOrder))}
       </ReactMarkdown>
     </div>
   );

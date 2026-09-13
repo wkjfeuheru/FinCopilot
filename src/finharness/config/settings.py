@@ -21,7 +21,7 @@ class SettingsError(ValueError):
 
 PositiveInt = Annotated[int, Field(gt=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
-CacheKind = Literal["quote", "kline", "indicators", "financials", "announcements"]
+CacheKind = Literal["quote", "kline", "indicators", "financials", "announcements", "web"]
 ProviderKind = Literal["openai_compat", "anthropic_compat", "fake"]
 PermissionMode = Literal["default", "plan", "auto"]
 
@@ -104,6 +104,9 @@ class DataSettings(FrozenModel):
             "indicators": 7,
             "financials": 365,
             "announcements": 7,
+            # Web results go stale fast; one day matches news and keeps a
+            # within-session repeat of the same query free.
+            "web": 1,
         }
     )
     @field_validator("adapter_order", mode="before")
@@ -179,6 +182,21 @@ class PathSettings(FrozenModel):
     skills_dir: Path = Path(__file__).resolve().parent.parent / "skills"
 
 
+class SearchSettings(FrozenModel):
+    """External web search/fetch backend (docs 03.4).
+
+    Configured like a provider: a ``kind`` picks the implementation and an
+    ``env_key`` names the variable holding the credential, so no key ever lands
+    in a config file. An absent key is not an error at load time — the tools
+    report "search not configured" when actually called.
+    """
+
+    kind: Literal["tavily"] = "tavily"
+    base_url: str = "https://api.tavily.com"
+    env_key: str = "TAVILY_API_KEY"
+    timeout_s: Annotated[float, Field(gt=0)] = 30.0
+
+
 def _default_providers() -> dict[str, ProviderSettings]:
     return {
         "deepseek": ProviderSettings(
@@ -230,6 +248,7 @@ class Settings(BaseSettings):
     audit: AuditSettings = Field(default_factory=AuditSettings)
     server: ServerSettings = Field(default_factory=ServerSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
+    search: SearchSettings = Field(default_factory=SearchSettings)
 
     @field_validator("providers")
     @classmethod
@@ -472,6 +491,10 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_PATHS_OUTPUT_DIR": (("paths", "output_dir"), Path),
     "FINH_PATHS_MEMORY_DB": (("paths", "memory_db"), Path),
     "FINH_PATHS_SKILLS_DIR": (("paths", "skills_dir"), Path),
+    "FINH_SEARCH_KIND": (("search", "kind"), Literal["tavily"]),
+    "FINH_SEARCH_BASE_URL": (("search", "base_url"), str),
+    "FINH_SEARCH_ENV_KEY": (("search", "env_key"), str),
+    "FINH_SEARCH_TIMEOUT_S": (("search", "timeout_s"), float),
 }
 
 

@@ -51,6 +51,18 @@ def fingerprint_frame(df: Any) -> str:
     return fingerprint_series(df.head(50).to_dict("records"))
 
 
+def fingerprint_text(text: str | None) -> str:
+    """Digest a text payload (a page body, a file read) for provenance.
+
+    Without this, every text-only citation shared one constant fingerprint —
+    the digest of an empty frame — so two different documents were
+    indistinguishable in the appendix.
+    """
+    if not text:
+        return fingerprint_series([])
+    return fingerprint_series({"text": text})
+
+
 class CitationRegistry:
     """Session-scoped citation store; bounded to avoid unbounded growth."""
 

@@ -32,9 +32,12 @@ from finharness.data.citation import CitationRegistry
 
 RISK_FOCUS = "risk"
 RISK_SKILL = "risk-checklist"
-# One round to read the report (and optionally fetch data), one to write the
-# review. A reviewer that needs more than this is looping, not reviewing.
-REVIEW_MAX_TURNS = 3
+# Read the report, re-fetch and cross-check several of its figures, then write
+# the review. Three turns was too tight: a report with a handful of numbers to
+# verify exhausts it before any comment is written (observed as
+# ``max_turns_exhausted``), which silently ships an unreviewed report. Six leaves
+# room for the read plus a few independent checks without allowing a loop.
+REVIEW_MAX_TURNS = 6
 
 
 @dataclass(frozen=True, slots=True)

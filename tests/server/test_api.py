@@ -284,6 +284,8 @@ def test_tools_endpoint_lists_m1_financial_tools() -> None:
             "write_report",
             "read_file",
             "write_file",
+            "web_search",
+            "fetch_url",
             "research_plan",
             "search_tools",
             "list_skills",

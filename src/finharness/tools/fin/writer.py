@@ -93,7 +93,14 @@ class WriteReportTool(BaseTool):
             ],
             risks=list(risks),
         )
-        pipeline = ReportPipeline(cite=self.ctx.cite, settings=self.data.settings)
+        pipeline = ReportPipeline(
+            cite=self.ctx.cite,
+            settings=self.data.settings,
+            # The catalogue doubles as the detection dictionary: a body that
+            # names any internal tool — called this session or not — is
+            # exposing system plumbing instead of speaking to the reader.
+            tool_names=set(self.registry.names()) if self.registry is not None else set(),
+        )
         try:
             artifact = pipeline.export(outline, formats=tuple(formats or ("md", "docx")))
         except ReportValidationError as exc:
@@ -155,11 +162,11 @@ class WriteReportTool(BaseTool):
         try:
             result = await self.coordinator.review_risk(topic=artifact.topic, markdown=body)
         except Exception as exc:  # noqa: BLE001 - never fail a rendered report
-            lines.append(f"- 风险终审未完成：{type(exc).__name__}: {exc}")
+            lines.append(self._unreviewed_warning(f"{type(exc).__name__}: {exc}"))
             return None
 
         if not result.ok:
-            lines.append(f"- 风险终审未完成：{result.error}")
+            lines.append(self._unreviewed_warning(result.error))
             return None
 
         comments = (result.summary or "").strip()
@@ -178,6 +185,20 @@ class WriteReportTool(BaseTool):
             lines.append(f"- 终审意见落盘失败：{exc}")
             return None
         return str(review_path)
+
+    @staticmethod
+    def _unreviewed_warning(error: str | None) -> str:
+        """A failure to review must read as "unreviewed", not as a neutral note.
+
+        The report body is deliberately left untouched (docs 03.10.5), so the tool
+        result is the only place a caller learns the review did not happen. A bland
+        "未完成" line is easy to skim past; this states the missing assurance.
+        """
+        detail = f"（{error}）" if error else ""
+        return (
+            f"- ⚠ 风险终审未完成{detail}：**本报告未经独立复核**，"
+            "不得视为已复核交付；如需复核请重新成稿触发，或人工核对关键数字。"
+        )
 
     @staticmethod
     def _report_body(markdown_path: Path) -> str:

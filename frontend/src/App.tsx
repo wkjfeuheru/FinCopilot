@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ConfigProvider, Tag } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import { ConversationList } from "./components/ConversationList";
 import { ChatPanel } from "./components/ChatPanel";
+import type { ChatPanelHandle, ChatView } from "./components/ChatPanel";
 import { SessionBar } from "./components/SessionBar";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSidebar } from "./components/SourceSidebar";
@@ -23,6 +24,25 @@ const EMPTY_CONFIG: ConfigSnapshot = { configured: false, active_id: null, confi
 // client knows which conversation the user was reading.
 const STORAGE_KEY = "finharness.conversation_id";
 
+/** Rebuild the activity feed from a saved trace, for a conversation's history. */
+function activitiesFromView(view: ChatView | undefined): Activity[] {
+  if (!view) return [];
+  const activities: Activity[] = [];
+  for (const message of view.messages) {
+    for (const step of message.trace?.steps ?? []) {
+      if (step.kind !== "tool" && step.kind !== "skill" && step.kind !== "plan") continue;
+      activities.push({
+        key: `${activities.length}-${step.key}`,
+        label: step.label,
+        status:
+          step.status === "error" ? "error" : step.status === "running" ? "running" : "done",
+        detail: step.detail ?? (step.durationMs ? `耗时 ${step.durationMs} ms` : undefined),
+      });
+    }
+  }
+  return activities;
+}
+
 function App() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(() =>
@@ -33,9 +53,18 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [history, setHistory] = useState<HistoryMessage[]>([]);
+  // Which conversation the loaded `history` belongs to. Without this the
+  // transcript from the previously open conversation would be seeded into the
+  // newly selected one while its own history is still loading.
+  const [historyConversationId, setHistoryConversationId] = useState<string | null>(null);
   const [loadingConversations, setLoadingConversations] = useState(false);
   const [citations, setCitations] = useState<Citation[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
+  // Conversations this client has already rendered, keyed by conversation id.
+  // The server persists only readable turns, so the execution trace and produced
+  // files must be kept here or they vanish when the user switches away and back.
+  const viewCacheRef = useRef(new Map<string, ChatView>());
+  const chatRef = useRef<ChatPanelHandle>(null);
 
   const refreshConfig = useCallback(async (): Promise<ConfigSnapshot> => {
     try {
@@ -71,15 +100,32 @@ function App() {
   useEffect(() => {
     if (!conversationId) {
       setHistory([]);
+      setHistoryConversationId(null);
       setCitations([]);
       return;
     }
+    // Ignore a late response if the user has already switched to another
+    // conversation: only the effect for the currently selected id may apply.
+    let cancelled = false;
     void loadConversationMessages(conversationId)
-      .then(setHistory)
-      .catch(() => setHistory([]));
+      .then((messages) => {
+        if (cancelled) return;
+        setHistory(messages);
+        setHistoryConversationId(conversationId);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setHistory([]);
+        setHistoryConversationId(conversationId);
+      });
     // Sources are recovered from the store too, so a resumed (or restarted)
     // conversation still shows the data it was built on.
-    void fetchCitations(conversationId, null).then(setCitations);
+    void fetchCitations(conversationId, null).then((data) => {
+      if (!cancelled) setCitations(data);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [conversationId]);
   function rememberConversation(id: string | null) {
     setConversationId(id);
@@ -87,9 +133,19 @@ function App() {
     else window.localStorage.removeItem(STORAGE_KEY);
   }
 
+  // Save what the panel is currently showing against the open conversation
+  // before navigating away from it.
+  function cacheCurrentView() {
+    const view = chatRef.current?.snapshot();
+    if (conversationId && view && view.messages.length > 0) {
+      viewCacheRef.current.set(conversationId, view);
+    }
+  }
+
   function startNewConversation() {
     // Drop only the client handle: history for the old conversation stays in the
     // store and remains reachable from the list.
+    cacheCurrentView();
     rememberConversation(null);
     setSessionId(null);
     setHistory([]);
@@ -105,16 +161,21 @@ function App() {
       // The list refresh below is the source of truth; a failure here just
       // leaves the row in place.
     }
-    // Deleting the conversation being viewed returns the UI to a fresh state.
+    // Deleting the conversation being viewed returns the UI to a fresh state,
+    // and drops whatever this client had cached for it.
     if (id === conversationId) startNewConversation();
+    viewCacheRef.current.delete(id);
     await refreshConversations();
   }
 
   function selectConversation(id: string) {
     if (id === conversationId) return;
+    cacheCurrentView();
+    // Restore the trace/activity feed we kept for this conversation; the server
+    // transcript alone does not carry it.
+    setActivities(activitiesFromView(viewCacheRef.current.get(id)));
     rememberConversation(id);
     setSessionId(null);
-    setActivities([]);
     setSessionVersion((version) => version + 1);
   }
 
@@ -129,10 +190,14 @@ function App() {
   }
 
   // Stable identity: a fresh array every render would re-trigger the child's
-  // history-sync effect on each pass.
+  // history-sync effect on each pass. Only surface history once it belongs to
+  // the selected conversation, so a switch never seeds the old transcript.
   const restoredMessages = useMemo(
-    () => history.map((item) => ({ role: item.role, text: item.text })),
-    [history],
+    () =>
+      historyConversationId === conversationId
+        ? history.map((item) => ({ role: item.role, text: item.text }))
+        : [],
+    [history, historyConversationId, conversationId],
   );
 
   const active = snapshot?.configs.find((config) => config.is_active) ?? null;
@@ -196,9 +261,11 @@ function App() {
               />
               <ChatPanel
                 key={sessionVersion}
+                ref={chatRef}
                 sessionId={sessionId}
                 conversationId={conversationId}
                 initialMessages={restoredMessages}
+                cachedView={conversationId ? viewCacheRef.current.get(conversationId) : undefined}
                 onSession={handleSession}
                 configured={snapshot?.configured ?? true}
                 onOpenSettings={() => setSettingsOpen(true)}

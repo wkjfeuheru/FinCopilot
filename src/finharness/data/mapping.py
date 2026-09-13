@@ -80,6 +80,19 @@ AKSHARE_INTERFACE_COLUMNS: Final[dict[str, dict[str, str]]] = {
     },
 }
 
+# --- Peer comparison -------------------------------------------------------
+# Identity columns that must survive a `fields` filter: with 代码/简称 dropped
+# the caller cannot tell which row is the target and which rows are aggregates,
+# which is how a peer table gets read as if every row were a company.
+PEER_IDENTITY_COLUMNS: Final[tuple[str, ...]] = ("排名", "代码", "简称")
+# The EM comparison table mixes two aggregate rows into the company list,
+# labelled in the 代码/简称 columns. They are tagged with PEER_ROW_TYPE_COLUMN
+# so a whole-frame mean is visibly wrong instead of silently polluted.
+PEER_STAT_LABELS: Final[tuple[str, ...]] = ("行业中值", "行业平均")
+PEER_ROW_TYPE_COLUMN: Final[str] = "行类型"
+PEER_COMPANY: Final[str] = "公司"
+PEER_STAT: Final[str] = "行业统计"
+
 # --- Exchange prefixes ----------------------------------------------------
 # Segment-based (not first-digit) so ChiNext, STAR, B-shares and Beijing are
 # all classified correctly. Longest prefix wins.

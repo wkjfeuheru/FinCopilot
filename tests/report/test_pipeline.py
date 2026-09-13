@@ -13,16 +13,20 @@ from finharness.report.pipeline import (
 )
 
 
-def make_pipeline(tmp_path) -> tuple[ReportPipeline, CitationRegistry, str]:
+def make_pipeline(tmp_path, **pipeline_kwargs) -> tuple[ReportPipeline, CitationRegistry, str]:
     cite = CitationRegistry()
     citation = cite.register(
-        tool="get_quote", endpoint="akshare:x", symbol="600519",
+        tool="get_quote", endpoint="akshare:stock_zh_a_spot_em", symbol="600519",
         params={}, rows=3, cols=2, fingerprint="abc",
     )
     settings = Settings(
         paths={"output_dir": tmp_path / "output"}, data={"cache_dir": tmp_path / "cache"}
     )
-    return ReportPipeline(cite=cite, settings=settings), cite, citation.cid
+    return (
+        ReportPipeline(cite=cite, settings=settings, **pipeline_kwargs),
+        cite,
+        citation.cid,
+    )
 
 
 def simple_outline(cid: str, **overrides) -> ReportOutline:
@@ -68,6 +72,24 @@ def test_section_without_any_citation_is_reported(tmp_path):
     with pytest.raises(ReportValidationError) as exc:
         pipeline.validate(outline)
     assert any("引用" in p for p in exc.value.problems)
+
+
+def test_chart_path_with_spaces_is_wrapped_in_markdown(tmp_path):
+    """A bare path with spaces is not a valid destination; it must be wrapped."""
+    pipeline, _, cid = make_pipeline(tmp_path)
+    chart = tmp_path / "output dir" / "增长 图.png"
+    chart.parent.mkdir(parents=True)
+    chart.write_bytes(b"\x89PNG\r\n\x1a\n")
+    outline = simple_outline(
+        cid,
+        sections=[ReportSection(
+            heading="图表", body=f"见下图 {{cite:{cid}}}", cids=[cid], charts=[str(chart)]
+        )],
+    )
+
+    markdown, _, _ = pipeline.build_markdown(outline)
+
+    assert f"![图表](<{chart}>)" in markdown
 
 
 def test_missing_chart_file_is_reported(tmp_path):
@@ -157,7 +179,7 @@ def test_appendix_lists_only_referenced_citations(tmp_path):
 
 
 def test_tool_name_in_body_is_warned(tmp_path):
-    pipeline, _, cid = make_pipeline(tmp_path)
+    pipeline, _, cid = make_pipeline(tmp_path, tool_names={"get_quote", "get_kline"})
     outline = simple_outline(
         cid,
         sections=[ReportSection(
@@ -169,6 +191,20 @@ def test_tool_name_in_body_is_warned(tmp_path):
 
     assert any("get_quote" in w and "工具名" in w for w in warnings)
     assert any("get_kline" in w for w in warnings)
+
+
+def test_uncalled_tool_name_in_body_is_also_warned(tmp_path):
+    """get_kline was never called this session; naming it is still exposure."""
+    pipeline, _, cid = make_pipeline(tmp_path, tool_names={"get_kline"})
+    outline = simple_outline(
+        cid,
+        sections=[ReportSection(
+            heading="说明", body=f"故改用 get_kline 的前复权数据 {{cite:{cid}}}"
+        )],
+    )
+    _, _, warnings = pipeline.build_markdown(outline)
+
+    assert any("get_kline" in w and "工具名" in w for w in warnings)
 
 
 def test_interface_name_in_body_is_warned(tmp_path):

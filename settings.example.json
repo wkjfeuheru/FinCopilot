@@ -110,5 +110,11 @@
     "output_dir": "output",
     "memory_db": "data_cache/memory.db",
     "skills_dir": "skills"
+  },
+  "search": {
+    "kind": "tavily",
+    "base_url": "https://api.tavily.com",
+    "env_key": "TAVILY_API_KEY",
+    "timeout_s": 30.0
   }
 }

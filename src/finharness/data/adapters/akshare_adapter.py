@@ -19,6 +19,11 @@ from finharness.data.adapters.base import AdapterError, DataAdapter, FetchResult
 from finharness.data.mapping import (
     AKSHARE_ENDPOINTS,
     AKSHARE_INTERFACE_COLUMNS,
+    PEER_COMPANY,
+    PEER_IDENTITY_COLUMNS,
+    PEER_ROW_TYPE_COLUMN,
+    PEER_STAT,
+    PEER_STAT_LABELS,
     prefixed_symbol,
 )
 
@@ -51,6 +56,31 @@ def _slice_years(df: pd.DataFrame, years: int, *, date_col: str = "date") -> pd.
     cutoff = pd.Timestamp(date.today() - timedelta(days=365 * years))
     trimmed = frame[frame[date_col] >= cutoff]
     return trimmed if len(trimmed) else frame
+
+
+def _label_peer_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Tag the industry-median/average rows so they are never read as a company.
+
+    EM's comparison table returns the aggregates as ordinary rows whose 代码/简称
+    hold the literal labels; without a tag a consumer averaging the frame (or
+    taking row 0) silently treats an aggregate as an issuer.
+    """
+    if PEER_ROW_TYPE_COLUMN in df.columns:
+        return df
+    for column in ("代码", "简称"):
+        if column not in df.columns:
+            continue
+        labels = df[column].astype(str)
+        if not labels.isin(PEER_STAT_LABELS).any():
+            continue
+        frame = df.copy()
+        frame.insert(
+            0,
+            PEER_ROW_TYPE_COLUMN,
+            labels.map(lambda value: PEER_STAT if value in PEER_STAT_LABELS else PEER_COMPANY),
+        )
+        return frame
+    return df
 
 
 class AkShareAdapter(DataAdapter):
@@ -220,10 +250,23 @@ class AkShareAdapter(DataAdapter):
         interface = AKSHARE_ENDPOINTS["peers"][0]
         target = prefixed_symbol(industry)
         df = self._call(interface, lambda ak: ak.stock_zh_valuation_comparison_em(symbol=target))
+        df = _label_peer_rows(df)
         if fields:
-            keep = [c for c in df.columns if any(f in str(c) for f in fields)]
-            if keep:
-                df = df[keep]
+            matched = [c for c in df.columns if any(f in str(c) for f in fields)]
+            # Identity columns and the row tag are contract, not filter material:
+            # a filtered table that cannot say whose row is whose is unusable.
+            keep = [
+                c for c in (PEER_ROW_TYPE_COLUMN, *PEER_IDENTITY_COLUMNS) if c in df.columns
+            ]
+            keep += [c for c in matched if c not in keep]
+            df = df[keep]
+        # Companies first, aggregates last: a whole-frame mean is then visibly
+        # wrong rather than silently including the industry statistics.
+        if PEER_ROW_TYPE_COLUMN in df.columns:
+            rank = {PEER_COMPANY: 0, PEER_STAT: 1}
+            df = df.sort_values(
+                PEER_ROW_TYPE_COLUMN, key=lambda col: col.map(rank), kind="stable"
+            )
         return FetchResult(df=df.reset_index(drop=True), interface=interface)
 
     def fetch_news(self, symbol: str | None, topic: str | None, top_n: int) -> FetchResult:

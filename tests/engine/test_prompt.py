@@ -58,6 +58,23 @@ def test_prompt_routes_skills_and_reports():
     assert "write_report" in text
 
 
+def test_prompt_states_when_not_to_produce_deliverables():
+    """Without this boundary the agent upgrades an analysis into a report itself."""
+    text = system_prompt()
+
+    assert "调用边界" in text
+    assert "make_chart" in text
+    # It must say the deliverable is opt-in, not the default outcome of analysis.
+    assert "明确要求" in text
+    assert "不要" in text
+
+
+def test_prompt_flags_an_unreviewed_report():
+    text = system_prompt()
+
+    assert "未经独立复核" in text
+
+
 def test_prompt_states_output_discipline():
     text = system_prompt()
 

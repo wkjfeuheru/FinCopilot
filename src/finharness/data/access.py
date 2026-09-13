@@ -229,6 +229,44 @@ class DataAccess:
             method="fetch_announcements", args=(symbol, since, top_n),
         )
 
+    async def web_search(
+        self,
+        query: str,
+        top_n: int = 5,
+        topic: str | None = None,
+        time_range: str | None = None,
+    ) -> RawData:
+        """External web search (docs 03.4).
+
+        ``kind="web"`` selects the short web TTL; the ``op`` field keeps search
+        and fetch results in separate cache slots, since both share that kind.
+        """
+        return await self._fetch(
+            kind="web",
+            cache_params={
+                "op": "search",
+                "query": query,
+                "top_n": top_n,
+                "topic": topic,
+                "time_range": time_range,
+            },
+            method="fetch_web_search",
+            args=(query, top_n, topic, time_range),
+        )
+
+    async def fetch_url(self, url: str, query: str | None = None) -> RawData:
+        """Fetch one page's content through the search provider (docs 03.4).
+
+        The request leaves from the provider's servers, not this host, so there
+        is no SSRF surface here; ``TavilyAdapter`` only screens the scheme.
+        """
+        return await self._fetch(
+            kind="web",
+            cache_params={"op": "extract", "url": url, "query": query},
+            method="fetch_url",
+            args=(url, query),
+        )
+
     # -- helpers --------------------------------------------------------------
     def fingerprint(self, df: pd.DataFrame | None) -> str:
         if df is None or not len(df):

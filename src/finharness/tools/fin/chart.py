@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from finharness.data.raw import RawData
 from finharness.report.charting import FontUnavailableError, apply_style, resolve_cjk_font
+from finharness.report.markdown import image_markdown
 from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
 
 CHART_TYPES = ("line", "bar", "candlestick")
@@ -69,7 +70,7 @@ class MakeChartTool(BaseTool):
         await asyncio.to_thread(self._draw, df, type, title, x, y, path, font)
         return RawData(
             kind="chart_path",
-            text=f"![{title}]({path})",
+            text=image_markdown(title, str(path)),
             paths=[str(path)],
             endpoint="chart:matplotlib",
             params={"type": type, "title": title, "rows": int(len(df))},

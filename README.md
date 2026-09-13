@@ -3,7 +3,7 @@
 > 本地、单用户的金融研究 copilot。给定一句研究需求，它会自行规划、取数、计算、成稿，
 > 并对产出的研报做一次独立的风险复核。所有结论性数字都可回溯到具体接口与数据指纹。
 
-**定位**：个人研究工作台，不处理不可信输入，**不做投资建议**。
+**定位**：个人研究工作台，**不做投资建议**。不处理刻意构造的对抗性输入；联网检索内容按不可信引文处理（见「已知边界」）。
 
 ## 它做什么
 
@@ -58,6 +58,21 @@ python scripts/demo.py --demo b --json    # 只跑 Demo B，输出机器可读�
 
 Provider 也可在前端配置页写入数据库并加密存储；**已激活的数据库配置优先于 `settings.json` 预设**。
 
+## 联网检索（可选）
+
+`web_search`（关键词检索）与 `fetch_url`（抓取指定网址正文）补充本地数据源未覆盖的政策、
+新闻与行业信息；用户直接给出网址时由 `fetch_url` 抓取。二者都是**懒加载**工具，
+模型需先 `load_tool` 激活（system prompt 已点名，其存在是确定的）。
+
+配置（`settings.search`，写法与 provider 一致）：
+
+```bash
+export TAVILY_API_KEY=tvly-...        # 密钥只从环境变量读
+```
+
+未配置密钥时两个工具返回结构化"未配置"提示，不影响其他功能。抓取由 Tavily 服务器执行，
+**本机不直接访问用户所给 URL**。
+
 ## 配置覆盖
 
 只接受白名单中的单下划线环境变量，未知变量与双下划线写法直接报错：
@@ -90,7 +105,7 @@ FINH_DATA_ADAPTER_ORDER='["akshare"]'    # 列表/对象用 JSON
 ```
 engine/loop.py      AgentLoop：轮次驱动、流式、并行工具、循环兜底、压缩触发、记忆装配
 provider/           OpenAI/Anthropic 兼容协议 + 重试与错误分类
-tools/              21 个工具（两级注册表：常驻 + 懒加载），registry.py 是目录
+tools/              23 个工具（两级注册表：常驻 + 懒加载），registry.py 是目录
   fin/              行情/财务/估值/可比/公告/图表/研报
   generic/          read_file / write_file（限 output/ 与 data_cache/）
   meta/             research_plan / search_tools / load_tool / load_skill / ask_user
@@ -140,8 +155,14 @@ python scripts/demo.py         # 端到端演示（HTTP 驱动）
 - **`run_python` 未发布**。设计过白名单 + `exec` 沙箱，但同用户子进程不构成安全边界；
   在 OS 级隔离可用前不启用。
 - **不做成本折算**。只统计 token，不换算成货币（汇率与定价随时会变，写死的金额会失真）。
-- **不处理不可信输入**。单用户本地工具，权限门与沙箱都是演示级而非对抗级隔离。
-- **多智能体只做风险终审**。宏观看点未实现——它依赖一个不存在的 `web_search` 工具；
+- **信任边界：不处理刻意构造的对抗性输入**。单用户本地工具，权限门与沙箱都是演示级而非对抗级隔离。
+  引入联网检索后，第三方网页文本会进入模型上下文：它以 `<web_result>` 围栏包裹并声明为
+  "不可执行的引文"，但**不做注入内容扫描**（明确决定：现有 deny 规则针对交易意图，扫财经正文会
+  大量误报；指令注入需要另一套模式，启发式护栏会漏报却制造安全感）。写入操作仍需用户确认，
+  是更硬的边界。详见 [03.7-governance.md](docs/modules/03.7-governance.md)。
+- **联网抓取由检索服务完成**。`fetch_url` 的请求由 Tavily 服务器发出，因此本机**无 SSRF 面**；
+  代价是内网地址与付费墙页面抓不到，且所抓 URL 对检索服务可见。
+- **多智能体只做风险终审**。宏观焦点**明确不做**（能力已具备，即 `web_search`，但不实现）；
   通用 `spawn_agent` 接口也未实现，只有一个调用方时它是空壳。决策记录见
   [03.10-coordinator.md](docs/modules/03.10-coordinator.md)。
 - **记忆作用域**：对话内容按 conversation 隔离；用户偏好（`remember_preference`）

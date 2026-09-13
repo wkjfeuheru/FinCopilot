@@ -63,6 +63,11 @@ class BaseTool(ABC):
     # never see (docs 03.10).
     needs_coordinator = False
     coordinator = None
+    # Whether the read-only reviewer sub-agent may call this tool. Most read
+    # tools qualify; web tools opt out, because a review that starts searching
+    # the internet burns tokens and pulls untrusted text into the reviewer for
+    # no benefit — its job is checking the report against the session's own data.
+    review_eligible = True
 
     def __init__(self, data: DataAccess, *, ctx: Any | None = None, registry: Any | None = None) -> None:
         self.data = data

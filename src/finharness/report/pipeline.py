@@ -15,6 +15,7 @@ from pathlib import Path
 from finharness.config.settings import Settings
 from finharness.data.citation import CitationRegistry
 from finharness.report.docx_export import DISCLAIMER, DocxExportError, export_markdown_to_docx
+from finharness.report.markdown import image_markdown
 
 PLACEHOLDER_RE = re.compile(r"\{(cite|chart|table|list):([^}]+)\}")
 CITE_RE = re.compile(r"\{cite:(cit_\d+)\}")
@@ -75,9 +76,19 @@ def safe_topic(topic: str) -> str:
 class ReportPipeline:
     """Outline -> validated markdown -> docx, with citations and warnings."""
 
-    def __init__(self, *, cite: CitationRegistry, settings: Settings) -> None:
+    def __init__(
+        self,
+        *,
+        cite: CitationRegistry,
+        settings: Settings,
+        tool_names: set[str] | None = None,
+    ) -> None:
         self.cite = cite
         self.settings = settings
+        # The full catalogue, injected by write_report when it can see the
+        # registry: body text must not name any internal tool, including ones
+        # this session never called ("本可用 X 但未调用" reads the same way).
+        self.tool_names = tool_names or set()
 
     # -- validation -----------------------------------------------------------
     def validate(self, outline: ReportOutline) -> None:
@@ -117,7 +128,7 @@ class ReportPipeline:
         the reader still needs the report — so it is a warning the author and
         reviewer can act on.
         """
-        known_tools = {item.tool for item in self.cite.all()}
+        known_tools = {item.tool for item in self.cite.all()} | self.tool_names
         known_interfaces: set[str] = set()
         for item in self.cite.all():
             endpoint = item.endpoint or ""
@@ -176,7 +187,7 @@ class ReportPipeline:
             lines.append("")
             for chart in section.charts:
                 if Path(chart).is_file():
-                    lines.append(f"![{section.heading}]({chart})")
+                    lines.append(image_markdown(section.heading, chart))
                     lines.append("")
                 else:
                     warnings.append(f"图表缺失：{chart}")

@@ -299,3 +299,57 @@ def test_settings_loading_does_not_create_configured_directories(tmp_path):
 
     assert not (tmp_path / "cache").exists()
     assert not (tmp_path / "logs").exists()
+
+
+# --- web search configuration (docs 03.4) -------------------------------------
+
+def test_search_defaults_to_tavily_with_an_env_key(tmp_path):
+    settings = Settings.from_file(write_settings(tmp_path, {"model": {"provider": "fake"}}))
+
+    assert settings.search.kind == "tavily"
+    assert settings.search.base_url == "https://api.tavily.com"
+    # The key lives in the environment; no secret field exists on the model.
+    assert settings.search.env_key == "TAVILY_API_KEY"
+    assert not hasattr(settings.search, "api_key")
+
+
+def test_search_section_is_configurable(tmp_path):
+    path = write_settings(
+        tmp_path,
+        {
+            "model": {"provider": "fake"},
+            "search": {"env_key": "MY_SEARCH_KEY", "timeout_s": 12.5},
+        },
+    )
+
+    settings = Settings.from_file(path)
+
+    assert settings.search.env_key == "MY_SEARCH_KEY"
+    assert settings.search.timeout_s == 12.5
+
+
+def test_search_environment_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("FINH_SEARCH_ENV_KEY", "FROM_ENV_KEY")
+    monkeypatch.setenv("FINH_SEARCH_TIMEOUT_S", "7.5")
+    path = write_settings(tmp_path, {"model": {"provider": "fake"}})
+
+    settings = Settings.from_file(path)
+
+    assert settings.search.env_key == "FROM_ENV_KEY"
+    assert settings.search.timeout_s == 7.5
+
+
+def test_unknown_search_backend_is_rejected(tmp_path):
+    path = write_settings(
+        tmp_path,
+        {"model": {"provider": "fake"}, "search": {"kind": "not-a-search-engine"}},
+    )
+
+    with pytest.raises(SettingsError):
+        Settings.from_file(path)
+
+
+def test_web_has_its_own_cache_ttl(tmp_path):
+    settings = Settings.from_file(write_settings(tmp_path, {"model": {"provider": "fake"}}))
+
+    assert settings.data.cache_ttl_days["web"] == 1

@@ -1,4 +1,11 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import {
+  FormEvent,
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 import { Button, Empty } from "antd";
 import { artifactUrl, fetchCitations, respondChat, streamChat } from "../api/client";
 import type { Citation } from "../api/client";
@@ -20,10 +27,21 @@ type Props = {
   onCitations: (citations: Citation[]) => void;
   activities: Activity[];
   onActivities: (update: (current: Activity[]) => Activity[]) => void;
+  /**
+   * Snapshot kept by the parent for this conversation. The server only persists
+   * readable turns, so the execution trace and produced files exist client-side
+   * and would otherwise vanish when switching away and back.
+   */
+  cachedView?: ChatView;
 };
 
 /** A file the engine produced (chart, report) that the user can download. */
-type Artifact = { path: string; name: string };
+export type Artifact = { path: string; name: string };
+
+/** The client-only part of a conversation view: messages (with trace) + files. */
+export type ChatView = { messages: Message[]; artifacts: Artifact[] };
+
+export type ChatPanelHandle = { snapshot: () => ChatView };
 
 function fileName(path: string): string {
   const parts = path.split(/[\\/]/);
@@ -60,25 +78,32 @@ function agentLabel(name: string): string {
   return `${name} 子代理`;
 }
 
-export function ChatPanel({
-  sessionId,
-  conversationId,
-  initialMessages,
-  onSession,
-  configured,
-  onOpenSettings,
-  citations,
-  onCitations,
-  activities,
-  onActivities,
-}: Props) {
-  // Seeded from restored history so a resumed conversation shows where it left off.
-  const [messages, setMessages] = useState<Message[]>(initialMessages);
+export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
+  {
+    sessionId,
+    conversationId,
+    initialMessages,
+    onSession,
+    configured,
+    onOpenSettings,
+    citations,
+    onCitations,
+    activities,
+    onActivities,
+    cachedView,
+  },
+  ref,
+) {
+  // Seeded from the parent's snapshot first (so switching back restores the
+  // trace and produced files), falling back to restored server history.
+  const [messages, setMessages] = useState<Message[]>(() =>
+    cachedView && cachedView.messages.length > 0 ? cachedView.messages : initialMessages,
+  );
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [interaction, setInteraction] = useState<Interaction | null>(null);
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [artifacts, setArtifacts] = useState<Artifact[]>(() => cachedView?.artifacts ?? []);
   const [notice, setNotice] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const runStartedRef = useRef(0);
@@ -89,6 +114,30 @@ export function ChatPanel({
     session: sessionId,
     conversation: conversationId,
   });
+  // Latest view for the parent to snapshot on switch. Kept in a ref so the
+  // parent can read it imperatively without re-rendering on every token.
+  const latestViewRef = useRef<ChatView>({ messages, artifacts });
+  // The parent remounts this panel on switch, but the stream it started keeps
+  // running; without this guard its events would leak into the next conversation.
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    latestViewRef.current = { messages, artifacts };
+  }, [messages, artifacts]);
+
+  useEffect(() => {
+    // Reset on mount too: StrictMode mounts, cleans up, then mounts again.
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useImperativeHandle(ref, () => ({ snapshot: () => latestViewRef.current }), []);
+
+  function emitActivities(update: (current: Activity[]) => Activity[]) {
+    if (mountedRef.current) onActivities(update);
+  }
 
   // Restored history arrives asynchronously, after this component has already
   // mounted with an empty list. Sync it in, but never clobber a conversation the
@@ -99,7 +148,9 @@ export function ChatPanel({
 
   function refreshCitations() {
     const { session, conversation } = streamIdsRef.current;
-    void fetchCitations(conversation, session).then(onCitations);
+    void fetchCitations(conversation, session).then((data) => {
+      if (mountedRef.current) onCitations(data);
+    });
   }
 
   function rememberArtifacts(raw: unknown) {
@@ -179,7 +230,7 @@ export function ChatPanel({
                 { key: callId, kind: traceKind(name), label: traceLabel(name), status: "running" },
               ],
             }));
-            onActivities((current) => [
+            emitActivities((current) => [
               ...current.filter((item) => item.key !== callId),
               { key: callId, label: activityLabel(name), status: "running" },
             ]);
@@ -206,7 +257,7 @@ export function ChatPanel({
                   : [...trace.steps, completed],
               };
             });
-            onActivities((current) => [
+            emitActivities((current) => [
               ...current.filter((item) => item.key !== callId),
               {
                 key: callId,
@@ -243,7 +294,7 @@ export function ChatPanel({
               detail: `${before.toLocaleString("zh-CN")} → ${after.toLocaleString("zh-CN")} Token${degraded ? " · 摘要降级" : ""}`,
             }],
           }));
-          onActivities((current) => [
+          emitActivities((current) => [
             ...current,
             {
               key: `compact-${current.length}`,
@@ -270,7 +321,7 @@ export function ChatPanel({
               detail: String(event.data.name ?? ""),
             }],
           }));
-          onActivities((current) => [
+          emitActivities((current) => [
             ...current,
             {
               key: `guard-${current.length}`,
@@ -299,7 +350,7 @@ export function ChatPanel({
               detail: prompt,
             }],
           }));
-          onActivities((current) => [
+          emitActivities((current) => [
             ...current,
             {
               key: `ask-${current.length}`,
@@ -443,4 +494,4 @@ export function ChatPanel({
       <InteractionPrompt interaction={interaction} onRespond={handleRespond} busy={false} />
     </section>
   );
-}
+});

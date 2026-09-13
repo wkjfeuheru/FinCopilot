@@ -269,6 +269,8 @@ def test_write_report_survives_a_review_failure(tmp_path):
 
     assert result.ok is True, result.error
     assert "风险终审未完成" in result.content
+    # Failure must read as "unreviewed", not as a neutral note.
+    assert "未经独立复核" in result.content
     # The report artefacts are still attached.
     assert any(p.endswith(".md") for p in result.attachments)
     assert any(p.endswith(".docx") for p in result.attachments)
@@ -283,6 +285,7 @@ def test_write_report_survives_a_declined_review(tmp_path):
     assert result.ok is True
     assert "风险终审未完成" in result.content
     assert "max_turns_exhausted" in result.content
+    assert "未经独立复核" in result.content
 
 
 def test_a_current_review_is_reused_instead_of_paying_twice(tmp_path):
