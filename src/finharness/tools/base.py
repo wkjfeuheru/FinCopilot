@@ -9,6 +9,7 @@ override ``_dispatch``. Callers always go through ``run``.
 
 from __future__ import annotations
 
+import re
 from abc import ABC
 from enum import Enum
 from typing import Any
@@ -23,6 +24,13 @@ from finharness.types import ToolResult
 MAX_RENDER_ROWS = 20
 MAX_RENDER_COLS = 12
 TRIM_NOTE = "（完整数据见缓存 parquet，可用 read_file 精读）"
+# How many omitted column names the truncation note spells out before eliding.
+_MAX_NAMED_DROPPED_COLUMNS = 6
+# Financial frames carry one column per period as ``YYYYMMDD``; annual columns
+# (``YYYY1231``) are listed/kept ahead of quarterly ones so a multi-year
+# comparison survives column trimming.
+_PERIOD_COLUMN_RE = re.compile(r"^\d{8}$")
+_ANNUAL_PERIOD_RE = re.compile(r"^\d{4}1231$")
 
 # Shared token counter: building one re-resolves the vocabulary, so a module-level
 # instance keeps render-time counting cheap.
@@ -135,27 +143,60 @@ class BaseTool(ABC):
         statements have dozens of columns) blow through a token budget with only
         a few rows, so columns are dropped too until the render fits
         ``context.max_result_tokens``.
+
+        Dropping is reported, not silent, and annual period columns are kept
+        ahead of quarterly ones. Both matter because the model cannot reason
+        about a column it was never shown: previously a "past three years"
+        frame lost its two earliest year columns quietly, and the answer read
+        the gap as missing data.
         """
         if df is None or not len(df):
             return "（无数据）"
         max_rows = self._max_rows()
         budget = self._result_token_budget()
         view = df.head(max_rows)
-        columns = min(len(view.columns), MAX_RENDER_COLS)
-        body = ""
-        while columns >= 1:
-            candidate = view.iloc[:, :columns].to_markdown(index=False)
-            body = candidate
-            if self._count_tokens(candidate) <= budget:
+        ordered = self._column_display_order(view)
+        limit = min(len(ordered), MAX_RENDER_COLS)
+        body, columns = "", 0
+        while limit >= 1:
+            selected = ordered[:limit]
+            candidate = view[selected].to_markdown(index=False)
+            if self._count_tokens(candidate) <= budget or limit == 1:
+                body, columns = candidate, limit
                 break
-            columns -= 1
-        truncated = (
-            len(df) > max_rows
-            or len(df.columns) > columns
-            or len(df.columns) > MAX_RENDER_COLS
-        )
-        note = TRIM_NOTE if truncated else ""
+            limit -= 1
+        dropped_rows = len(df) - len(view)
+        dropped_columns = [str(c) for c in df.columns if c not in set(ordered[:columns])]
+        note = self._truncation_note(dropped_rows, dropped_columns)
         return body + ("\n" + note if note else "")
+
+    @staticmethod
+    def _column_display_order(df: pd.DataFrame) -> list[str]:
+        """Lead with annual period columns, then the rest in frame order.
+
+        A financial frame lists periods newest-first, so plain left-to-right
+        trimming sacrificed the oldest years of a multi-year comparison. Annual
+        columns are surfaced first so the three year-ends fit before quarters
+        are considered; non-period frames are returned unchanged.
+        """
+        if not any(_PERIOD_COLUMN_RE.match(str(c)) for c in df.columns):
+            return list(df.columns)
+        annual = [c for c in df.columns if _ANNUAL_PERIOD_RE.match(str(c))]
+        rest = [c for c in df.columns if c not in set(annual)]
+        return annual + rest
+
+    def _truncation_note(self, dropped_rows: int, dropped_columns: list[str]) -> str:
+        """Name what was omitted so it is never mistaken for absent data."""
+        parts: list[str] = []
+        if dropped_columns:
+            named = "、".join(dropped_columns[:_MAX_NAMED_DROPPED_COLUMNS])
+            more = len(dropped_columns) - _MAX_NAMED_DROPPED_COLUMNS
+            parts.append(f"已省略列：{named}" + (f" 等 {len(dropped_columns)} 列" if more > 0 else ""))
+        if dropped_rows > 0:
+            parts.append(f"已省略行：{dropped_rows} 行")
+        if not parts:
+            return ""
+        return "（" + "；".join(parts) + "。完整数据见缓存 parquet，可用 read_file 精读）"
 
     def _result_token_budget(self) -> int:
         settings = getattr(self.data, "settings", None)

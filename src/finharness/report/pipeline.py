@@ -20,9 +20,12 @@ from finharness.report.markdown import image_markdown
 PLACEHOLDER_RE = re.compile(r"\{(cite|chart|table|list):([^}]+)\}")
 CITE_RE = re.compile(r"\{cite:(cit_\d+)\}")
 # A number with a unit or percent sign is the shape that must be traceable;
-# bare years and section numbers are deliberately excluded.
+# bare years and section numbers are deliberately excluded. English magnitude
+# abbreviations (pct/pp/bp) count as units too: without them a difference written
+# as "10.3pct" carried an unmarked number straight past the sourcing check.
 UNSOURCED_NUMBER_RE = re.compile(
-    r"(\d+(?:\.\d+)?\s*(?:%|％|元|亿元|万元|倍|股|天|次|个百分点))"
+    r"(\d+(?:\.\d+)?\s*(?:%|％|元|亿元|万元|倍|股|天|次|个百分点|pct|pp|bp))",
+    re.IGNORECASE,
 )
 UNSOURCED_MARK = "[!无来源:{n}]"
 # Internal-fetch vocabulary that must not reach the report body. Tool names and

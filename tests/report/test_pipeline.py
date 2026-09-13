@@ -166,6 +166,18 @@ def test_number_with_citation_in_same_paragraph_is_not_marked(tmp_path):
     assert warnings == []
 
 
+def test_english_magnitude_abbreviation_is_still_a_sourced_number(tmp_path):
+    """``10.3pct`` carries a number; it must not slip past the sourcing check."""
+    pipeline, _, cid = make_pipeline(tmp_path)
+    outline = simple_outline(
+        cid,
+        sections=[ReportSection(heading="h", body="茅台 ROE 高约 10.3pct，未标注来源")],
+    )
+    markdown, _, warnings = pipeline.build_markdown(outline)
+
+    assert "[!无来源:1]" in markdown
+
+
 def test_appendix_lists_only_referenced_citations(tmp_path):
     pipeline, cite, used = make_pipeline(tmp_path)
     cite.register(

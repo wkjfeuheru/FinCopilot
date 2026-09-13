@@ -178,3 +178,36 @@ def test_tool_surfaces_adapter_failure_as_structured_error(tmp_path):
 
     assert result.ok is False
     assert "upstream exploded" in result.error
+
+
+class IndicatorsAdapter(DataAdapter):
+    name = "ind"
+
+    def fetch_indicators(self, symbol, years, fields):
+        df = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-30", "2025-12-31"]),
+                "净资产收益率(%)": [32.53, 34.19],
+                "资产负债率(%)": [15.19, 16.42],
+            }
+        )
+        return FetchResult(df=df, interface="ind_api")
+
+
+def test_indicators_tool_flags_a_field_the_source_does_not_have(tmp_path):
+    """An unmatched field is a gap, not an empty cell; it must be stated."""
+    from finharness.tools.fin.indicators import GetIndicatorsTool
+
+    async def run():
+        return await GetIndicatorsTool(make_access([IndicatorsAdapter()], tmp_path)).run(
+            symbol="600519", years=3, fields=["ROE", "权益乘数"]
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    # 权益乘数 has no column in this frame and is named as unavailable.
+    assert "权益乘数" in result.content
+    assert "无对应列" in result.content
+    # ROE resolved, so it is not reported as missing.
+    assert "净资产收益率" in result.content
