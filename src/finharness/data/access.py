@@ -18,6 +18,7 @@ from finharness.config.settings import Settings
 from finharness.data.adapters.base import AdapterError, DataAdapter, FetchResult
 from finharness.data.cache import LocalCache, make_lookup_key
 from finharness.data.citation import fingerprint_series
+from finharness.data.mapping import normalize_valuation_indicator
 from finharness.data.raw import RawData
 
 
@@ -165,10 +166,18 @@ class DataAccess:
 
     # -- semantic methods -----------------------------------------------------
     async def quote(self, symbol: str) -> RawData:
-        """Market snapshot keyed once for the whole market, then filtered."""
+        """Latest market snapshot for one symbol.
+
+        The cache key is symbol-scoped even though snapshot sources
+        (``stock_zh_a_spot_em``) fetch the whole market: the adapter returns only
+        the matching row, so a symbol-independent key would serve the first
+        symbol's row to every later one. Sharing one market-wide payload is only
+        sound once the *unfiltered* snapshot is cached and filtered on read; the
+        per-symbol key is what the current adapter contract can honour.
+        """
         symbol = validate_symbol(symbol)
         return await self._fetch(
-            kind="quote", cache_params={"scope": "all_market"},
+            kind="quote", cache_params={"symbol": symbol},
             method="fetch_quote", args=(symbol,),
         )
 
@@ -196,12 +205,24 @@ class DataAccess:
             method="fetch_financials", args=(symbol, statement, years),
         )
 
-    async def valuation(self, symbol: str, lookback_years: int = 1) -> RawData:
+    async def valuation(
+        self, symbol: str, lookback_years: int = 1, indicator: str | None = None
+    ) -> RawData:
+        """One valuation series; ``indicator`` selects which metric.
+
+        Normalising here (not in the adapter) keeps aliases on a single cache
+        slot and makes the canonical name part of the lookup key.
+        """
         symbol = validate_symbol(symbol)
+        canonical = normalize_valuation_indicator(indicator)
         return await self._fetch(
             kind="valuation",
-            cache_params={"symbol": symbol, "lookback_years": lookback_years},
-            method="fetch_valuation", args=(symbol, lookback_years),
+            cache_params={
+                "symbol": symbol,
+                "lookback_years": lookback_years,
+                "indicator": canonical,
+            },
+            method="fetch_valuation", args=(symbol, lookback_years, canonical),
         )
 
     async def peers(self, symbol: str, fields: list[str] | None = None) -> RawData:

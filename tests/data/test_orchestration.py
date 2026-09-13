@@ -117,18 +117,75 @@ def test_adapter_without_the_endpoint_is_skipped(tmp_path):
         raise AssertionError("expected DataUnavailableError")
 
 
-def test_quote_cache_key_is_symbol_independent(tmp_path):
-    """The full-market snapshot is stored once and reused for every symbol."""
-    primary = CountingAdapter(name="primary")
+def test_quote_cache_is_scoped_per_symbol(tmp_path):
+    """A symbol's quote must never be served to a different symbol.
 
-    def fetch_quote(symbol):
-        primary.calls += 1
-        return FetchResult(df=_frame(10), interface="quotes_snapshot")
+    Snapshot sources fetch the whole market, but the adapter keeps only the
+    matching row; a symbol-independent cache key would hand the first symbol's
+    row to every later lookup.
+    """
+    class QuoteAdapter(DataAdapter):
+        name = "primary"
+        calls = 0
 
-    primary.fetch_quote = fetch_quote  # type: ignore[method-assign]
-    access = DataAccess([primary], settings=make_settings(tmp_path))
+        def fetch_quote(self, symbol):
+            type(self).calls += 1
+            return FetchResult(
+                df=pd.DataFrame([{"symbol": symbol, "close": 100.0}]),
+                interface="quotes_snapshot",
+            )
 
-    asyncio.run(access.quote("600519"))
-    asyncio.run(access.quote("000001"))
+    access = DataAccess([QuoteAdapter()], settings=make_settings(tmp_path))
 
-    assert primary.calls == 1
+    first = asyncio.run(access.quote("600519"))
+    second = asyncio.run(access.quote("000858"))
+    again = asyncio.run(access.quote("600519"))
+
+    # Each symbol gets its own row, not the first symbol's cached row.
+    assert first.df.iloc[0]["symbol"] == "600519"
+    assert second.df.iloc[0]["symbol"] == "000858"
+    # Two fetches (one per symbol); the repeated symbol is a cache hit.
+    assert QuoteAdapter.calls == 2
+    assert again.from_cache is True
+    assert again.df.iloc[0]["symbol"] == "600519"
+
+
+def test_valuation_cache_key_includes_the_indicator(tmp_path):
+    class ValuationAdapter(DataAdapter):
+        name = "primary"
+        calls = 0
+
+        def fetch_valuation(self, symbol, lookback_years, indicator):
+            type(self).calls += 1
+            return FetchResult(df=_frame(), interface="valuation_api")
+
+    access = DataAccess([ValuationAdapter()], settings=make_settings(tmp_path))
+
+    asyncio.run(access.valuation("600519", 1, "市盈率(TTM)"))
+    asyncio.run(access.valuation("600519", 1, "pe"))  # alias of the same metric
+    assert ValuationAdapter.calls == 1  # alias reuses the canonical slot
+
+    asyncio.run(access.valuation("600519", 1, "市净率"))
+    assert ValuationAdapter.calls == 2  # a different metric is a different slot
+
+
+def test_unknown_valuation_indicator_rejected_before_any_adapter_call(tmp_path):
+    class ValuationAdapter(DataAdapter):
+        name = "primary"
+        calls = 0
+
+        def fetch_valuation(self, symbol, lookback_years, indicator):
+            type(self).calls += 1
+            return FetchResult(df=_frame(), interface="valuation_api")
+
+    adapter = ValuationAdapter()
+    access = DataAccess([adapter], settings=make_settings(tmp_path))
+
+    try:
+        asyncio.run(access.valuation("600519", 1, "净资产收益率"))
+    except ValueError as exc:
+        assert "不支持的估值指标" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError")
+
+    assert adapter.calls == 0

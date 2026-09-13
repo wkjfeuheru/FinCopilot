@@ -119,6 +119,17 @@ class MakeChartTool(BaseTool):
                 return name
         return None
 
+    @staticmethod
+    def _last_numeric_column(df: pd.DataFrame, *, exclude: str | None) -> str | None:
+        """Rightmost column convertible to numeric, ignoring the X axis column."""
+        numeric = [
+            column
+            for column in df.columns
+            if column != exclude
+            and pd.to_numeric(df[column], errors="coerce").notna().any()
+        ]
+        return numeric[-1] if numeric else None
+
     def _draw(
         self,
         df: pd.DataFrame,
@@ -134,6 +145,10 @@ class MakeChartTool(BaseTool):
 
         x_col = self._pick(df, x, ("date", "日期", "报告期", "公告日期"))
         y_col = self._pick(df, y, ("close", "value", "收盘", "最新价"))
+        if y_col is None:
+            # Valuation frames name their column after the indicator (for example
+            # "市盈率(TTM)(倍)"), so fall back to the last plottable column.
+            y_col = self._last_numeric_column(df, exclude=x_col)
 
         figure, axes = plt.subplots(figsize=(8, 4.5))
         try:

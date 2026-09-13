@@ -50,7 +50,7 @@ class DataAdapter(ABC):
     def fetch_financials(self, symbol: str, statement: str, years: int) -> FetchResult:
         raise NotImplementedError
 
-    def fetch_valuation(self, symbol: str, lookback_years: int) -> FetchResult:
+    def fetch_valuation(self, symbol: str, lookback_years: int, indicator: str) -> FetchResult:
         raise NotImplementedError
 
     def fetch_peers(self, industry: str, fields: list[str] | None) -> FetchResult:

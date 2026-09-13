@@ -5,10 +5,13 @@ when ``fields`` is used, used to drop 代码/简称 — leaving a frame the call
 could neither identify nor average correctly (docs 03.5.2).
 """
 
+import time
+
 import pandas as pd
 
 from finharness.data.adapters import akshare_adapter
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
+from finharness.data.adapters.base import AdapterError
 from finharness.data.mapping import PEER_COMPANY, PEER_ROW_TYPE_COLUMN, PEER_STAT
 
 
@@ -95,3 +98,208 @@ def test_peer_table_without_aggregate_rows_is_untouched(monkeypatch):
 
     assert PEER_ROW_TYPE_COLUMN not in df.columns
     assert list(df["代码"]) == ["688169", "603486"]
+
+
+class FakeValuationAk:
+    """Records the indicator it was asked for; returns a bare date/value frame."""
+
+    def __init__(self) -> None:
+        self.indicators: list[str] = []
+
+    def stock_zh_valuation_baidu(self, symbol: str, indicator: str, period: str) -> pd.DataFrame:
+        self.indicators.append(indicator)
+        return pd.DataFrame(
+            {"date": ["2026-09-12", "2026-09-11"], "value": [2707.42, 2735.76]}
+        )
+
+
+def make_valuation_adapter(monkeypatch) -> tuple[AkShareAdapter, FakeValuationAk]:
+    fake = FakeValuationAk()
+    monkeypatch.setattr(akshare_adapter, "_import_akshare", lambda: fake)
+    return AkShareAdapter(throttle_seconds=0), fake
+
+
+def test_valuation_passes_the_requested_indicator_to_the_source(monkeypatch):
+    adapter, fake = make_valuation_adapter(monkeypatch)
+
+    adapter.fetch_valuation("000858", 1, "市盈率(TTM)")
+
+    assert fake.indicators == ["市盈率(TTM)"]
+
+
+def test_valuation_column_names_the_metric_and_unit(monkeypatch):
+    """A bare ``value`` column is how a market cap got read as a PE multiple."""
+    adapter, _ = make_valuation_adapter(monkeypatch)
+
+    df = adapter.fetch_valuation("000858", 1, "总市值").df
+
+    assert "总市值(亿元)" in df.columns
+    assert "value" not in df.columns
+    assert df.iloc[0]["总市值(亿元)"] == 2707.42
+
+
+class FakeIndicatorAk:
+    """Analysis-indicator source: Chinese labels, a date column, no ROE text."""
+
+    def stock_financial_analysis_indicator(self, symbol: str, start_year: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "日期": ["2026-06-30", "2025-12-31"],
+                "净资产收益率(%)": [32.53, 34.19],
+                "销售净利率(%)": [50.75, 52.49],
+                "资产负债率(%)": [15.19, 16.42],
+            }
+        )
+
+
+def test_indicator_field_filter_resolves_english_alias(monkeypatch):
+    """``ROE`` must select ``净资产收益率(%)`` rather than silently matching none."""
+    monkeypatch.setattr(akshare_adapter, "_import_akshare", lambda: FakeIndicatorAk())
+    adapter = AkShareAdapter(throttle_seconds=0)
+
+    df = adapter.fetch_indicators("600519", 3, ["ROE"]).df
+
+    assert "净资产收益率(%)" in df.columns
+    assert "date" in df.columns
+    assert "销售净利率(%)" not in df.columns
+
+
+# --- quote candidate budgeting ------------------------------------------------
+
+def _em_frame() -> pd.DataFrame:
+    """EM snapshot shape, before the ``quote`` normalization renames it."""
+    return pd.DataFrame(
+        {
+            "代码": ["600519"], "名称": ["贵州茅台"], "最新价": [1275.16],
+            "涨跌幅": [1.23], "成交量": [34801.0], "成交额": [4.43e9], "换手率": [0.28],
+        }
+    )
+
+
+def _tx_frame() -> pd.DataFrame:
+    """Tencent daily series; the last row is the latest close."""
+    return pd.DataFrame({"date": ["2026-09-10", "2026-09-11"], "close": [1269.0, 1275.16]})
+
+
+def make_quote_adapter(monkeypatch, ak) -> AkShareAdapter:
+    monkeypatch.setattr(akshare_adapter, "_import_akshare", lambda: ak)
+    return AkShareAdapter(throttle_seconds=0)
+
+
+def test_quote_prefers_the_rich_snapshot_when_available(monkeypatch):
+    class Ak:
+        def stock_zh_a_spot_em(self):
+            return _em_frame()
+
+        def stock_zh_a_hist_tx(self, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("the fallback must not be reached")
+
+        def stock_zh_a_spot(self):  # pragma: no cover - must not run
+            raise AssertionError("the last resort must not be reached")
+
+    result = make_quote_adapter(monkeypatch, Ak()).fetch_quote("600519")
+
+    assert result.interface == "stock_zh_a_spot_em"
+    assert result.df.iloc[0]["close"] == 1275.16
+
+
+def test_quote_moves_on_when_a_candidate_exceeds_its_deadline(monkeypatch):
+    """A hanging source must not consume the caller's whole budget."""
+    class Ak:
+        def stock_zh_a_spot_em(self):
+            time.sleep(3.0)  # much longer than the deadline
+            return _em_frame()
+
+        def stock_zh_a_hist_tx(self, **kwargs):
+            return _tx_frame()
+
+        def stock_zh_a_spot(self):  # pragma: no cover - must not run
+            raise AssertionError("the last resort must not be reached")
+
+    monkeypatch.setattr(akshare_adapter, "_QUOTE_CANDIDATE_DEADLINE_S", 0.2)
+    started = time.perf_counter()
+
+    result = make_quote_adapter(monkeypatch, Ak()).fetch_quote("600519")
+
+    # It fell through to Tencent well before the slow candidate returned.
+    assert result.interface == "stock_zh_a_hist_tx"
+    assert time.perf_counter() - started < 1.0
+
+
+def test_tencent_quote_receives_a_request_timeout_and_prefixed_symbol(monkeypatch):
+    class Ak:
+        def __init__(self):
+            self.kwargs = None
+
+        def stock_zh_a_spot_em(self):
+            raise RuntimeError("em unreachable")
+
+        def stock_zh_a_hist_tx(self, **kwargs):
+            self.kwargs = kwargs
+            return _tx_frame()
+
+        def stock_zh_a_spot(self):  # pragma: no cover - must not run
+            raise AssertionError("the last resort must not be reached")
+
+    ak = Ak()
+    make_quote_adapter(monkeypatch, ak).fetch_quote("600519")
+
+    assert ak.kwargs["timeout"] == akshare_adapter._QUOTE_REQUEST_TIMEOUT_S
+    assert ak.kwargs["symbol"] == "sh600519"
+
+
+def test_repeatedly_failing_candidate_is_short_circuited(monkeypatch):
+    """After the failure threshold the dead source is skipped, not re-probed."""
+    class Ak:
+        def __init__(self):
+            self.em_calls = 0
+
+        def stock_zh_a_spot_em(self):
+            self.em_calls += 1
+            raise RuntimeError("em unreachable")
+
+        def stock_zh_a_hist_tx(self, **kwargs):
+            return _tx_frame()
+
+        def stock_zh_a_spot(self):  # pragma: no cover - must not run
+            raise AssertionError("the last resort must not be reached")
+
+    ak = Ak()
+    adapter = make_quote_adapter(monkeypatch, ak)
+
+    for _ in range(3):
+        assert adapter.fetch_quote("600519").interface == "stock_zh_a_hist_tx"
+
+    # Called on the first two queries, then skipped inside its cooldown.
+    assert ak.em_calls == akshare_adapter._UNHEALTHY_AFTER_FAILURES
+
+
+def test_all_unhealthy_candidates_are_retried_rather_than_giving_up(monkeypatch):
+    """Blacklisting every source must not turn into a permanent outage."""
+    class Ak:
+        def __init__(self):
+            self.recovered = False
+
+        def stock_zh_a_spot_em(self):
+            if self.recovered:
+                return _em_frame()
+            raise RuntimeError("em unreachable")
+
+        def stock_zh_a_hist_tx(self, **kwargs):
+            raise RuntimeError("tx unreachable")
+
+        def stock_zh_a_spot(self):
+            raise RuntimeError("sina unreachable")
+
+    ak = Ak()
+    adapter = make_quote_adapter(monkeypatch, ak)
+    for _ in range(akshare_adapter._UNHEALTHY_AFTER_FAILURES):
+        try:
+            adapter.fetch_quote("600519")
+        except AdapterError:
+            pass
+
+    ak.recovered = True
+
+    # Every candidate is in cooldown, so the full chain is retried and EM wins.
+    assert adapter.fetch_quote("600519").interface == "stock_zh_a_spot_em"
