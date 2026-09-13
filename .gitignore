@@ -31,3 +31,5 @@ output/*
 .mimosa/
 # ZCode IDE session plans and scratch state; not project content.
 .zcode/
+# Workflow-tool scratch output (task reports, cached runs); not project content.
+.superpowers/
