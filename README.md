@@ -14,13 +14,17 @@
 3. **计算**：`calc_metrics` / `calc_valuation` 做衍生指标与 DCF/可比估值，结论性数字必须标注 `{cite:cid}`；
 4. **成稿**：`write_report` 渲染成带图表、带「数据来源」附录的 markdown + docx；未标注来源的数字会被标记 `[!无来源:n]`；
 5. **风险终审**：成稿后**自动**启动一个独立子 Agent 复核报告——它在自己的上下文里，用受限的只读工具集**重新取数核对**报告中的关键数字，输出修改意见。主 Agent 据此决定是否修订。
+6. **并行子代理**：`spawn_agent` 把若干彼此独立的并行任务分派给子代理，每个子代理在**自己的上下文**里完成、只回结论，因此大量中间材料（多份长文档、多条独立分析线）不占主上下文。子代理只读、**不取数**：材料由主 Agent 取好后写在任务里或以本地路径给出。
 
-第 5 步是这个项目与「一个带工具的聊天机器人」的主要区别：终审人是独立上下文，且能自己去核数据，因此抓得住作者自己看不见的错误。真实运行中它抓到过同一份报告里 ROE 前后矛盾（17.72% vs 16.75%）、近一年收益率偏差（-12.43% vs -15.89%）等问题。
+第 5 步是这个项目与「一个带工具的聊天机器人」的主要区别：终审人是独立上下文，且能自己去核数据，因此抓得住作者自己看不见的错误。真实运行中它抓到过同一份报告里 ROE 前后矛盾（17.72% vs 16.75%）、近一年收益率偏差（-12.43% vs -15.89%）等问题。第 6 步把同一个机制推广到任意可隔离任务——**理由始终是隔离，不是并发**：主 Agent 本来就能在一轮内并行调多个工具。
 
 ## 快速开始
 
 ```bash
 uv sync --extra dev
+
+# 可选：可观测性后端（Prometheus 指标 / LangSmith 追踪）
+uv sync --extra dev --extra observability
 
 # 1. 配置：复制示例并选择 Provider
 cp settings.example.json settings.json
@@ -33,7 +37,13 @@ uv run uvicorn finharness.server.api:create_production_app --factory --port 8000
 cd frontend && npm install && npm run dev
 ```
 
-浏览器打开前端地址即可对话。也可用 HTTP 驱动的演示脚本跑通两个端到端场景：
+浏览器打开前端地址即可对话。首次使用需要注册一个账号：登录页可切换
+「注册新账号」，用户名 2–32 个字符，口令至少 8 位。所有对话、偏好与
+模型供应商配置都按账号隔离（见 [docs/modules/03.13-auth.md](docs/modules/03.13-auth.md)）。
+若这是从单用户版本升级而来，第一个注册的账号会自动继承原有的对话与配置。
+
+也可用 HTTP 驱动的演示脚本跑通两个端到端场景（脚本会先注册/登录一个
+`demo` 账号，因为所有 `/v1` 接口都要求认证）：
 
 ```bash
 python scripts/demo.py                    # 自己拉起服务，跑 Demo A + B
@@ -58,20 +68,29 @@ python scripts/demo.py --demo b --json    # 只跑 Demo B，输出机器可读�
 
 Provider 也可在前端配置页写入数据库并加密存储；**已激活的数据库配置优先于 `settings.json` 预设**。
 
-## 联网检索（可选）
+## 联网检索与研报（可选）
 
-`web_search`（关键词检索）与 `fetch_url`（抓取指定网址正文）补充本地数据源未覆盖的政策、
-新闻与行业信息；用户直接给出网址时由 `fetch_url` 抓取。二者都是**懒加载**工具，
-模型需先 `load_tool` 激活（system prompt 已点名，其存在是确定的）。
+`web_search`（关键词检索）补充本地数据源未覆盖的政策、新闻与行业信息；
+`get_research_reports` 抓取**东方财富研报**——按类型（行业/个股）、行业、机构、时间段与标题
+关键词筛选，返回标题/机构/评级/日期/链接，并可选用 `with_text` 抓取 PDF 全文。
+二者都是**懒加载**工具，模型需先 `load_tool` 激活（system prompt 已点名）。
 
-配置（`settings.search`，写法与 provider 一致）：
+`web_search` 配置（`settings.search`，写法与 provider 一致）：
 
 ```bash
-export TAVILY_API_KEY=tvly-...        # 密钥只从环境变量读
+export TAVILY_API_KEY=tvly-...        # 推荐：密钥只从环境变量读
 ```
 
-未配置密钥时两个工具返回结构化"未配置"提示，不影响其他功能。抓取由 Tavily 服务器执行，
-**本机不直接访问用户所给 URL**。
+也可在 `settings.json`（已被 git 忽略）里直接写 `search.api_key`，适合不方便设环境变量的本地环境，
+此时密钥以明文落盘。`search.proxy` 可显式指定检索请求走的代理；**不填则自动使用系统代理**——
+`httpx` 只读环境变量、不读 Windows 注册表，而 A 股数据源用的 `requests` 会读系统代理，
+不自动对齐会导致"国内源通、检索源不通"。
+
+未配置密钥时 `web_search` 返回结构化"未配置"提示，不影响其他功能（`get_research_reports`
+**不需要密钥**）。`web_search` 的检索请求由 Tavily 服务器发出，本机不直接访问目标地址。
+例外是研报**全文**：`with_text=true` 时由本机抓取 PDF 并用 `pypdf` 抽取正文，该能力默认开启
+（`search.local_pdf_fallback`）且带私网阻断（逐跳校验重定向，拦 loopback／私网／云元数据地址），
+关闭后 `with_text=true` 会明确报错；仅取元数据不受影响。
 
 ## 配置覆盖
 
@@ -98,7 +117,7 @@ FINH_DATA_ADAPTER_ORDER='["akshare"]'    # 列表/对象用 JSON
 | M5 演示打磨 | 风险终审子 Agent、Demo 脚本、E2E 预算断言、README | ✅ |
 | M6 服务层 Web 化 | FastAPI SSE、确认往返、Web 聊天页、对话管理 | ✅ |
 
-规模：`src/` 约 9,700 行 Python；509 条离线测试（`pytest -m "not smoke"`）。
+规模：`src/` 约 1.9 万行 Python（`wc -l`）；895 条离线测试（`pytest -m "not smoke"`）。
 
 ## 架构一览
 
@@ -106,16 +125,17 @@ FINH_DATA_ADAPTER_ORDER='["akshare"]'    # 列表/对象用 JSON
 engine/loop.py      AgentLoop：轮次驱动、流式、并行工具、循环兜底、压缩触发、记忆装配
 provider/           OpenAI/Anthropic 兼容协议 + 重试与错误分类
 tools/              23 个工具（两级注册表：常驻 + 懒加载），registry.py 是目录
-  fin/              行情/财务/估值/可比/公告/图表/研报
+  fin/              行情/财务/估值/可比/公告/图表/研报（含 report_pipeline.py 渲染 + docx 导出）
   generic/          read_file / write_file（限 output/ 与 data_cache/）
   meta/             research_plan / search_tools / load_tool / load_skill / ask_user
-skills/             8 个方法论技能（杜邦/DCF/可比/盈利质量/行业框架/风险清单/回测/研报模板）
+skills/             4 个投研场景（个股/行业/宏观/量化）：各含 SKILL.md + references 方法论 + assets 报告模板
 data/               adapter 降级链 + 缓存 + citation 注册表
 context/            L1 WorkingMemory + L2 事件环 + L3 SQLite 持久层；分段摘要与压缩
-report/             Markdown 渲染 + 占位符替换 + 无来源数字校验 + docx 导出
+utils/              跨层通用件：pandas/akshare 运行时垫片、Markdown 图片链接转义
 permissions/        权限门（deny 规则 > 模式回退 > 路径白名单）
 hooks/              审计链（JSONL，每次受治理的工具调用一行）
-coordinator/        风险终审子 Agent（独立上下文 + 受限只读工具集）
+coordinator/        风险终审子 Agent（独立上下文 + 受限只读工具集；review.py 终审编排）
+observability/      三层观测：结构化 JSON 日志（trace_id 贯穿）+ Prometheus 指标 + LangSmith 追踪
 server/             FastAPI 路由、SSE、会话注册表、确认总线
 frontend/           React 19 + TypeScript + antd
 ```
@@ -137,11 +157,12 @@ frontend/           React 19 + TypeScript + antd
 | GET | `/v1/artifacts` | 下载产物（限 output/ 与 data_cache/） |
 | GET | `/v1/cache/stats` | 缓存命中统计 |
 | GET | `/v1/config` | Provider 配置（前端设置页用） |
+| GET | `/metrics` | Prometheus 指标（仅在 `observability.metrics.enabled=true` 时注册） |
 
 ## 测试
 
 ```bash
-pytest -m "not smoke"          # 离线：509 条，约 20s，不联网、不花钱
+pytest -m "not smoke"          # 离线：895 条，约 30s，不联网、不花钱
 pytest -m smoke                # 真实 Provider + 真实行情数据，需 DEEPSEEK_API_KEY
 python scripts/demo.py         # 端到端演示（HTTP 驱动）
 ```
@@ -149,6 +170,23 @@ python scripts/demo.py         # 端到端演示（HTTP 驱动）
 - 离线测试不写真实 `data_cache/`：每个用例用 `tmp_path` 构造 hermetic 的 Settings 与缓存。
 - `@smoke` 用例同时是 M5 的**成本验收**：一次完整研报必须落在 240s / 600k token 的包络内
   （实测基线 102s / 300,319 token，阈值留了余量以吸收模型间方差）。
+
+### Agent 评估体系
+
+四维度评估（任务完成率 / 推理路径正确性 / 效率 / 安全性），详见 [03.13-eval.md](docs/modules/03.13-eval.md)：
+
+```bash
+python -m finharness.eval list  --set smoke|core|full   # 列出题集
+python -m finharness.eval check                          # 仅校验用例 YAML
+python -m finharness.eval run --set selfcheck --offline  # 零成本管线自检
+python -m finharness.eval run --set smoke                # 真实 Provider（需密钥）
+```
+
+- 用例在 `evals/cases/*.yaml`，判定规则从 `docs/测试问题集-功能与幻觉.md` 的
+  「通过标准/典型失败信号」翻译而来；判定看**行为模式**而非字面文本。
+- 产出 `evals/runs/<ts>_<set>/report.md`：四维度表、加权综合分、红线门禁结论、失败用例轨迹。
+- 引擎为轨迹评估记录每步 `Thought/Action/Observation`（含被拒绝的调用），见 `AgentTurnOutcome.trace`。
+- **首次真实运行前需校准 `evals/config.yaml` 的效率预算**（当前为估计基线）。
 
 ## 已知边界
 
@@ -160,11 +198,16 @@ python scripts/demo.py         # 端到端演示（HTTP 驱动）
   "不可执行的引文"，但**不做注入内容扫描**（明确决定：现有 deny 规则针对交易意图，扫财经正文会
   大量误报；指令注入需要另一套模式，启发式护栏会漏报却制造安全感）。写入操作仍需用户确认，
   是更硬的边界。详见 [03.7-governance.md](docs/modules/03.7-governance.md)。
-- **联网抓取由检索服务完成**。`fetch_url` 的请求由 Tavily 服务器发出，因此本机**无 SSRF 面**；
-  代价是内网地址与付费墙页面抓不到，且所抓 URL 对检索服务可见。
-- **多智能体只做风险终审**。宏观焦点**明确不做**（能力已具备，即 `web_search`，但不实现）；
-  通用 `spawn_agent` 接口也未实现，只有一个调用方时它是空壳。决策记录见
-  [03.10-coordinator.md](docs/modules/03.10-coordinator.md)。
+- **联网检索由检索服务完成**。`web_search` 的请求由 Tavily 服务器发出，该路径本机
+  **无 SSRF 面**；代价是内网地址与付费墙页面抓不到，且查询对检索服务可见。
+  例外是研报**全文**（`get_research_reports` 的 `with_text=true`）：它让本机访问文档 CDN，
+  故以"私网阻断 + 长度/时长上限 + 有界重试"收窄受影响面，并可用
+  `search.local_pdf_fallback=false` 完全关闭。已知局限：地址校验为请求前解析而非固定对端，
+  非 DNS-rebinding 免疫。
+- **多智能体做两件事：风险终审 + 通用任务扇出**，共同理由是**上下文隔离**（不是并发）。
+  宏观焦点**明确不做**（能力已具备，即 `web_search`，但不实现）。通用 `spawn_agent`
+  已在第二个焦点出现后按原定条件落地；子代理一律只读、**不含取数层**（风险终审是唯一例外，
+  它需要独立核数）。决策记录见 [03.10-coordinator.md](docs/modules/03.10-coordinator.md)。
 - **记忆作用域**：对话内容按 conversation 隔离；用户偏好（`remember_preference`）
   是所有对话共享的全局记忆。
 - **模型输出有方差**：同一句提问的取数路径与报告结构可能不同，属正常。
@@ -185,3 +228,5 @@ python scripts/demo.py         # 端到端演示（HTTP 驱动）
 | 风险终审 | [03.10-coordinator.md](docs/modules/03.10-coordinator.md) |
 | CLI | [03.11-cli.md](docs/modules/03.11-cli.md) |
 | 服务层 | [03.12-server.md](docs/modules/03.12-server.md) |
+| 评估体系 | [03.13-eval.md](docs/modules/03.13-eval.md) |
+| 可观测性 | [03.14-observability.md](docs/modules/03.14-observability.md) |

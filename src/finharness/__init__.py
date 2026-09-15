@@ -1,9 +1,9 @@
-"""FinHarness backend package.
+"""FinHarness 后端包。
 
-Importing this package applies the compatibility settings the data layer needs
-before any adapter pulls in pandas/akshare.
+导入本包会应用数据层所需的兼容性设置，
+且须在任何适配器引入 pandas/akshare 之前完成。
 """
 
-from finharness._compat import apply_data_runtime_compat
+from finharness.utils.compat import apply_data_runtime_compat
 
 apply_data_runtime_compat()

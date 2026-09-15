@@ -1,13 +1,10 @@
-"""remember_preference: record a user preference shared by all conversations.
+"""remember_preference：记录一条对该用户所有对话共享的偏好。
 
-Preferences are the one memory surface that is *not* conversation-scoped — "how
-this user likes reports" applies everywhere — so this tool writes to the global
-``notes`` table rather than the conversation's own memory.
+偏好以*用户*（而非对话）为作用域——“这位用户喜欢怎样的报告”处处适用——因此本
+工具写入按用户划分的 ``notes`` 表，而非对话自身的记忆。
 
-Declared READ so it is allowed without a confirmation prompt: recording a stated
-preference is what the user just asked for, and prompting on every mention would
-make the feature unusable. It takes effect from the next turn, because memory is
-assembled before the prompt is built.
+声明为 READ，使其无需确认提示即被允许：记录用户刚刚表达的偏好正是其要求，而每次提及
+都弹确认会让该功能无法使用。它从下一轮起生效，因为记忆在提示构建之前就已组装完成。
 """
 
 from __future__ import annotations
@@ -32,9 +29,10 @@ class RememberPreferenceTool(BaseTool):
     timeout = 10
 
     async def _dispatch(self, *, key: str, value: str) -> RawData:
+        """把偏好写入全局存储；无存储时退化为仅当前会话生效。"""
         store = getattr(self.ctx, "store", None) if self.ctx is not None else None
         if store is None:
-            # Fall back to the session view so the caller still sees the effect.
+            # 退回到会话视图，使调用者仍能看到效果。
             if self.ctx is not None:
                 self.ctx.notes[key] = value
             return RawData(
@@ -43,7 +41,8 @@ class RememberPreferenceTool(BaseTool):
                 endpoint="memory:remember_preference",
                 params={"key": key},
             )
-        store.set_note(key, value, kind="preference")
+        user_id = getattr(self.ctx, "user_id", "") if self.ctx is not None else ""
+        store.set_note(key, value, user_id=user_id, kind="preference")
         self.ctx.notes[key] = value
         return RawData(
             kind="text",

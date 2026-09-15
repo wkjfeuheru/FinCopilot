@@ -37,7 +37,7 @@ def make_settings(**kwargs) -> Settings:
 
 
 def make_access(adapters, tmp_path, **kwargs) -> DataAccess:
-    """Hermetic access: an explicit cache keeps runs out of the repo cache."""
+    """封闭式访问：显式指定缓存，避免运行污染仓库缓存。"""
     return DataAccess(adapters, cache=LocalCache(tmp_path / "cache"), settings=make_settings(**kwargs))
 
 
@@ -66,13 +66,13 @@ def test_kline_tool_renders_a_summary_and_detail(tmp_path):
 
 
 def test_kline_summary_uses_the_latest_row_not_the_first(tmp_path):
-    """Sources return either row order; the render must read the newest close."""
+    """数据源可能返回任一行序；渲染必须读取最新收盘价。"""
 
     class AscendingAdapter(DataAdapter):
         name = "asc"
 
         def fetch_kline(self, symbol, period, adjust, years):
-            # Ascending order, as Sina returns it.
+            # 升序，与 Sina 返回的顺序一致。
             df = pd.DataFrame(
                 {
                     "date": pd.to_datetime(["2025-01-01", "2025-06-01", "2026-09-11"]),
@@ -89,7 +89,7 @@ def test_kline_summary_uses_the_latest_row_not_the_first(tmp_path):
     result = asyncio.run(run())
 
     assert result.ok is True
-    # The newest close (300.0) must be reported, not the oldest.
+    # 必须报告最新收盘价（300.0），而非最旧的。
     assert "300.00" in result.content
 
 
@@ -128,7 +128,7 @@ def test_kline_states_the_actual_window_it_covered(tmp_path):
 
 
 def test_kline_flags_a_window_much_shorter_than_requested(tmp_path):
-    """The Adapter history spans ~1 month; asking for a year must not pass silently."""
+    """该 Adapter 的历史跨度约 1 个月；请求一年时不得静默通过。"""
     async def run():
         return await GetKlineTool(make_access([Adapter()], tmp_path)).run(
             symbol="600519", period="day", adjust=None, years=1
@@ -137,7 +137,7 @@ def test_kline_flags_a_window_much_shorter_than_requested(tmp_path):
     result = asyncio.run(run())
 
     assert result.ok is True
-    # A recent listing asked for a year must be told it only has weeks.
+    # 对于请求一年的次新股，必须告知其仅有数周数据。
     assert "明显短于请求的 1 年" in result.content
     assert "近 1 年" in result.content
 
@@ -195,7 +195,7 @@ class IndicatorsAdapter(DataAdapter):
 
 
 def test_indicators_tool_flags_a_field_the_source_does_not_have(tmp_path):
-    """An unmatched field is a gap, not an empty cell; it must be stated."""
+    """未匹配到的字段是一个缺口，而非空单元格；必须予以说明。"""
     from finharness.tools.fin.indicators import GetIndicatorsTool
 
     async def run():
@@ -206,8 +206,8 @@ def test_indicators_tool_flags_a_field_the_source_does_not_have(tmp_path):
     result = asyncio.run(run())
 
     assert result.ok is True
-    # 权益乘数 has no column in this frame and is named as unavailable.
+    # 权益乘数在该 frame 中没有对应列，会被列为不可用。
     assert "权益乘数" in result.content
     assert "无对应列" in result.content
-    # ROE resolved, so it is not reported as missing.
+    # ROE 已解析成功，因此不会报告为缺失。
     assert "净资产收益率" in result.content

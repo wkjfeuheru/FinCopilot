@@ -1,12 +1,12 @@
-"""Working memory: transcript ownership, request size, and window maintenance."""
+"""Working memory：transcript 归属、请求大小与窗口维护。"""
 
 from finharness.config.settings import ContextSettings, Settings
 from finharness.context.memory.working import KEEP_RECENT_ROUNDS, WorkingMemory
 from finharness.context.tokens import TokenCounter
 from finharness.types import Msg, ToolUse
 
-# A shared counter: tiktoken's vocabulary is expensive to fetch, so tests reuse
-# whatever cache the machine already has instead of requesting a fresh one.
+# 共享的 counter：tiktoken 的词表获取代价高昂，因此测试复用机器上
+# 已有的缓存，而不是每次重新请求一份新的。
 COUNTER = TokenCounter()
 
 
@@ -59,7 +59,7 @@ def test_not_over_budget_below_the_threshold(tmp_path):
 
 
 def test_over_budget_past_the_ratio(tmp_path):
-    # A small window makes the threshold easy to cross deterministically.
+    # 较小的窗口能让阈值被确定性地轻松越过。
     memory = make_memory(tmp_path, context_window_tokens=200, compaction_ratio=0.5)
     for _ in range(40):
         memory.append_user("这是一段足够长的中文文本用来把窗口撑满" * 3)
@@ -76,19 +76,19 @@ def test_squash_keeps_the_recent_rounds_and_returns_removed_count(tmp_path):
     removed, discarded = memory.squash(keep_rounds=2)
 
     assert removed > 0
-    # No digest is injected: earlier history lives in the summary layer.
+    # 不注入 digest：更早的历史存放在 summary layer 中。
     assert "摘要" not in [m.content for m in memory.raw if m.role == "user"]
     assert "问题4" in [m.content for m in memory.raw if m.role == "user"]
     assert "问题0" not in [m.content for m in memory.raw if m.role == "user"]
-    # Two assistant frames survive: one per kept round.
+    # 保留两个 assistant frame：每个保留的 round 一个。
     assistants = [m for m in memory.raw if m.role == "assistant"]
     assert len(assistants) == KEEP_RECENT_ROUNDS
-    # The kept window starts with an assistant frame, so tool calls stay paired.
+    # 保留的窗口以 assistant frame 开头，因此 tool call 与其结果保持配对。
     assert memory.raw[0].role == "assistant"
 
 
 def test_squash_leaves_cumulative_spend_untouched(tmp_path):
-    """Compaction must not rewrite the billing figure."""
+    """Compaction 不得改写计费数值。"""
     memory = make_memory(tmp_path)
     for index in range(4):
         memory.append_user(f"问题{index}")
@@ -101,7 +101,7 @@ def test_squash_leaves_cumulative_spend_untouched(tmp_path):
 
 def test_squash_reduces_the_window(tmp_path):
     memory = make_memory(tmp_path)
-    # Rounds are model exchanges: an assistant frame marks each one.
+    # Round 指模型的一轮交互：每个 assistant frame 标记一个 round。
     for index in range(6):
         memory.append_user("很长的历史内容" * 20)
         memory.append_assistant(Msg(role="assistant", content="很长的阶段回答" * 20))
@@ -128,15 +128,15 @@ def test_zero_window_disables_the_check(tmp_path):
     memory = make_memory(tmp_path, context_window_tokens=1)
     memory.append_user("内容")
 
-    # A window of 1 token would otherwise be over budget immediately.
+    # 否则 1 token 的窗口会立即处于超预算状态。
     assert memory.over_budget(system="s", tools=[]) is True
 
 
 def test_rounds_are_counted_by_exchange_not_by_user_message(tmp_path):
-    """A research task is one question followed by many exchanges.
+    """一次研究任务是一个问题后跟多轮交互。
 
-    Counting user messages would find nothing foldable in exactly the case
-    compaction exists for, so rounds must be counted per model exchange.
+    若按 user message 计数，恰好在 compaction 存在的那个场景下会找不到任何
+    可折叠的内容，因此必须按模型交互轮次来计数 round。
     """
     memory = make_memory(tmp_path)
     memory.append_user("只问了一次很长的问题" * 10)
@@ -153,11 +153,11 @@ def test_rounds_are_counted_by_exchange_not_by_user_message(tmp_path):
 
 
 def test_squash_never_orphans_a_tool_result(tmp_path):
-    """Every retained tool_result must still have its announcing assistant frame.
+    """每个保留的 tool_result 都必须仍能找到声明它的 assistant frame。
 
-    A tool_result whose call_id was never announced is rejected outright by
-    OpenAI-compatible APIs (HTTP 400), so the cut must land on an assistant
-    frame — never between a tool call and its result.
+    call_id 从未被声明过的 tool_result 会被 OpenAI 兼容 API 直接拒绝
+    （HTTP 400），因此切割点必须落在 assistant frame 上——绝不能落在
+    tool call 与其结果之间。
     """
     memory = make_memory(tmp_path)
     memory.append_user("问题")

@@ -179,3 +179,29 @@ def test_anthropic_malformed_structures_are_network_errors(event):
 
     with pytest.raises(NetworkError):
         collect(handler)
+
+
+def test_anthropic_context_overflow_is_token_limit_error():
+    """上下文超限必须与一般请求失败区分开（docs 03.14.2）。"""
+    from finharness.provider.errors import TokenLimitError
+
+    async def handler(request):
+        return httpx.Response(
+            400,
+            content=b'{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}',
+        )
+
+    with pytest.raises(TokenLimitError):
+        collect(handler)
+
+
+def test_anthropic_sse_context_overflow_is_token_limit_error():
+    from finharness.provider.errors import TokenLimitError
+
+    async def handler(request):
+        return sse_response(
+            [{"type": "error", "error": {"type": "invalid_request_error", "message": "context length exceeded"}}]
+        )
+
+    with pytest.raises(TokenLimitError):
+        collect(handler)

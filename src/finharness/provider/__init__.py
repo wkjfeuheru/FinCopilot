@@ -1,1 +1,1 @@
-"""Model provider implementations."""
+"""模型 Provider 实现。"""

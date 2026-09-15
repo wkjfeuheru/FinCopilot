@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: finharness
+    orgId: 1
+    folder: FinHarness
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      # docker-compose 把 ops/grafana/dashboards 挂到这里。
+      path: /var/lib/grafana/dashboards

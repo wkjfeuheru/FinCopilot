@@ -1,4 +1,4 @@
-"""Resolve the active provider: database config first, settings preset as fallback."""
+"""解析当前激活的 provider：优先使用数据库配置，settings 预设作为回退。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from finharness.provider.registry import build_provider_from_fields
 
 
 class NotConfigured(RuntimeError):
-    """Raised when neither the database nor settings yields a usable provider."""
+    """当数据库与 settings 都无法提供可用 provider 时抛出。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +30,7 @@ class ProviderStatus:
 
 
 def _default_timeouts(settings: Settings, kind: str) -> tuple[float, float]:
-    """Borrow timeout defaults from any preset sharing the requested kind."""
+    """从任意一个具有指定 kind 的预设借用超时默认值。"""
     for preset in settings.providers.values():
         if preset.kind == kind:
             return preset.first_byte_timeout_s, preset.idle_timeout_s
@@ -42,7 +42,12 @@ def _settings_has_key(preset: ProviderSettings) -> bool:
 
 
 class ProviderResolver:
-    """Caches the active provider and rebuilds it only when configuration changes."""
+    """缓存各用户当前激活的 provider，仅当配置变化时才重新构建。
+
+    缓存键包含 user_id：每个用户有自己的激活配置，互不串台。
+    settings 预设 + 环境变量回退保持全局——那是部署级凭据，
+    在用户尚未配置任何供应商时作为兜底。
+    """
 
     def __init__(
         self,
@@ -62,14 +67,16 @@ class ProviderResolver:
         return self._store_factory()
 
     def invalidate(self) -> None:
+        """清除缓存的 provider，使其在下次访问时重建。"""
         self._cached_key = None
         self._cached_provider = None
 
-    def status(self) -> ProviderStatus:
-        active = self._store.get_active()
+    def status(self, user_id: str = "") -> ProviderStatus:
+        """返回该用户当前 provider 的配置状态（数据库优先，settings 回退）。"""
+        active = self._store.get_active(user_id=user_id)
         if active is not None:
             return ProviderStatus(
-                configured=active.kind == "fake" or self._store.resolve_key(active.id) is not None,
+                configured=active.kind == "fake" or self._store.resolve_key(active.id, user_id=user_id) is not None,
                 source="database",
                 name=active.name,
                 kind=active.kind,
@@ -94,17 +101,19 @@ class ProviderResolver:
             has_key=available,
         )
 
-    def current(self) -> Provider:
-        active = self._store.get_active()
+    def current(self, user_id: str = "") -> Provider:
+        """返回该用户当前激活的 provider 实例（数据库优先，settings 回退）。"""
+        active = self._store.get_active(user_id=user_id)
         if active is not None:
-            return self._from_database(active)
+            return self._from_database(active, user_id=user_id)
         return self._from_settings()
 
-    def _from_database(self, active: ProviderConfigRecord) -> Provider:
-        cache_key = ("database", active.id, active.updated_at)
+    def _from_database(self, active: ProviderConfigRecord, *, user_id: str) -> Provider:
+        """根据数据库中的激活记录构建（并缓存）provider。"""
+        cache_key = ("database", user_id, active.id, active.updated_at)
         if self._cached_key == cache_key and self._cached_provider is not None:
             return self._cached_provider
-        api_key = self._store.resolve_key(active.id)
+        api_key = self._store.resolve_key(active.id, user_id=user_id)
         if active.kind != "fake" and not api_key:
             raise NotConfigured(
                 f"配置「{active.name}」缺少可用 API Key，请重新填写或设置环境变量"
@@ -126,6 +135,7 @@ class ProviderResolver:
         return provider
 
     def _from_settings(self) -> Provider:
+        """根据 settings 预设构建（并缓存）provider。"""
         preset = self._settings.providers.get(self._settings.model.provider)
         if preset is None:
             raise NotConfigured("未配置供应商，请先在设置中配置模型供应商")

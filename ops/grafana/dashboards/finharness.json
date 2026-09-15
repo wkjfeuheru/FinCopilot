@@ -1,0 +1,162 @@
+{
+  "title": "FinHarness Agent Observability",
+  "uid": "finharness-agent",
+  "tags": ["finharness", "agent"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "model",
+        "label": "模型",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(llm_tokens_total, model)",
+        "includeAll": true,
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "请求耗时分布 (P50 / P95 / P99)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "P50",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(agent_request_duration_seconds_bucket{model=~\"$model\"}[5m])))",
+          "legendFormat": "P50"
+        },
+        {
+          "refId": "P95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(agent_request_duration_seconds_bucket{model=~\"$model\"}[5m])))",
+          "legendFormat": "P95"
+        },
+        {
+          "refId": "P99",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(agent_request_duration_seconds_bucket{model=~\"$model\"}[5m])))",
+          "legendFormat": "P99"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "错误率（按错误类型）",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "stacking": {"mode": "normal"}}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (error_type) (rate(agent_request_errors_total[5m]))",
+          "legendFormat": "{{error_type}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Token 消耗速率（按模型与调用类型）",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 9},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "stacking": {"mode": "normal"}}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model, kind, call_type) (rate(llm_tokens_total{model=~\"$model\"}[5m]))",
+          "legendFormat": "{{model}} / {{kind}} / {{call_type}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "工具调用量与失败率",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 9},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "calls",
+          "expr": "sum by (tool, status) (rate(agent_tool_calls_total[5m]))",
+          "legendFormat": "{{tool}} / {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "首 token 延迟 (P95)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 18},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, model, call_type) (rate(agent_llm_first_token_seconds_bucket{model=~\"$model\"}[5m])))",
+          "legendFormat": "{{model}} / {{call_type}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "单次模型调用耗时 (P95)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 18},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, model, call_type) (rate(agent_llm_duration_seconds_bucket{model=~\"$model\"}[5m])))",
+          "legendFormat": "{{model}} / {{call_type}}"
+        }
+      ]
+    }
+  ]
+}

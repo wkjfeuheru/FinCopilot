@@ -41,6 +41,40 @@ def test_settings_defaults_include_complete_contract(tmp_path):
     assert settings.providers["fake"].kind == "fake"
     assert settings.providers["deepseek"].first_byte_timeout_s == 30.0
     assert settings.providers["deepseek"].idle_timeout_s == 60.0
+    # 观测默认关闭：核心安装不引入 prometheus-client/langsmith（docs 03.14）。
+    assert settings.observability.logging.level == "INFO"
+    assert settings.observability.logging.json_format is True
+    assert settings.observability.logging.path is None
+    assert settings.observability.logging.capture_payloads is False
+    assert settings.observability.metrics.enabled is False
+    assert settings.observability.tracing.enabled is False
+    assert settings.observability.tracing.env_key == "LANGSMITH_API_KEY"
+
+
+def test_observability_log_path_is_resolved_relative_to_settings(tmp_path):
+    path = write_settings(tmp_path, {"observability": {"logging": {"path": "logs/app.jsonl"}}})
+    settings = Settings.from_file(path)
+
+    assert settings.observability.logging.path == tmp_path / "logs" / "app.jsonl"
+
+
+def test_observability_rejects_unknown_keys(tmp_path):
+    """extra=forbid 在观测段同样生效，拼错的开关不会静默失效。"""
+    path = write_settings(tmp_path, {"observability": {"metrics": {"enable": True}}})
+
+    with pytest.raises(SettingsError, match="observability.metrics"):
+        Settings.from_file(path)
+
+
+def test_metrics_switch_fails_fast_without_the_dependency(monkeypatch, tmp_path):
+    """开关打开却没装依赖时启动即失败，而不是静默不采集。"""
+    import finharness.config.settings as settings_module
+
+    monkeypatch.setattr(settings_module, "_module_available", lambda name: False)
+    path = write_settings(tmp_path, {"observability": {"metrics": {"enabled": True}}})
+
+    with pytest.raises(SettingsError, match="prometheus-client"):
+        Settings.from_file(path).validate_runtime(require_api_key=False)
 
 def test_provider_validation_rejects_invalid_kind_url_and_timeout(tmp_path):
     cases = [
@@ -116,7 +150,7 @@ def test_provider_overrides_deep_merge_preset_defaults(tmp_path):
     settings = Settings.from_file(write_settings(tmp_path, {"providers": {"deepseek": {"env_key": "ALT_KEY"}}}))
 
     assert settings.providers["deepseek"].env_key == "ALT_KEY"
-    # Untouched preset fields survive the merge.
+    # 未被覆盖的预设字段在合并后依然保留。
     assert settings.providers["deepseek"].kind == "openai_compat"
     assert settings.providers["deepseek"].base_url == "https://api.deepseek.com/v1"
     assert settings.providers["deepseek"].idle_timeout_s == 60.0
@@ -301,24 +335,24 @@ def test_settings_loading_does_not_create_configured_directories(tmp_path):
     assert not (tmp_path / "logs").exists()
 
 
-# --- web search configuration (docs 03.4) -------------------------------------
+# --- web search 配置（文档 03.4） -------------------------------------
 
 def test_search_defaults_to_tavily_with_an_env_key(tmp_path):
     settings = Settings.from_file(write_settings(tmp_path, {"model": {"provider": "fake"}}))
 
     assert settings.search.kind == "tavily"
     assert settings.search.base_url == "https://api.tavily.com"
-    # The environment variable is the recommended key source.
+    # 环境变量是推荐的密钥来源。
     assert settings.search.env_key == "TAVILY_API_KEY"
-    # An inline key is permitted but absent by default, so nothing is stored.
+    # 允许内联密钥，但默认不存在，因此不会存储任何内容。
     assert settings.search.api_key is None
 
 
 def test_search_accepts_an_inline_api_key(tmp_path):
-    """A locally configured key must work without exporting an env var.
+    """本地配置的密钥必须在不导出 env var 的情况下也能工作。
 
-    The key lives in settings.json, which is git-ignored; the environment
-    variable remains the recommended source.
+    该密钥存放在 settings.json 中，而该文件已被 git 忽略；环境变量
+    仍是推荐的来源。
     """
     path = write_settings(
         tmp_path,
@@ -343,6 +377,22 @@ def test_search_section_is_configurable(tmp_path):
 
     assert settings.search.env_key == "MY_SEARCH_KEY"
     assert settings.search.timeout_s == 12.5
+    # 默认未设置，因此 adapter 会回退到系统代理检测。
+    assert settings.search.proxy is None
+
+
+def test_search_proxy_is_configurable(tmp_path):
+    path = write_settings(
+        tmp_path,
+        {
+            "model": {"provider": "fake"},
+            "search": {"proxy": "http://127.0.0.1:7890"},
+        },
+    )
+
+    settings = Settings.from_file(path)
+
+    assert settings.search.proxy == "http://127.0.0.1:7890"
 
 
 def test_search_environment_overrides(monkeypatch, tmp_path):

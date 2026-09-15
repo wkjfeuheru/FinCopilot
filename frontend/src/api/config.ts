@@ -1,3 +1,5 @@
+import { authedFetch } from "./http";
+
 export type Preset = {
   name: string;
   kind: string;
@@ -43,7 +45,7 @@ export type ConfigDraft = {
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const response = await authedFetch(path, {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
@@ -54,7 +56,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       if (typeof body.detail === "string") detail = body.detail;
       else if (body.detail?.errors) detail = body.detail.errors.map((e: { message: string }) => e.message).join("；");
     } catch {
-      /* keep the status-based message */
+      /* 保留基于状态码的提示信息 */
     }
     throw new Error(detail);
   }

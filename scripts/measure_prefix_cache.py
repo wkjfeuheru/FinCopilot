@@ -1,13 +1,12 @@
 #!/usr/bin/env python
-"""Measure prefix-cache effectiveness: state-in-system vs state-as-trailing-message.
+"""测量 prefix cache 的效果：state 放在 system 中 vs state 作为尾部消息。
 
-Runs the same multi-step research question through two loop configurations and
-reports the provider's own cache accounting for each. The "old" arm is produced
-by monkeypatching the loop's request assembly back to the pre-optimization
-layout (state concatenated onto the system prompt), so both arms run identical
-code paths otherwise and the comparison is apples-to-apples.
+将同一个多步研究问题分别跑过两种 loop 配置，并报告各配置下 provider 自身的缓存
+统计。“old” 一组通过 monkeypatch 把 loop 的请求组装恢复为优化前的布局
+（state 拼接在 system prompt 上）得到，因此除此之外两组运行的是完全相同的代码
+路径，比较才是同类可比的。
 
-    python scripts/measure_prefix_cache.py            # needs DEEPSEEK_API_KEY
+    python scripts/measure_prefix_cache.py            # 需要 DEEPSEEK_API_KEY
 """
 
 from __future__ import annotations
@@ -37,8 +36,7 @@ from finharness.permissions.gate import PermissionGate  # noqa: E402
 from finharness.provider.openai_compat import OpenAICompatProvider  # noqa: E402
 from finharness.tools.registry import ToolRegistry  # noqa: E402
 
-# One question that forces several sequential tool rounds — the shape where
-# per-iteration prefix reuse matters most.
+# 一个会强制进行多轮串行工具调用的问题——这正是每次迭代 prefix 复用最关键的情形。
 QUESTION = "请分步研究贵州茅台(600519)：先取行情与估值，再看财务指标，最后给一段综合结论。"
 
 
@@ -78,8 +76,8 @@ def _build_loop(settings, data, *, state_in_system: bool):
         session_id="prefix-measure",
     )
     if state_in_system:
-        # Reproduce the pre-optimization layout without touching the source:
-        # state glued to the system prompt, history unchanged.
+        # 在不改动源码的前提下复现优化前的布局：state 粘到 system prompt 上，
+        # history 保持不变。
         def old_system() -> str:
             return loop.system + loop.ctx.state_block()
 
@@ -106,6 +104,7 @@ async def _run_arm(settings, data, *, state_in_system: bool) -> Arm:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """运行 prefix cache 测量主流程：两种配置各跑一遍并输出对比。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -114,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         print("需要设置 DEEPSEEK_API_KEY", file=sys.stderr)
         return 2
 
-    from finharness.context.tokens import TokenCounter  # warm the vocabulary cache
+    from finharness.context.tokens import TokenCounter  # 预热词表缓存
 
     TokenCounter()
 
@@ -130,9 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         settings=settings,
     )
 
-    # Old first: its writes warm the market-data cache, so the new arm is not
-    # penalised by cold fetches. Prefix caching is per-request-prefix and
-    # unaffected by this ordering.
+    # 先跑 old：它的写入会预热行情数据缓存，从而使 new 一组不会因冷启动取数而
+    # 吃亏。prefix cache 以单次请求的 prefix 为单位，不受此顺序影响。
     arms = [asyncio.run(_run_arm(settings, data, state_in_system=True))]
     arms.append(asyncio.run(_run_arm(settings, data, state_in_system=False)))
 
@@ -157,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"命中率：{old.hit_ratio:.0%} → {new.hit_ratio:.0%}")
     print(f"未命中（全价）token：{old.cache_miss_tokens} → {new.cache_miss_tokens}")
     if old.input_tokens:
-        # Lower is better; report the direction explicitly rather than a sign.
+        # 数值越低越好；显式说明方向，而不是用正负号表示。
         delta = new.input_tokens - old.input_tokens
         word = "减少" if delta < 0 else "增加"
         print(f"输入 token 合计：{old.input_tokens} → {new.input_tokens}（{word} {abs(delta)}）")

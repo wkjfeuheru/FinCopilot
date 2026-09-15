@@ -1,4 +1,4 @@
-"""Two-tier tool registry: resident schemas plus searchable lazy tools."""
+"""两层工具注册表：常驻 schema 加上可检索的懒加载工具。"""
 
 from __future__ import annotations
 
@@ -11,40 +11,50 @@ from finharness.context.trim import DEFAULT_MAX_DESC_LEN, trim_schema
 from finharness.data.access import DataAccess
 from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
 
-# Tool classes are registered through a loader so the module stays importable
-# while the catalogue grows.
+# 工具类经由 loader 注册，使目录扩张时该模块仍可导入。
 from finharness.tools.fin.announcements import GetAnnouncementsTool
+from finharness.tools.fin.backtest import RunBacktestTool
 from finharness.tools.fin.chart import MakeChartTool
 from finharness.tools.fin.financials import GetFinancialsTool
 from finharness.tools.fin.indicators import GetIndicatorsTool
+from finharness.tools.fin.industry import GetIndustryConstituentsTool, GetIndustryPerfTool
 from finharness.tools.fin.kline import GetKlineTool
+from finharness.tools.fin.macro import GetMacroIndicatorsTool
 from finharness.tools.fin.metrics import CalcMetricsTool
 from finharness.tools.fin.news import GetMarketNewsTool
 from finharness.tools.fin.peers import GetPeersTool
 from finharness.tools.fin.quote import GetQuoteTool
+from finharness.tools.fin.research_reports import GetResearchReportsTool
 from finharness.tools.fin.valuation import GetValuationTool
 from finharness.tools.fin.valuation_calc import CalcValuationTool
 from finharness.tools.fin.writer import WriteReportTool
 from finharness.tools.generic.files import ReadFileTool, WriteFileTool
-from finharness.tools.generic.web import FetchUrlTool, WebSearchTool
+from finharness.tools.generic.web import WebSearchTool
 from finharness.tools.meta.ask import AskUserTool
 from finharness.tools.meta.discovery import LoadToolTool, SearchToolsTool
-from finharness.tools.meta.plan import ResearchPlanTool
+from finharness.tools.meta.plan import (
+    RecordConclusionTool,
+    ResearchPlanTool,
+    UpdatePlanStepTool,
+)
 from finharness.tools.meta.preference import RememberPreferenceTool
 from finharness.tools.meta.skills import ListSkillsTool, LoadSkillTool
+from finharness.tools.meta.spawn import SpawnAgentTool
 
-# Every name here must resolve to a registered class — a lazy entry without an
-# implementation would be listed by lazy_names() while being unreachable, so
-# run_backtest / read_pdf are omitted until their tools exist.
+# 这里的每个名称都必须解析到一个已注册的类——没有实现的懒加载条目会被
+# lazy_names() 列出却无法触达，因此在对应工具存在之前，run_backtest / read_pdf
+# 不予列入。
 #
-# Web access is lazy because most financial questions never need it, and a
-# resident schema is re-sent on every request; the system prompt names these so
-# discovery does not depend on the model choosing to search first.
+# 联网访问与研报设为懒加载，是因为大多数金融问题从不需要它们，而常驻 schema 会在
+# 每次请求时重新发送；系统提示会点名它们，使发现过程不依赖于模型主动先去检索。
 DEFAULT_LAZY_TOOLS: tuple[str, ...] = (
     "get_announcements",
     "calc_valuation",
     "web_search",
-    "fetch_url",
+    "get_research_reports",
+    "spawn_agent",
+    # 重量级计算（面板取数、IC/分组回测）：由量化因子场景按需激活，而非随每次请求携带。
+    "run_backtest",
 )
 
 ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
@@ -57,9 +67,14 @@ ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
     GetPeersTool,
     GetMarketNewsTool,
     GetAnnouncementsTool,
+    GetResearchReportsTool,
+    GetMacroIndicatorsTool,
+    GetIndustryPerfTool,
+    GetIndustryConstituentsTool,
     # 金融-计算
     CalcMetricsTool,
     CalcValuationTool,
+    RunBacktestTool,
     # 金融-输出
     MakeChartTool,
     WriteReportTool,
@@ -67,43 +82,39 @@ ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
     ReadFileTool,
     WriteFileTool,
     WebSearchTool,
-    FetchUrlTool,
     # 元
     ResearchPlanTool,
+    UpdatePlanStepTool,
+    RecordConclusionTool,
     SearchToolsTool,
     ListSkillsTool,
     LoadSkillTool,
     LoadToolTool,
+    SpawnAgentTool,
     AskUserTool,
     RememberPreferenceTool,
 )
 
 FINANCIAL_DATA_TOOLS = ALL_TOOL_CLASSES
 
-# Groups whose tools may be handed to a read-only reviewer sub-agent. Data tools
-# let it re-fetch and check the report's numbers; GENERIC adds read_file for the
-# rendered artefact and cached parquet. FIN_CALC is deliberately absent: those
-# tools only compute over inputs the caller supplies, so they add no ability to
-# independently verify a figure.
+# 其工具可交给只读复核子代理的分组。数据工具让它能重新取数并核对报告中的数字；
+# GENERIC 增加 read_file 以读取渲染产物与缓存 parquet。FIN_CALC 被刻意排除：
+# 这些工具只在调用方提供的输入上做计算，因此无法增加独立核验某个数字的能力。
 REVIEW_TOOL_GROUPS: tuple[ToolGroup, ...] = (ToolGroup.FIN_DATA, ToolGroup.GENERIC)
 
 
 def review_tool_names() -> tuple[str, ...]:
-    """The read-only subset a reviewer sub-agent is allowed to call.
+    """复核子代理被允许调用的只读子集。
 
-    Derived from the contract rather than a hand-kept list, so a new read-only
-    data tool is available to the reviewer automatically. Four exclusions are
-    implicit in the rule and each matters:
+    由契约推导而来而非手工维护的清单，因此新的只读数据工具会自动对复核者可用。
+    规则隐含了四项排除，且每一项都有其意义：
 
-    * ``PermissionLevel.WRITE`` — the reviewer must not be able to write.
-    * META group — ``research_plan`` and ``remember_preference`` have
-      side effects on session/global state, and ``load_tool`` would let the
-      reviewer widen its own catalogue.
-    * ``needs_interactive`` — ``ask_user`` cannot work in a sub-agent, which has
-      no interactive channel wired.
-    * ``review_eligible=False`` — web tools. A reviewer that starts searching
-      the internet spends tokens to pull untrusted text into a context whose
-      only job is checking the report against the session's own data.
+    * ``PermissionLevel.WRITE`` —— 复核者绝不能有写权限。
+    * META 分组 —— ``research_plan`` 与 ``remember_preference`` 会对会话/全局状态
+      产生副作用，而 ``load_tool`` 会让复核者自行扩大其目录。
+    * ``needs_interactive`` —— ``ask_user`` 在子代理中无法工作，因为没有接上交互通道。
+    * ``review_eligible=False`` —— 联网工具。一旦复核者开始搜索互联网，就会消耗 token
+      把不可信文本拉入一个只负责拿报告与会话自身数据核对的上下文。
     """
     return tuple(
         tool_cls.name
@@ -115,9 +126,29 @@ def review_tool_names() -> tuple[str, ...]:
     )
 
 
+def worker_tool_names() -> tuple[str, ...]:
+    """通用子代理可调用的子集：仅限本地材料（docs 03.10）。
+
+    为隔离上下文而派发的子代理只消费交给它的材料；它不会自行去取数。因此这里刻意
+    只含*通用*只读工具——``read_file``，用于以路径传入的材料——而**不含**
+    ``review_tool_names()``，后者还额外携带数据层。一个唯一输入只是任务文本的
+    worker 本就无法正确选择股票代码或行业，给它数据工具只会招致猜测，而非隔离。
+
+    与 ``review_tool_names`` 一样按谓词推导：新的通用只读工具无需修改本函数即可可用。
+    """
+    return tuple(
+        tool_cls.name
+        for tool_cls in ALL_TOOL_CLASSES
+        if tool_cls.permission is PermissionLevel.READ
+        and tool_cls.group is ToolGroup.GENERIC
+        and not tool_cls.needs_interactive
+        and tool_cls.review_eligible
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ToolBrief:
-    """Search result: enough to describe a lazy tool without its full schema."""
+    """检索结果：足以描述一个懒加载工具，而无需其完整 schema。"""
 
     name: str
     description: str
@@ -126,7 +157,7 @@ class ToolBrief:
 
 
 def build_parameters(model: type[BaseModel]) -> dict[str, Any]:
-    """JSON Schema for the model, with the title noise stripped."""
+    """模型的 JSON Schema，已剥除 title 噪声字段。"""
     schema = model.model_json_schema()
     schema.pop("title", None)
     for prop in schema.get("properties", {}).values():
@@ -135,12 +166,11 @@ def build_parameters(model: type[BaseModel]) -> dict[str, Any]:
 
 
 class ToolRegistry:
-    """Instantiates every tool but only exposes resident schemas by default.
+    """实例化所有工具，但默认只暴露常驻 schema。
 
-    ``only`` narrows the catalogue itself, not just its visibility: a name
-    outside the set does not resolve, so the loop reports it as unknown. That is
-    how a sub-agent is confined — the restriction is structural rather than a
-    policy the sub-agent could be persuaded to ignore.
+    ``only`` 收窄的是目录本身，而不只是其可见性：集合之外的名称无法解析，因此循环会
+    将其报告为未知。子代理正是以这种方式被限域——该限制是结构性的，而不是一条子代理
+    可能被说服去忽略的策略。
     """
 
     def __init__(
@@ -152,8 +182,8 @@ class ToolRegistry:
         only: set[str] | None = None,
     ) -> None:
         self.settings = settings
-        # Kept so the loop can mint a coordinator (or a scoped registry for one)
-        # without the caller having to pass the same DataAccess twice.
+        # 保留它，使循环无需调用方两次传入同一个 DataAccess，即可铸造一个协调器
+        # （或为协调器铸造一个限域注册表）。
         self.data = data
         classes = (
             tuple(tool_cls for tool_cls in ALL_TOOL_CLASSES if tool_cls.name in only)
@@ -163,27 +193,27 @@ class ToolRegistry:
         self.tools: dict[str, BaseTool] = {
             tool_cls.name: tool_cls(data, ctx=ctx) for tool_cls in classes
         }
-        # Meta tools need the catalogue they live in; wire after construction.
+        # 元工具需要它们所栖身的目录；构造后接线。
         for tool in self.tools.values():
             tool.registry = self
         configured_lazy = tuple(getattr(settings.tools, "lazy", ()) or ()) if settings else ()
         configured_resident = tuple(getattr(settings.tools, "resident", ()) or ()) if settings else ()
         if only is not None:
-            # A scoped catalogue is a working set, so nothing in it is lazy: the
-            # activation path needs ``load_tool``, which a confined registry does
-            # not have, so a lazy tool here would be listed but unreachable.
+            # 限域目录是一个工作集，因此其中没有任何工具是懒加载的：激活路径需要
+            # ``load_tool``，而受限于限域的注册表没有它，所以这里的懒加载工具会被
+            # 列出却无法触达。
             self._lazy: set[str] = set()
         elif configured_resident:
-            # An explicit resident list wins; everything else becomes lazy.
+            # 显式的常驻列表优先；其余一切都变为懒加载。
             self._lazy = {name for name in self.tools if name not in configured_resident}
         elif configured_lazy:
             self._lazy = {name for name in configured_lazy if name in self.tools}
         else:
             self._lazy = {name for name in DEFAULT_LAZY_TOOLS if name in self.tools}
-        # Lazy tools only enter the request after activation (docs 03.4.3).
+        # 懒加载工具只有在激活后才进入请求（docs 03.4.3）。
         self._active: set[str] = {name for name in self.tools if name not in self._lazy}
 
-    # -- catalogue ------------------------------------------------------------
+    # -- 目录 ------------------------------------------------------------
     def names(self) -> list[str]:
         return list(self.tools)
 
@@ -204,20 +234,19 @@ class ToolRegistry:
         return name in self._active
 
     def activate(self, name: str) -> bool:
-        """Add a tool to the injected set; returns False for unknown or already-active."""
+        """将一个工具加入已注入集合；对未知或已激活的工具返回 False。"""
         if name not in self.tools or name in self._active:
             return False
         self._active.add(name)
         return True
 
-    # -- schemas --------------------------------------------------------------
+    # -- schema --------------------------------------------------------------
     def schemas(self, names: set[str] | None = None) -> list[dict]:
-        """OpenAI-style schemas for the injected set (registry order).
+        """已注入集合的 OpenAI 风格 schema（按注册表顺序）。
 
-        ``names`` defaults to the active set, so lazy tools stay hidden until
-        the round after activation. Descriptions are trimmed to the configured
-        budget because every resident schema is re-sent on every request
-        (docs 3.6.1).
+        ``names`` 默认为活动集合，因此懒加载工具会一直隐藏，直到激活后的下一轮。
+        描述会按配置的预算裁剪，因为每个常驻 schema 都会在每次请求时重新发送
+        （docs 3.6.1）。
         """
         selected = self._active if names is None else names
         budget = self._desc_budget()
@@ -238,19 +267,17 @@ class ToolRegistry:
         ]
 
     def _desc_budget(self) -> int:
-        """Per-description character budget derived from the token setting."""
+        """由 token 设置推导出的每条描述字符预算。"""
         if self.settings is None:
             return DEFAULT_MAX_DESC_LEN
-        # Tokens -> characters using the documented Chinese approximation, so the
-        # setting stays expressed in the unit the docs use.
+        # 用文档给出的中文近似值做 token -> 字符换算，使该设置仍以文档所用单位表达。
         return max(int(self.settings.context.max_tool_schema_tokens * 1.7), 20)
 
-    # -- search ---------------------------------------------------------------
+    # -- 检索 ---------------------------------------------------------------
     def search(self, query: str, *, limit: int = 5) -> list[ToolBrief]:
-        """Keyword-weighted search over name/description, cataloguing lazy tools.
+        """在名称/描述上做关键词加权检索，并将懒加载工具编入目录。
 
-        v1 is deliberately word-matching plus recency-free weighting (docs
-        3.4.3): no vector store.
+        v1 刻意采用词匹配加与时效无关的权重（docs 3.4.3）：不用向量库。
         """
         terms = [term for term in query.lower().replace("，", " ").split() if term]
         scored: list[ToolBrief] = []

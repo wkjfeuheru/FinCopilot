@@ -1,4 +1,4 @@
-"""Audit hook: JSONL schema, truncation and secret redaction (docs 4.3)."""
+"""Audit hook：JSONL schema、截断与密钥脱敏（文档 4.3）。"""
 
 import asyncio
 import json
@@ -23,8 +23,8 @@ def test_summarize_args_truncates_long_values():
 
 
 def test_summarize_args_redacts_secret_keys():
-    # Keys are built from a list so no literal pair reads as a credential; the
-    # assertion is that secret-shaped keys never reach the log.
+    # 键由列表构建，因此没有任何字面键值对看起来像凭据；
+    # 断言的是形如密钥的键绝不会进入日志。
     secret_keys = ("api_key", "token")
     args = dict.fromkeys(secret_keys, "placeholder")
     args["symbol"] = "600519"
@@ -88,3 +88,67 @@ def test_denied_action_is_recorded(tmp_path):
     assert record["action"] == "denied"
     assert record["verdict"] == "deny"
     assert record["ok"] is False
+
+
+def test_a_review_outcome_is_audited_as_its_own_row(tmp_path):
+    """报告的 review 是可审计事件：tool 声明，hook 记录。"""
+    writer = AuditLogWriter(tmp_path / "audit.jsonl")
+    hook = AuditHook(writer, session_id="s")
+
+    class ReportTool:
+        name = "write_report"
+
+    reviewed = ToolResult(
+        content="已生成报告", ok=True,
+        metadata={"review": {"status": "done", "topic": "测试报告",
+                              "review_path": "out/x.review.md", "error": None}},
+    )
+    asyncio.run(
+        hook.post(
+            ReportTool(), {"topic": "测试报告"}, reviewed,
+            action="run", verdict="allow", duration_ms=1200.0, turn=3,
+        )
+    )
+    # 没有 review metadata 的结果（其他所有 tool）不写 review 行。
+    asyncio.run(
+        hook.post(
+            FakeTool(), {"symbol": "600519"}, ToolResult(content="ok", ok=True),
+            action="run", verdict="allow", turn=3,
+        )
+    )
+
+    records = read_lines(tmp_path / "audit.jsonl")
+    assert [r["action"] for r in records] == ["run", "review", "run"]
+    review = records[1]
+    assert review["tool"] == "write_report"
+    assert review["turn"] == 3
+    assert review["status"] == "done"
+    assert review["topic"] == "测试报告"
+    assert review["review_path"] == "out/x.review.md"
+    assert "error" in review and review["error"] is None
+
+
+def test_an_unreviewed_report_is_audited_as_such(tmp_path):
+    """降级的 review 必须仅凭日志即可回答，而不只是 tool 文本。"""
+    writer = AuditLogWriter(tmp_path / "audit.jsonl")
+    hook = AuditHook(writer, session_id="s")
+
+    class ReportTool:
+        name = "write_report"
+
+    degraded = ToolResult(
+        content="已生成报告", ok=True,
+        metadata={"review": {"status": "unreviewed", "topic": "测试报告",
+                              "review_path": None, "error": "max_turns_exhausted"}},
+    )
+    asyncio.run(
+        hook.post(
+            ReportTool(), {"topic": "测试报告"}, degraded,
+            action="run", verdict="allow", turn=2,
+        )
+    )
+
+    review = read_lines(tmp_path / "audit.jsonl")[1]
+    assert review["action"] == "review"
+    assert review["status"] == "unreviewed"
+    assert review["error"] == "max_turns_exhausted"

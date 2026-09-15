@@ -1,1 +1,1 @@
-"""Permission and sandbox governance."""
+"""权限与沙箱治理。"""

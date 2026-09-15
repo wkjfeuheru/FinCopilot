@@ -1,4 +1,4 @@
-"""Session statistics for usage, retries and tool execution time."""
+"""会话统计：usage、重试与工具执行耗时。"""
 
 from __future__ import annotations
 
@@ -17,19 +17,19 @@ class SessionStatsSnapshot:
     tool_calls: int = 0
     tool_duration_ms: int = 0
     per_tool: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
-    # Sub-agent usage, keyed by focus (e.g. "risk"). A sub-agent's tokens are
-    # also folded into input_tokens/output_tokens above, so the total stays
-    # complete while this dimension shows where the spend went.
+    # sub-agent 的 usage，按 focus 归类（例如 "risk"）。sub-agent 的 token
+    # 同时也会计入上方的 input_tokens/output_tokens，因此总量保持完整，
+    # 而这个维度展示开销的去向。
     per_agent: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
-    # Prefix-cache split of input_tokens. cache_miss_tokens stays 0 for providers
-    # that do not report the split, so hit_ratio is only meaningful when at least
-    # one of the two is non-zero.
+    # input_tokens 的 prefix-cache 拆分。对于不报告该拆分的 provider，
+    # cache_miss_tokens 保持为 0，因此只有两者中至少一个非零时，hit_ratio
+    # 才有意义。
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
 
 
 class SessionStats:
-    """Mutable session-local counters; snapshots are detached read-only copies."""
+    """会话内可变计数器；快照是分离的只读副本。"""
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self.input_tokens = 0
@@ -56,20 +56,19 @@ class SessionStats:
         self.cache_miss_tokens += cache_miss_tokens
 
     def cache_hit_ratio(self) -> float:
-        """Share of reported cacheable input served from the prefix cache.
+        """从 prefix cache 命中提供的、所报告可缓存输入所占的比例。
 
-        Returns 0.0 when the provider reports no split, which is distinct from a
-        genuine 0% hit rate but is the honest answer: nothing was reported.
+        当 provider 未报告拆分时返回 0.0，这与真正的 0% 命中率不同，但却是
+        诚实的答案：没有任何报告。
         """
         total = self.cache_hit_tokens + self.cache_miss_tokens
         return (self.cache_hit_tokens / total) if total else 0.0
 
     def record_agent_usage(self, name: str, input_tokens: int, output_tokens: int) -> None:
-        """Attribute usage to a sub-agent focus as a breakdown, not a second sum.
+        """将 usage 归属到某个 sub-agent focus，作为明细拆分而非重复求和。
 
-        The totals are incremented separately via ``add_usage``; keeping the two
-        apart means a snapshot can report both "how much in total" and "how much
-        of it was the risk reviewer" without double-counting.
+        总量通过 ``add_usage`` 单独递增；将二者分开意味着快照既能报告
+        "总共多少"，也能报告"其中多少来自风险评审者"，且不会重复计数。
         """
         entry = self._per_agent.setdefault(
             name, {"input_tokens": 0, "output_tokens": 0, "runs": 0}
@@ -82,7 +81,7 @@ class SessionStats:
         self.retry_count += 1
 
     def record_tool_request(self, name: str) -> None:
-        """Count every tool request, including unknown or rejected ones."""
+        """统计每一个 tool 请求，包括未知或被拒绝的请求。"""
         self.tool_calls += 1
         entry = self._per_tool.setdefault(name, {"count": 0, "duration_ms": 0})
         entry["count"] += 1
@@ -91,13 +90,14 @@ class SessionStats:
         return self._clock()
 
     def record_tool_duration(self, name: str, started_at: float) -> int:
-        """Accumulate wall time for a call that actually entered tool.run()."""
+        """累加真正进入了 tool.run() 的调用的墙钟耗时。"""
         duration_ms = round((self._clock() - started_at) * 1000)
         entry = self._per_tool.setdefault(name, {"count": 0, "duration_ms": 0})
         entry["duration_ms"] += duration_ms
         return duration_ms
 
     def snapshot(self) -> SessionStatsSnapshot:
+        """汇总当前计数器，生成一份分离的只读快照。"""
         return SessionStatsSnapshot(
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,

@@ -1,7 +1,7 @@
-"""M3 end-to-end: a natural-language request produces a charted report with an appendix.
+"""M3 端到端：一个自然语言请求会生成带图表的 report 和附录。
 
-Hits a real provider and real market data, so it is marked ``smoke``.
-Requires a CJK font; skips cleanly where none is installed.
+会访问真实 provider 和真实市场数据，因此标记为 ``smoke``。
+需要 CJK 字体；未安装时会被干净地跳过。
 """
 
 from __future__ import annotations
@@ -25,19 +25,19 @@ from finharness.hooks.audit import AuditHook, AuditLogWriter
 from finharness.hooks.base import HookChain
 from finharness.permissions.gate import PermissionGate
 from finharness.provider.openai_compat import OpenAICompatProvider
-from finharness.report.charting import FontUnavailableError, resolve_cjk_font
+from finharness.tools.fin.charting import FontUnavailableError, resolve_cjk_font
 from finharness.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.smoke
 
-# Exercise the shipped prompt so the asset itself is under test.
+# 使用随包发布的 prompt，以便该资产本身也处于测试之下。
 SYSTEM_PROMPT = system_prompt()
 
-# M5 budget envelope (docs §10). Measured on a from-scratch report request
-# against deepseek-chat: 102s wall, 300,319 total tokens (28 tool calls, and the
-# report revised twice after review). These ceilings sit above the measurement
-# with headroom, so they catch a gross regression — an unbounded revise loop, a
-# lost cache — without failing on ordinary model-to-model variance.
+# M5 预算上限（文档 §10）。基于一次从零开始的 report 请求测得
+# （针对 deepseek-chat）：墙钟 102s，总计 300,319 tokens（28 次 tool call，
+# report 经 review 后修订了两次）。这些上限在测量值之上留有余量，
+# 因此能捕获严重回归——无界的 revise 循环、缓存丢失——而不会因
+# 模型之间的正常差异而失败。
 REPORT_WALL_CEILING_S = 240.0
 REPORT_TOKEN_CEILING = 600_000
 
@@ -93,7 +93,7 @@ def _build(tmp_path):
 
 
 def test_report_request_produces_a_charted_docx(tmp_path):
-    """One request should yield both artefact forms, with citations and a chart."""
+    """一次请求应产出两种形态的交付物，并带有 citations 和一张 chart。"""
     _require_font()
     loop, _, settings = _build(tmp_path)
 
@@ -114,7 +114,7 @@ def test_report_request_produces_a_charted_docx(tmp_path):
 
     assert markdowns, "a markdown report must be produced"
     assert docx_files, "a docx must be produced alongside the markdown"
-    # The charted page and the provenance appendix are the M3 acceptance points.
+    # 带图表的页面和来源附录是 M3 的验收要点。
     assert list((output_dir / "charts").glob("*.png")), "the report should embed a chart"
     body = markdowns[0].read_text(encoding="utf-8")
     assert "附录" in body
@@ -133,21 +133,19 @@ def test_report_request_registers_citations_for_the_appendix(tmp_path):
     outcome = asyncio.run(run())
 
     assert outcome.succeeded is True, outcome.error
-    # Data actually fetched during the run is what the appendix is built from.
+    # 附录正是基于运行期间实际获取的数据构建的。
     assert ctx.symbols, "the session should have recorded covered symbols"
 
 
 def test_report_generation_triggers_the_risk_review_sub_agent(tmp_path):
-    """M5 acceptance: a report request earns an independent risk review (docs 03.10).
+    """M5 验收：一个 report 请求会触发独立的 risk review（文档 03.10）。
 
-    The demo claim is "writing a report runs a reviewer that did not write it".
-    This asserts the observable outcome — a review file with comments and a
-    per-agent token entry — rather than the mechanism, so it stays honest if the
-    internals move.
+    demo 的主张是「写 report 会运行一个并非由它自己撰写的 reviewer」。
+    这里断言的是可观察的结果——一个带有意见的 review 文件，以及一条按 agent 归集的
+    token 记录——而不是其内部机制，这样即使内部实现变动也依然成立。
 
-    It also enforces the M5 budget envelope: the same run must finish inside the
-    time and token ceilings. That is the point of putting the measurement here —
-    a cost regression and a review regression should both fail this one test.
+    它还强制 M5 预算上限：同一次运行必须在时间和 token 上限内完成。
+    这正是把测量放在此处的原因——成本回归和 review 回归都应在这一个测试中失败。
     """
     _require_font()
     loop, _, settings = _build(tmp_path)
@@ -169,17 +167,17 @@ def test_report_generation_triggers_the_risk_review_sub_agent(tmp_path):
     reviews = list(output_dir.glob("*.review.md"))
     assert reviews, "writing a report must produce a risk review file"
     comments = reviews[0].read_text(encoding="utf-8")
-    # Either real comments or an explicit clean bill; an empty file is a bug.
+    # 要么是真实的意见，要么是明确的「无问题」结论；空文件是一个 bug。
     assert "风险终审意见" in comments
     assert comments.split("风险终审意见", 1)[1].strip()
 
-    # Review spend is attributed to the session under its own focus.
+    # review 的花费会在其专门的 focus 下归集到本会话。
     snapshot = loop.stats.snapshot()
     assert "risk" in snapshot.per_agent
     assert snapshot.per_agent["risk"]["runs"] >= 1
     assert snapshot.per_agent["risk"]["input_tokens"] > 0
 
-    # M5 budget envelope.
+    # M5 预算上限。
     total_tokens = snapshot.input_tokens + snapshot.output_tokens
     assert wall_s < REPORT_WALL_CEILING_S, (
         f"report took {wall_s:.0f}s, over the {REPORT_WALL_CEILING_S:.0f}s ceiling"

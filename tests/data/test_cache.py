@@ -11,7 +11,7 @@ def _frame(rows: int = 3) -> pd.DataFrame:
 
 def test_lookup_key_is_date_independent_and_param_sensitive():
     a = make_lookup_key(kind="kline", params={"symbol": "600519", "years": 1})
-    b = make_lookup_key(kind="kline", params={"years": 1, "symbol": "600519"})  # order-insensitive
+    b = make_lookup_key(kind="kline", params={"years": 1, "symbol": "600519"})  # 与顺序无关
     c = make_lookup_key(kind="kline", params={"symbol": "600519", "years": 3})
 
     assert a == b
@@ -99,7 +99,7 @@ def test_cache_write_is_idempotent_for_same_lookup(tmp_path):
 
     asyncio.run(run())
 
-    # INSERT OR REPLACE keeps a single row for the same lookup key.
+    # INSERT OR REPLACE 会为同一个 lookup key 只保留一行。
     assert cache.stats().entries == 1
 
 

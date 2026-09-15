@@ -1,14 +1,14 @@
-"""Financial statement abstracts (income / balance / cash flow)."""
+"""财务报表摘要（利润表 / 资产负债表 / 现金流量表）。"""
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool, DataInput, PermissionLevel, ToolGroup
 
 
-class FinancialsInput(BaseModel):
+class FinancialsInput(DataInput):
     symbol: str = Field(description="6位A股代码")
     statement: str = Field(default="利润", description="报表类型：利润/资产/现金流")
     years: int = Field(default=3, description="回溯年数")

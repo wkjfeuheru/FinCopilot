@@ -1,12 +1,12 @@
-"""Governance chain reached through AgentLoop: gate, hooks, audit, ctx injection."""
+"""通过 AgentLoop 触达的治理链：gate、hooks、audit、ctx 注入。"""
 
 import asyncio
 import json
 import sys
 from pathlib import Path
 
-# Reuse the engine test doubles; the suite has no tests package, so the sibling
-# module is loaded by path.
+# 复用 engine 的测试替身；测试套件没有 tests 包，因此通过路径加载
+# 兄弟模块。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_loop import (  # noqa: E402
     RecordingTool,
@@ -48,7 +48,7 @@ def test_gate_denial_blocks_execution_and_reports_a_reason():
             [tool_round(ToolUse("c1", "danger", {})), text_round("ok")]
         )
 
-        # A gate that always denies, independent of tool permission.
+        # 一个始终拒绝的 gate，与工具权限无关。
         class DenyAll:
             async def check(self, tool, args):
                 from finharness.permissions.gate import GateDecision
@@ -62,11 +62,11 @@ def test_gate_denial_blocks_execution_and_reports_a_reason():
 
     outcome, messages, tool = asyncio.run(run())
 
-    assert tool.calls == []  # never executed
+    assert tool.calls == []  # 从未执行
     payload = json.loads(messages[2].tool_results[0][1])
     assert payload["ok"] is False
     assert "forbidden by policy" in payload["error"]
-    assert outcome.succeeded is True  # the model still got to answer
+    assert outcome.succeeded is True  # 模型仍然得以作答
 
 
 def test_pre_hook_can_block_a_tool():
@@ -112,7 +112,7 @@ def test_audit_hook_records_run_and_session_boundaries(tmp_path):
 
 
 def test_write_tool_confirmation_flows_through_the_gate(tmp_path):
-    """A write tool reaches the confirm callback and is refused when declined."""
+    """写类工具会到达 confirm 回调，若被拒绝则不会执行。"""
     seen = []
 
     async def confirm(name, args):
@@ -146,18 +146,18 @@ def test_write_tool_confirmation_flows_through_the_gate(tmp_path):
 
 
 def test_context_state_is_injected_as_the_trailing_request_message():
-    """The state rides the request after the history, not in the system prompt.
+    """状态随请求附在历史之后，而不是放在 system prompt 中。
 
-    Keeping it out of ``system`` is what lets the provider's prefix cache retain
-    the static prompt *and* the growing history; putting it first would move the
-    cache boundary to the front of the conversation (docs 3.3).
+    将其排除在 ``system`` 之外，才能让 provider 的前缀缓存同时保留
+    静态 prompt *和* 不断增长的历史；若把它放在最前面，会把缓存边界
+    移到对话的开头（docs 3.3）。
     """
     from finharness.context.session import PlanStep
 
     async def run():
         ctx = ResearchContext(cite=CitationRegistry(), settings=Settings())
         ctx.set_plan("分析茅台", [PlanStep(seq=1, action="取行情")])
-        ctx.add_skill("dupont-analysis")
+        ctx.add_skill("equity-research")
         provider = ScriptedProvider([text_round("ok")])
         loop = make_loop(provider, registry=StubRegistry(), ctx=ctx)
         await loop.run("问题")
@@ -166,27 +166,27 @@ def test_context_state_is_injected_as_the_trailing_request_message():
     provider = asyncio.run(run())
 
     request = provider.requests[0]
-    # The system prompt stays static...
+    # system prompt 保持静态……
     assert "研究计划" not in request["system"]
-    assert "dupont-analysis" not in request["system"]
-    # ...and the state arrives as the last message instead.
+    assert "equity-research" not in request["system"]
+    # ……而状态改为作为最后一条消息到达。
     assert request["roles"][-1] == "user"
     state = request["messages"][-1].content
     assert "研究计划" in state
-    assert "dupont-analysis" in state
+    assert "equity-research" in state
 
 
 def test_tool_timeout_uses_the_declared_value_when_settings_has_no_override():
-    """A tool's own timeout must be honoured (settings override still wins)."""
-    from finharness.types import AgentTurnOutcome  # noqa: F401 - imported for clarity
+    """工具自身的 timeout 必须被遵守（settings 的覆盖仍然优先）。"""
+    from finharness.types import AgentTurnOutcome  # noqa: F401 - 仅为清晰起见而导入
 
     async def run():
         slow = RecordingTool("slow", delay=5.0)
-        slow.timeout = 1  # declared budget: 1s
+        slow.timeout = 1  # 声明的预算：1s
         registry = StubRegistry({"slow": slow})
         provider = ScriptedProvider([tool_round(ToolUse("c1", "slow", {})), text_round("ok")])
         settings = Settings(
-            tools=ToolSettings(timeout_default_s=30),  # global default would NOT trip 5s
+            tools=ToolSettings(timeout_default_s=30),  # 全局默认值不会触发 5s 超时
             context=ContextSettings(max_turns=3),
         )
         loop = make_loop(provider, registry=registry, settings=settings)
@@ -198,4 +198,4 @@ def test_tool_timeout_uses_the_declared_value_when_settings_has_no_override():
     payload = json.loads(messages[2].tool_results[0][1])
     assert payload["ok"] is False
     assert "timeout" in payload["error"]
-    assert "1s" in payload["error"]  # the declared 1s, not the 30s default
+    assert "1s" in payload["error"]  # 声明的是 1s，而非 30s 默认值

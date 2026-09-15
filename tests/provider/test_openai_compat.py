@@ -308,8 +308,8 @@ def test_openai_retry_metadata_marks_status_and_connection_errors():
     ],
 )
 def test_openai_retry_after_supports_http_dates_and_ignores_invalid_values(retry_after, expected):
-    # Date headers must be formatted at run time: a collection-time stamp
-    # drifts past the assertion tolerance once the suite runs long enough.
+    # 日期头必须在运行时生成：集合阶段生成的时间戳
+    # 会在测试套件运行足够久后漂移出断言的容差范围。
     if isinstance(retry_after, str):
         header = retry_after
     else:
@@ -454,4 +454,42 @@ def test_openai_malformed_scalar_fields_are_network_error(event):
         return sse_response([event])
 
     with pytest.raises(NetworkError):
+        collect_from(handler)
+
+
+def test_openai_context_overflow_is_token_limit_error():
+    """上下文超限必须与一般请求失败区分开，才能被指标单独统计（docs 03.14.2）。"""
+    from finharness.provider.errors import TokenLimitError
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            content=b'{"error":{"message":"This model maximum context length is 65536 tokens"}}',
+        )
+
+    with pytest.raises(TokenLimitError):
+        collect_from(handler)
+
+
+def test_openai_generic_400_remains_a_network_error():
+    from finharness.provider.errors import TokenLimitError
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, content=b'{"error":{"message":"bad request"}}')
+
+    with pytest.raises(NetworkError) as failure:
+        collect_from(handler)
+
+    assert not isinstance(failure.value, TokenLimitError)
+
+
+def test_openai_sse_context_overflow_is_token_limit_error():
+    from finharness.provider.errors import TokenLimitError
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response(
+            [{"error": {"code": "invalid_request", "message": "prompt is too long: 200000 tokens"}}]
+        )
+
+    with pytest.raises(TokenLimitError):
         collect_from(handler)

@@ -1,9 +1,9 @@
-"""Async data facade: cache lookup, adapter fallback, and provenance.
+"""异步数据门面：缓存查询、适配器回退与来源追溯。
 
-Tools never touch adapters directly. Every read goes cache-first, falls back
-through ``settings.data.adapter_order``, writes successful payloads back, and
-returns a ``RawData`` whose ``endpoint`` names the interface that actually
-served the data.
+工具从不直接接触适配器。每次读取都先查缓存，再按
+``settings.data.adapter_order`` 逐级回退，成功后将数据写回缓存，
+并返回一个 ``RawData``，其 ``endpoint`` 标明实际提供该数据的
+接口。
 """
 
 from __future__ import annotations
@@ -23,17 +23,26 @@ from finharness.data.raw import RawData
 
 
 class DataUnavailableError(RuntimeError):
-    """Raised when every configured source fails for a request."""
+    """当某次请求的所有已配置数据源都失败时抛出。"""
+
+
+# 可重试的数据源故障（TLS 握手重置、429、5xx）通常只是瞬时抖动。
+# 在放弃前短暂重试，对 web 类型尤为重要，因为它只有一个适配器：
+# 若没有该重试，一次瞬时错误就会导致整个调用失败，
+# 尽管下一次尝试本可成功。
+_ADAPTER_MAX_ATTEMPTS = 3
+_ADAPTER_RETRY_BACKOFF_S = 0.5
 
 
 def validate_symbol(symbol: str) -> str:
+    """校验标的为 6 位 A 股代码，格式不符则抛出 ``ValueError``。"""
     if not re.fullmatch(r"\d{6}", str(symbol)):
         raise ValueError("symbol must be a 6-digit A-share code")
     return symbol
 
 
 def _data_date(df: pd.DataFrame | None, fallback: str) -> str:
-    """Derive the data's own date so TTLs follow the data, not the fetch."""
+    """推导数据自身的日期，使 TTL 跟随数据而非抓取时刻。"""
     if df is None or not len(df):
         return fallback
     for column in ("date", "日期", "公告日期", "报告期", "end_date"):
@@ -49,7 +58,7 @@ def _data_date(df: pd.DataFrame | None, fallback: str) -> str:
 
 
 class DataAccess:
-    """The only data entry point available to tools."""
+    """工具可用的唯一数据入口。"""
 
     def __init__(
         self,
@@ -64,9 +73,9 @@ class DataAccess:
         if self.cache is None and settings is not None:
             self.cache = LocalCache(settings.data.cache_dir)
 
-    # -- orchestration --------------------------------------------------------
+    # -- 编排 --------------------------------------------------------
     def _ordered_adapters(self) -> list[DataAdapter]:
-        """Apply ``settings.data.adapter_order`` when configured."""
+        """在已配置时应用 ``settings.data.adapter_order``。"""
         if self.settings is None:
             return list(self.adapters)
         order = list(self.settings.data.adapter_order)
@@ -88,7 +97,7 @@ class DataAccess:
         method: str,
         args: tuple[Any, ...],
     ) -> RawData:
-        """Cache-first, then adapter fallback in configured order."""
+        """先查缓存，再按配置顺序回退到适配器。"""
         lookup_key = make_lookup_key(kind=kind, params=cache_params)
         if self.cache is not None:
             cached = self.cache.get(lookup_key)
@@ -102,18 +111,31 @@ class DataAccess:
 
         errors: list[str] = []
         for adapter in self._ordered_adapters():
-            try:
-                result = await asyncio.to_thread(getattr(adapter, method), *args)
-            except NotImplementedError:
-                errors.append(f"{adapter.name}: 不支持 {kind}")
-                continue
-            except AdapterError as exc:
-                errors.append(f"{adapter.name}: {exc.message}")
-                continue
-            except ValueError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - isolate adapter faults
-                errors.append(f"{adapter.name}: {type(exc).__name__}: {exc}")
+            result: Any = None
+            for attempt in range(1, _ADAPTER_MAX_ATTEMPTS + 1):
+                try:
+                    # ``getattr`` 保持在 try 内部：未实现该语义方法的
+                    # 适配器必须落到下一个数据源，而不是中止
+                    # 整个请求。
+                    result = await asyncio.to_thread(getattr(adapter, method), *args)
+                    break
+                except NotImplementedError:
+                    errors.append(f"{adapter.name}: 不支持 {kind}")
+                    break
+                except AdapterError as exc:
+                    # 仅重试瞬时故障；鉴权与配额错误
+                    # 在第二次尝试时也会同样失败。
+                    if exc.retryable and attempt < _ADAPTER_MAX_ATTEMPTS:
+                        await asyncio.sleep(_ADAPTER_RETRY_BACKOFF_S * attempt)
+                        continue
+                    errors.append(f"{adapter.name}: {exc.message}")
+                    break
+                except ValueError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 隔离适配器故障
+                    errors.append(f"{adapter.name}: {type(exc).__name__}: {exc}")
+                    break
+            if result is None:
                 continue
 
             df = result.df if isinstance(result, FetchResult) else result
@@ -164,16 +186,16 @@ class DataAccess:
             parquet_path=parquet_path,
         )
 
-    # -- semantic methods -----------------------------------------------------
+    # -- 语义方法 -----------------------------------------------------
     async def quote(self, symbol: str) -> RawData:
-        """Latest market snapshot for one symbol.
+        """单个标的的最新行情快照。
 
-        The cache key is symbol-scoped even though snapshot sources
-        (``stock_zh_a_spot_em``) fetch the whole market: the adapter returns only
-        the matching row, so a symbol-independent key would serve the first
-        symbol's row to every later one. Sharing one market-wide payload is only
-        sound once the *unfiltered* snapshot is cached and filtered on read; the
-        per-symbol key is what the current adapter contract can honour.
+        尽管快照数据源（``stock_zh_a_spot_em``）会抓取整个市场，缓存键仍按
+        标的作用域划分：适配器只返回匹配的那一行，因此与标的无关的键会把
+        第一个标的的行返回给之后的每一个标的。只有当缓存的是*未过滤*
+        的快照并在读取时再过滤，共享整份全市场数据才成立；
+        按标的划分的键才是当前适配器契约所
+        能够保证的。
         """
         symbol = validate_symbol(symbol)
         return await self._fetch(
@@ -182,6 +204,7 @@ class DataAccess:
         )
 
     async def kline(self, symbol: str, period: str = "day", adjust: str | None = None, years: int = 1) -> RawData:
+        """某标的在指定周期/复权方式下的 K 线序列。"""
         symbol = validate_symbol(symbol)
         return await self._fetch(
             kind="kline",
@@ -190,6 +213,7 @@ class DataAccess:
         )
 
     async def indicators(self, symbol: str, years: int = 3, fields: list[str] | None = None) -> RawData:
+        """某标的的财务指标序列，可按字段过滤列。"""
         symbol = validate_symbol(symbol)
         return await self._fetch(
             kind="indicators",
@@ -198,6 +222,7 @@ class DataAccess:
         )
 
     async def financials(self, symbol: str, statement: str = "利润", years: int = 3) -> RawData:
+        """某标的指定报表（利润/资产/现金流等）的财务数据。"""
         symbol = validate_symbol(symbol)
         return await self._fetch(
             kind="financials",
@@ -208,10 +233,10 @@ class DataAccess:
     async def valuation(
         self, symbol: str, lookback_years: int = 1, indicator: str | None = None
     ) -> RawData:
-        """One valuation series; ``indicator`` selects which metric.
+        """单条估值序列；``indicator`` 选择具体指标。
 
-        Normalising here (not in the adapter) keeps aliases on a single cache
-        slot and makes the canonical name part of the lookup key.
+        在此处（而非适配器中）做归一化，可让各种别名落在同一个缓存槽，
+        并使规范名称成为查找键的一部分。
         """
         symbol = validate_symbol(symbol)
         canonical = normalize_valuation_indicator(indicator)
@@ -226,6 +251,7 @@ class DataAccess:
         )
 
     async def peers(self, symbol: str, fields: list[str] | None = None) -> RawData:
+        """某标的的同行估值对比数据。"""
         symbol = validate_symbol(symbol)
         return await self._fetch(
             kind="peers",
@@ -234,6 +260,7 @@ class DataAccess:
         )
 
     async def news(self, symbol: str | None = None, topic: str | None = None, top_n: int = 10) -> RawData:
+        """个股或主题新闻列表。"""
         if symbol is not None:
             symbol = validate_symbol(symbol)
         return await self._fetch(
@@ -243,11 +270,45 @@ class DataAccess:
         )
 
     async def announcements(self, symbol: str, since: str, top_n: int = 20) -> RawData:
+        """某标的在指定起始日期之后的公告列表。"""
         symbol = validate_symbol(symbol)
         return await self._fetch(
             kind="announcements",
             cache_params={"symbol": symbol, "since": since, "top_n": top_n},
             method="fetch_announcements", args=(symbol, since, top_n),
+        )
+
+    async def research_reports(
+        self,
+        report_type: str = "行业",
+        industry: str | None = None,
+        institution: str | None = None,
+        keyword: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        top_n: int = 10,
+        with_text: bool = False,
+    ) -> RawData:
+        """东方财富研究报告（docs 03.4）。
+
+        每个参数都是缓存键的一部分，因此不同的行业、
+        机构、时间窗口或文本设置都会对应不同的缓存槽，
+        而不会命中过期数据。
+        """
+        return await self._fetch(
+            kind="reports",
+            cache_params={
+                "report_type": report_type,
+                "industry": industry,
+                "institution": institution,
+                "keyword": keyword,
+                "start_date": start_date,
+                "end_date": end_date,
+                "top_n": top_n,
+                "with_text": with_text,
+            },
+            method="fetch_research_reports",
+            args=(report_type, industry, institution, keyword, start_date, end_date, top_n, with_text),
         )
 
     async def web_search(
@@ -257,10 +318,9 @@ class DataAccess:
         topic: str | None = None,
         time_range: str | None = None,
     ) -> RawData:
-        """External web search (docs 03.4).
+        """外部网络搜索（docs 03.4）。
 
-        ``kind="web"`` selects the short web TTL; the ``op`` field keeps search
-        and fetch results in separate cache slots, since both share that kind.
+        ``kind="web"`` 会选择较短的 web TTL。
         """
         return await self._fetch(
             kind="web",
@@ -275,20 +335,53 @@ class DataAccess:
             args=(query, top_n, topic, time_range),
         )
 
-    async def fetch_url(self, url: str, query: str | None = None) -> RawData:
-        """Fetch one page's content through the search provider (docs 03.4).
+    async def macro(self, indicators: list[str], years: int = 3) -> RawData:
+        """长表形式的宏观经济序列（docs 03.4）。
 
-        The request leaves from the provider's servers, not this host, so there
-        is no SSRF surface here; ``TavilyAdapter`` only screens the scheme.
+        指标在生成缓存键前先做规范化，使别名与其 slug 共享同一个缓存槽；
+        列表会排序，因此顺序不会导致键被拆分。
         """
+        from finharness.data.mapping import normalize_macro_indicator
+
+        canonical = sorted({normalize_macro_indicator(name) for name in indicators})
         return await self._fetch(
-            kind="web",
-            cache_params={"op": "extract", "url": url, "query": query},
-            method="fetch_url",
-            args=(url, query),
+            kind="macro",
+            cache_params={"indicators": canonical, "years": years},
+            method="fetch_macro",
+            args=(canonical, years),
         )
 
-    # -- helpers --------------------------------------------------------------
+    async def industry_perf(self, industry: str | None = None, years: int = 1) -> RawData:
+        """申万行业指数历史；当 industry 为 None 时返回一级行业概览。"""
+        return await self._fetch(
+            kind="industry",
+            cache_params={"op": "perf", "industry": industry, "years": years},
+            method="fetch_industry_perf",
+            args=(industry, years),
+        )
+
+    async def industry_constituents(self, industry: str) -> RawData:
+        """申万行业的成分股（横截面选股池的一个来源）。"""
+        return await self._fetch(
+            kind="industry",
+            cache_params={"op": "cons", "industry": industry},
+            method="fetch_industry_constituents",
+            args=(industry,),
+        )
+
+    async def index_constituents(self, index: str) -> RawData:
+        """中证指数的成分股（主要的横截面选股池）。"""
+        from finharness.data.mapping import normalize_index
+
+        canonical = normalize_index(index)
+        return await self._fetch(
+            kind="industry",
+            cache_params={"op": "index_cons", "index": canonical},
+            method="fetch_index_constituents",
+            args=(canonical,),
+        )
+
+    # -- 辅助函数 --------------------------------------------------------------
     def fingerprint(self, df: pd.DataFrame | None) -> str:
         if df is None or not len(df):
             return fingerprint_series([])

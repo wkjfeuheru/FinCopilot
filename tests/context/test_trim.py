@@ -1,4 +1,4 @@
-"""Context trimming: schema descriptions and frame rows are budgeted."""
+"""上下文裁剪：schema description 与 frame 行都受预算约束。"""
 
 from finharness.config.settings import ContextSettings, Settings
 from finharness.context.trim import trim_schema
@@ -49,8 +49,8 @@ def test_registry_trims_descriptions_to_the_configured_budget(tmp_path):
 
     for entry in registry.schemas():
         description = entry["function"]["description"]
-        # A tiny budget floors at 20 characters so descriptions stay readable;
-        # anything already shorter is left untouched.
+        # 极小的预算会以 20 个字符为下限，以保证 description 可读；
+        # 已经更短的内容则保持不变。
         assert len(description) <= 20
 
 
@@ -79,14 +79,14 @@ def test_trim_rows_from_settings_controls_rendered_rows(tmp_path):
 
     rendered = tool.trim_dataframe(pd.DataFrame({"v": range(10)}))
 
-    # Header + separator + exactly trim_rows data rows, plus the truncation note.
+    # 表头 + 分隔行 + 恰好 trim_rows 行数据，外加截断提示。
     assert "|   0 |" in rendered
     assert "|   2 |" in rendered
     assert "|   3 |" not in rendered
 
 
 def test_dropped_columns_are_named_not_silently_omitted(tmp_path):
-    """A reader cannot reason about a column that was never shown."""
+    """读者无法对从未展示过的列进行推断。"""
     import pandas as pd
 
     settings = Settings(
@@ -94,17 +94,101 @@ def test_dropped_columns_are_named_not_silently_omitted(tmp_path):
         data={"cache_dir": tmp_path / "cache"},
     )
     tool = _StubTool(DataAccess([], settings=settings))
-    # Wide frame: the token budget forces columns to be dropped.
+    # 宽 frame：token 预算迫使部分列被丢弃。
     df = pd.DataFrame({f"col_{i}": range(40) for i in range(12)})
 
     rendered = tool.trim_dataframe(df)
 
     assert "已省略列" in rendered
-    assert "parquet" in rendered
+    # 提示会指明*真正有效的下一步*：以 detail=full 调用本工具。
+    assert 'detail="full"' in rendered
+
+
+def test_truncation_note_points_at_detail_full_not_read_file(tmp_path):
+    """提示必须指明一个确实能提供更多内容的步骤。
+
+    它曾经写作“用 read_file 读取缓存的 parquet”，但那同样要经过 trim
+    预算，因此返回的内容并不比原先的取数更多。真正的下一步是以
+    detail="full" 调用同一个工具。
+    """
+    import pandas as pd
+
+    settings = Settings(
+        context=ContextSettings(max_result_tokens=1000),
+        data={"cache_dir": tmp_path / "cache"},
+    )
+    tool = _StubTool(DataAccess([], settings=settings))
+    source = tmp_path / "cache" / "parquet" / "2026-09" / "abc123.parquet"
+    df = pd.DataFrame({"v": range(50)})
+
+    rendered = tool.trim_dataframe(df, source_path=str(source))
+
+    assert 'detail="full"' in rendered
+    assert "read_file" not in rendered
+    # 复用载荷的来源仍然会被标明。
+    assert "abc123.parquet" in rendered
+
+
+def test_truncation_note_path_is_absolute(tmp_path, monkeypatch):
+    """相对路径会使结果取决于模型能否猜中工作目录。"""
+    import pandas as pd
+
+    settings = Settings(
+        context=ContextSettings(max_result_tokens=1000),
+        data={"cache_dir": tmp_path / "cache"},
+    )
+    tool = _StubTool(DataAccess([], settings=settings))
+    df = pd.DataFrame({"v": range(50)})
+
+    rendered = tool.trim_dataframe(df, source_path="data_cache/parquet/x.parquet")
+
+    assert "来源 " in rendered
+    named = rendered.split("来源 ")[1].split("）")[0]
+    from pathlib import Path
+
+    assert Path(named).is_absolute()
+
+
+def test_note_still_names_detail_full_without_a_source_path(tmp_path):
+    import pandas as pd
+
+    settings = Settings(
+        context=ContextSettings(max_result_tokens=1000),
+        data={"cache_dir": tmp_path / "cache"},
+    )
+    tool = _StubTool(DataAccess([], settings=settings))
+
+    rendered = tool.trim_dataframe(pd.DataFrame({"v": range(50)}))
+
+    assert 'detail="full"' in rendered
+
+
+def test_full_detail_widens_the_row_budget(tmp_path):
+    """detail="full" 是同一个工具的一种策略：它必须返回比 summary
+    更多的行，而不是完全相同的切片。"""
+    import pandas as pd
+
+    settings = Settings(
+        context=ContextSettings(trim_rows=5, max_result_tokens=100000),
+        data={"cache_dir": tmp_path / "cache"},
+    )
+    tool = _StubTool(DataAccess([], settings=settings))
+    df = pd.DataFrame({"v": range(100)})
+
+    def data_rows(text: str) -> int:
+        lines = text.splitlines()
+        # 去掉 markdown 表头（第 0 行）和 `|---|` 分隔行（第 1 行）。
+        return sum(1 for line in lines[2:] if line.startswith("|"))
+
+    summary = tool.trim_dataframe(df, detail="summary")
+    full = tool.trim_dataframe(df, detail="full")
+
+    assert data_rows(summary) == 5
+    assert data_rows(full) > 5
 
 
 def test_annual_period_columns_are_ordered_ahead_of_quarters():
-    """Column trimming is left-to-right, so annuals must lead to survive."""
+    """列裁剪是从左到右进行的，因此年度列必须排在前面才能被保留。"""
     import pandas as pd
 
     from finharness.tools.base import BaseTool
@@ -115,7 +199,7 @@ def test_annual_period_columns_are_ordered_ahead_of_quarters():
 
     ordered = BaseTool._column_display_order(df)
 
-    # Three year-ends first (newest first), then the newest quarter and labels.
+    # 先放三个年末（最新的在前），然后是最近的季度和标签列。
     assert ordered[:3] == ["20251231", "20241231", "20231231"]
     assert ordered[3:] == ["选项", "指标", "20260630"]
 
@@ -137,7 +221,7 @@ def test_trimming_a_wide_period_frame_keeps_the_year_ends(tmp_path):
     rendered = tool.trim_dataframe(df)
     header = rendered.splitlines()[0]
 
-    # The three year-ends survive trimming; quarterly columns are sacrificed.
+    # 三个年末在裁剪中保留下来；季度列则被舍弃。
     assert "20231231" in header and "20241231" in header and "20251231" in header
     assert "已省略列" in rendered
 
@@ -162,5 +246,5 @@ class _StubTool(BaseTool):
     name = "stub"
     description = "stub"
 
-    async def _dispatch(self, **kwargs):  # pragma: no cover - not exercised
+    async def _dispatch(self, **kwargs):  # pragma: no cover - 未被调用
         raise NotImplementedError

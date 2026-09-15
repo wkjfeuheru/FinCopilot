@@ -1,9 +1,8 @@
-"""Permission gate: decide allow / confirm / deny for one tool call (docs 03.7.1).
+"""权限闸门：为一次工具调用决定 allow / confirm / deny（docs 03.7.1）。
 
-Rule priority is deny > mode fallback. Read tools are always allowed; write
-tools confirm under DEFAULT/PLAN and pass under AUTO. Writes whose ``path``
-target resolves inside the output or cache directory count as artefact writes
-and are allowed outright.
+规则优先级为 deny > 模式回退。读类工具始终放行；写类工具在 DEFAULT/PLAN 下需
+确认，在 AUTO 下直接通过。``path`` 目标解析后位于 output 或 cache 目录内的写入
+被视为产物（artefact）写入，直接放行。
 """
 
 from __future__ import annotations
@@ -16,8 +15,7 @@ from finharness.permissions.modes import PermissionMode, Verdict
 from finharness.permissions.rules import scan_args, scan_text
 from finharness.tools.base import PermissionLevel
 
-# Path-bearing tools: a write whose target sits in these directories is an
-# artefact write, not a mutation of user data.
+# 带路径的工具：目标位于这些目录中的写入属于产物写入，而非对用户数据的改动。
 _WHITELIST_DIR_KEYS = ("output", "cache")
 _PATH_ARG_KEYS = ("path", "file", "filename", "target")
 
@@ -29,20 +27,20 @@ class GateDecision:
 
 
 class ReadOnlyGate:
-    """Default gate: permits read tools, refuses everything else.
+    """默认闸门：放行读类工具，拒绝其他一切。
 
-    This preserves the pre-governance behaviour for callers that do not inject a
-    real gate, and keeps the refusal message the loop already produced.
+    这为未注入真实闸门的调用方保留了治理之前的行为，并沿用循环已经产生的
+    拒绝消息。
     """
 
-    async def check(self, tool, args: dict) -> GateDecision:  # noqa: ARG002 - interface parity
+    async def check(self, tool, args: dict) -> GateDecision:  # noqa: ARG002 - 保持接口一致
         if tool.permission is PermissionLevel.READ:
             return GateDecision(Verdict.ALLOW)
         return GateDecision(Verdict.DENY, f"tool is not read-only: {tool.name}")
 
 
 class PermissionGate:
-    """Mode-aware gate with deny rules and a path whitelist."""
+    """感知模式、带拒绝规则与路径白名单的闸门。"""
 
     def __init__(
         self,
@@ -60,34 +58,34 @@ class PermissionGate:
         self._deny_patterns = deny_patterns
 
     async def check(self, tool, args: dict) -> GateDecision:
-        """Decide the verdict. CONFIRM is answered here when a callback exists."""
-        # 1. Trading-intent rules win over everything, including read tools:
-        #    a data parameter carrying an order instruction is still an attack.
+        """决定裁决。当存在回调时，CONFIRM 在此处被应答。"""
+        # 1. 交易意图规则优先于一切，包括读类工具：
+        #    一个携带下单指令的数据参数仍然是一次攻击。
         hit = self._scan_deny(tool, args)
         if hit is not None:
             return GateDecision(Verdict.DENY, hit.reason())
 
-        # 2. Read tools are always allowed.
+        # 2. 读类工具始终放行。
         if tool.permission is PermissionLevel.READ:
             return GateDecision(Verdict.ALLOW)
 
-        # 3. Artefact writes inside the whitelisted directories bypass confirmation.
+        # 3. 白名单目录内的产物写入绕过确认。
         if self._path_in_whitelist(args):
             return GateDecision(Verdict.ALLOW, "写入白名单目录（output/data_cache）")
 
-        # 4. Mode fallback for write tools.
+        # 4. 写类工具的模式回退。
         if self.mode is PermissionMode.AUTO:
             return GateDecision(Verdict.ALLOW, "auto 模式放行写类工具")
 
         if self.confirm is None:
-            # Non-interactive caller: refuse rather than silently allowing.
+            # 非交互式调用方：拒绝，而不是静默放行。
             return GateDecision(Verdict.DENY, f"写类工具需确认，但当前无交互通道：{tool.name}")
         approved = await self.confirm(tool.name, args)
         if approved:
             return GateDecision(Verdict.ALLOW, "用户已确认")
         return GateDecision(Verdict.DENY, "用户已拒绝该工具调用")
 
-    # -- helpers --------------------------------------------------------------
+    # -- 辅助方法 --------------------------------------------------------------
     def _scan_deny(self, tool, args: dict):
         code = args.get("code") if isinstance(args.get("code"), str) else None
         if code is not None:
@@ -111,7 +109,7 @@ class PermissionGate:
 
     @staticmethod
     def _under(target: Path, root: Path) -> bool:
-        """Containment check that resists ``..`` escapes (both already resolved)."""
+        """抵抗 ``..`` 越权逃逸的包含性检查（两者均已解析）。"""
         try:
             return target == root or target.is_relative_to(root)
         except (OSError, ValueError):

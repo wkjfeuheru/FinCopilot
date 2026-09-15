@@ -1,0 +1,10 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # 与 docker-compose.observability.yml 中的 service 名一致。
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

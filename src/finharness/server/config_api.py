@@ -1,7 +1,7 @@
-"""HTTP routes for provider configuration management.
+"""用于 provider 配置管理的 HTTP 路由。
 
-Secrets are only ever written to the encrypted store and never echoed back:
-responses expose a ``has_key`` boolean instead of the value.
+密钥只写入加密存储，绝不回显：
+响应暴露一个 ``has_key`` 布尔值而不是密钥值。
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from finharness.auth.store import CurrentUser
 from finharness.config.settings import Settings
 from finharness.config.store import (
     ActiveConfigDeleteError,
@@ -55,6 +56,7 @@ class ProbePayload(BaseModel):
 
 
 def _field_errors(payload: ConfigPayload | ProbePayload) -> list[dict[str, str]]:
+    """校验配置/探测载荷的字段，返回字段级错误列表。"""
     errors: list[dict[str, str]] = []
     if isinstance(payload, ConfigPayload) and not payload.name.strip():
         errors.append({"field": "name", "message": "配置名称不能为空"})
@@ -79,7 +81,7 @@ def _missing_secret_error() -> dict[str, str]:
 
 
 def _resolve_secret(explicit: str | None, env_name: str | None) -> str | None:
-    """Prefer an explicitly supplied secret, then the named environment variable."""
+    """优先使用显式提供的密钥，其次是指定的环境变量。"""
     if explicit:
         return explicit
     if env_name:
@@ -87,13 +89,13 @@ def _resolve_secret(explicit: str | None, env_name: str | None) -> str | None:
     return None
 
 
-def _effective_secret(store: ConfigStore, payload, *, config_id: int | None) -> str | None:
-    """Resolve the secret for an unsaved payload, reusing a stored value if editing."""
+def _effective_secret(store: ConfigStore, payload, *, config_id: int | None, user_id: str = "") -> str | None:
+    """为未保存的载荷解析密钥，编辑时复用已存储的值。"""
     secret = _resolve_secret(payload.api_key, payload.env_key)
     if secret:
         return secret
-    if config_id is not None and store.get(config_id) is not None:
-        return store.resolve_key(config_id)
+    if config_id is not None and store.get(config_id, user_id=user_id) is not None:
+        return store.resolve_key(config_id, user_id=user_id)
     return None
 
 
@@ -113,7 +115,7 @@ def _record_payload(record, *, has_key: bool) -> dict[str, Any]:
 
 
 async def _probe(provider: Provider, *, timeout_s: float = PROBE_TIMEOUT_S) -> None:
-    """Drive one minimal streaming request and require at least one chunk."""
+    """发起一次最小流式请求，要求至少收到一个分块。"""
     usage = ModelUsage()
 
     async def run() -> None:
@@ -143,7 +145,11 @@ def create_config_router(
     resolver: ProviderResolver | None,
     settings: Settings,
     probe_client_factory: Callable[[float, float], httpx.AsyncClient] | None = None,
+    require_user: Callable | None = None,
 ) -> APIRouter:
+    """构建 provider 配置的 API 路由；所有配置按当前用户隔离。"""
+    from fastapi import Depends
+
     router = APIRouter(prefix="/v1/config")
 
     def store() -> ConfigStore:
@@ -152,10 +158,10 @@ def create_config_router(
     def _has_effective_key(record) -> bool:
         if record.kind == "fake":
             return True
-        return store().resolve_key(record.id) is not None
+        return store().resolve_key(record.id, user_id=record.user_id) is not None
 
     @router.get("/presets")
-    async def list_presets() -> dict[str, list[dict[str, Any]]]:
+    async def list_presets(user=Depends(require_user) if require_user else None) -> dict[str, list[dict[str, Any]]]:
         presets = [
             {
                 "name": name,
@@ -169,9 +175,10 @@ def create_config_router(
         return {"presets": presets}
 
     @router.get("")
-    async def get_config() -> dict[str, Any]:
-        records = store().list_configs()
-        active = store().get_active()
+    async def get_config(user: CurrentUser = Depends(require_user) if require_user else None) -> dict[str, Any]:
+        user_id = user.id if user is not None else ""
+        records = store().list_configs(user_id=user_id)
+        active = store().get_active(user_id=user_id)
         return {
             "configured": active is not None,
             "active_id": active.id if active is not None else None,
@@ -182,7 +189,11 @@ def create_config_router(
         }
 
     @router.post("")
-    async def create_config(payload: ConfigPayload) -> dict[str, Any]:
+    async def create_config(
+        payload: ConfigPayload, user: CurrentUser = Depends(require_user) if require_user else None
+    ) -> dict[str, Any]:
+        """校验并新建一份 provider 配置，成功后失效解析器缓存。"""
+        user_id = user.id if user is not None else ""
         errors = _field_errors(payload)
         if errors:
             raise HTTPException(status_code=422, detail={"errors": errors})
@@ -197,6 +208,7 @@ def create_config_router(
                 env_key=payload.env_key,
                 api_key=payload.api_key,
                 activate=payload.activate,
+                user_id=user_id,
             )
         except DuplicateConfigName as exc:
             raise HTTPException(
@@ -207,13 +219,19 @@ def create_config_router(
         return {"config": _record_payload(record, has_key=_has_effective_key(record))}
 
     @router.put("/{config_id}")
-    async def update_config(config_id: int, payload: ConfigPayload) -> dict[str, Any]:
+    async def update_config(
+        config_id: int, payload: ConfigPayload, user: CurrentUser = Depends(require_user) if require_user else None
+    ) -> dict[str, Any]:
+        """更新指定配置；保留未重新提供的已存密钥并失效解析器缓存。"""
+        user_id = user.id if user is not None else ""
         errors = _field_errors(payload)
         if errors:
             raise HTTPException(status_code=422, detail={"errors": errors})
-        if store().get(config_id) is None:
+        if store().get(config_id, user_id=user_id) is None:
             raise HTTPException(status_code=404, detail="配置不存在")
-        if payload.kind != "fake" and not _effective_secret(store(), payload, config_id=config_id):
+        if payload.kind != "fake" and not _effective_secret(
+            store(), payload, config_id=config_id, user_id=user_id
+        ):
             raise HTTPException(status_code=422, detail={"errors": [_missing_secret_error()]})
         try:
             record = store().update(
@@ -224,6 +242,7 @@ def create_config_router(
                 model=payload.model.strip(),
                 env_key=payload.env_key,
                 api_key=payload.api_key,
+                user_id=user_id,
             )
         except DuplicateConfigName as exc:
             raise HTTPException(
@@ -234,9 +253,13 @@ def create_config_router(
         return {"config": _record_payload(record, has_key=_has_effective_key(record))}
 
     @router.post("/{config_id}/activate")
-    async def activate_config(config_id: int) -> dict[str, Any]:
+    async def activate_config(
+        config_id: int, user: CurrentUser = Depends(require_user) if require_user else None
+    ) -> dict[str, Any]:
+        """激活指定配置，使其成为该用户解析器当前使用的 provider。"""
+        user_id = user.id if user is not None else ""
         try:
-            record = store().activate(config_id)
+            record = store().activate(config_id, user_id=user_id)
         except ConfigNotFound as exc:
             raise HTTPException(status_code=404, detail="配置不存在") from exc
         if resolver is not None:
@@ -244,9 +267,13 @@ def create_config_router(
         return {"config": _record_payload(record, has_key=_has_effective_key(record))}
 
     @router.delete("/{config_id}")
-    async def delete_config(config_id: int) -> dict[str, bool]:
+    async def delete_config(
+        config_id: int, user: CurrentUser = Depends(require_user) if require_user else None
+    ) -> dict[str, bool]:
+        """删除指定配置；拒绝删除当前激活项。"""
+        user_id = user.id if user is not None else ""
         try:
-            store().delete(config_id)
+            store().delete(config_id, user_id=user_id)
         except ConfigNotFound as exc:
             raise HTTPException(status_code=404, detail="配置不存在") from exc
         except ActiveConfigDeleteError as exc:
@@ -258,14 +285,18 @@ def create_config_router(
         return {"ok": True}
 
     @router.post("/probe")
-    async def probe_config(payload: ProbePayload) -> dict[str, Any]:
+    async def probe_config(
+        payload: ProbePayload, user: CurrentUser = Depends(require_user) if require_user else None
+    ) -> dict[str, Any]:
+        """探测一份配置的连通性，返回是否可用及延迟。"""
+        user_id = user.id if user is not None else ""
         errors = _field_errors(payload)
         if errors:
             raise HTTPException(status_code=422, detail={"errors": errors})
         if payload.kind == "fake":
             return {"ok": True, "latency_ms": 0, "model": payload.model, "error": None}
 
-        secret = _effective_secret(store(), payload, config_id=payload.config_id)
+        secret = _effective_secret(store(), payload, config_id=payload.config_id, user_id=user_id)
         if not secret:
             return {
                 "ok": False, "latency_ms": 0, "model": payload.model, "error": _MISSING_SECRET_MESSAGE,
@@ -297,7 +328,7 @@ def create_config_router(
                 "model": payload.model,
                 "error": str(exc) or type(exc).__name__,
             }
-        except Exception as exc:  # noqa: BLE001 - surface any transport failure to the UI
+        except Exception as exc:  # noqa: BLE001 - 将任何传输失败暴露给 UI
             return {
                 "ok": False,
                 "latency_ms": int((time.perf_counter() - started) * 1000),

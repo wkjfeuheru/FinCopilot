@@ -19,7 +19,7 @@ from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
 
 
 class ScriptedProvider(Provider):
-    """Offline provider double replaying canned rounds per request."""
+    """离线 provider 替身，按请求回放预设的轮次。"""
 
     def __init__(self, rounds: list[list[StreamChunk] | Exception]):
         self.rounds = list(rounds)
@@ -57,7 +57,7 @@ class QuoteAdapter(DataAdapter):
 
 
 class BlockingQuoteData:
-    """Quote source that never returns, so cancellation can be observed."""
+    """永不返回的行情来源，以便能观察到取消行为。"""
 
     def __init__(self):
         self.started = asyncio.Event()
@@ -120,11 +120,15 @@ def session_id_from(text: str) -> str:
 
 
 class AsgiStream:
-    """Drives one ASGI request as a cancellable task and records SSE frames."""
+    """以一个可取消的 task 驱动单个 ASGI 请求，并记录 SSE 帧。
 
-    def __init__(self, asgi_app, payload: dict):
+    该通道绕过 TestClient 直连 ASGI，因此认证头必须显式传入。
+    """
+
+    def __init__(self, asgi_app, payload: dict, token: str = "") -> None:
         self.asgi_app = asgi_app
         self.payload = payload
+        self.token = token
         self.frames: list[str] = []
         self.task: asyncio.Task | None = None
         self._body_sent = False
@@ -147,6 +151,12 @@ class AsgiStream:
                 self.frames.append(chunk)
 
     def start(self) -> asyncio.Task:
+        headers = [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+        ]
+        if self.token:
+            headers.append((b"authorization", f"Bearer {self.token}".encode()))
         scope = {
             "type": "http",
             "asgi": {"version": "3.0"},
@@ -155,10 +165,7 @@ class AsgiStream:
             "path": "/v1/chat/stream",
             "raw_path": b"/v1/chat/stream",
             "query_string": b"",
-            "headers": [
-                (b"host", b"testserver"),
-                (b"content-type", b"application/json"),
-            ],
+            "headers": headers,
             "scheme": "http",
             "server": ("testserver", 80),
             "client": ("127.0.0.1", 123),
@@ -187,11 +194,11 @@ async def wait_until(predicate, *, timeout: float = 5.0) -> None:
 
 
 def make_client(provider=None, data_access=None, tmp_path=None) -> TestClient:
-    """Build a client whose memory store and cache live in a temp directory.
+    """构建一个客户端，其 memory store 与缓存位于临时目录中。
 
-    Without an explicit settings object the app would use the repository's
-    data_cache/memory.db, so every chat test would append conversations to the
-    developer's real store.
+    若不显式传入 settings 对象，应用会使用仓库中的
+    data_cache/memory.db，于是每个聊天测试都会把对话追加到
+    开发者真实的 store 中。
     """
     if tmp_path is None:
         import tempfile
@@ -203,9 +210,13 @@ def make_client(provider=None, data_access=None, tmp_path=None) -> TestClient:
         paths={
             "output_dir": tmp_path / "output",
             "memory_db": tmp_path / "cache" / "memory.db",
+            "auth_db": tmp_path / "cache" / "users.db",
         },
     )
-    return TestClient(create_app(provider, data_access=data_access, settings=settings))
+    from tests.server.conftest import authed_client
+
+    client = TestClient(create_app(provider, data_access=data_access, settings=settings))
+    return authed_client(client)
 
 
 def test_health_endpoint_returns_service_status() -> None:
@@ -242,7 +253,7 @@ def test_done_event_carries_the_session_id_and_usage() -> None:
     assert done[1]["succeeded"] is True
     assert done[1]["usage"]["input_tokens"] == 1
     assert done[1]["usage"]["output_tokens"] == 1
-    # Cache split is always reported so a caller can compute a hit rate.
+    # 始终报告缓存拆分，以便调用方计算命中率。
     assert "cache_hit_tokens" in done[1]["usage"]
     assert "cache_miss_tokens" in done[1]["usage"]
     assert done[1]["tool_calls"] == 0
@@ -282,19 +293,26 @@ def test_tools_endpoint_lists_m1_financial_tools() -> None:
             "get_peers",
             "get_market_news",
             "get_announcements",
+            "get_research_reports",
+            "get_macro_indicators",
+            "get_industry_perf",
+            "get_industry_constituents",
             "calc_metrics",
             "calc_valuation",
+            "run_backtest",
             "make_chart",
             "write_report",
             "read_file",
             "write_file",
             "web_search",
-            "fetch_url",
             "research_plan",
+            "update_plan_step",
+            "record_conclusion",
             "search_tools",
             "list_skills",
             "load_skill",
             "load_tool",
+            "spawn_agent",
             "ask_user",
             "remember_preference",
         ]
@@ -347,7 +365,7 @@ def test_tool_call_streams_draft_then_resets_it_and_never_leaks_it_into_the_answ
         payload["text"] for name, payload in events[reset_at + 1 :] if name == "delta"
     )
     assert statuses == ["started", "completed"]
-    # The draft streams live, then text_reset clears it before the answer streams.
+    # 草稿会实时流式输出，随后 text_reset 在答案开始流式输出前将其清除。
     assert "草稿" in streamed
     assert "草稿" not in after_reset
     assert "草稿" not in "".join(answers)
@@ -355,8 +373,8 @@ def test_tool_call_streams_draft_then_resets_it_and_never_leaks_it_into_the_answ
     assert adapter.quoted == ["600519"]
     assert names[-1] == "done"
     assert events[-1][1]["tool_calls"] == 1
-    # The last outgoing message is the research-state view; the tool_result is
-    # the last real history entry before it (docs 3.3).
+    # 最后一条发往模型的消息是研究状态视图；tool_result 是
+    # 它之前最后一条真实的历史条目（docs 3.3）。
     roles = [message.role for message in provider.requests[-1]]
     assert "tool_result" in roles
 
@@ -393,10 +411,15 @@ def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session(
                 paths={
                     "output_dir": tmp_path / "output",
                     "memory_db": tmp_path / "cache" / "memory.db",
+                    "auth_db": tmp_path / "cache" / "users.db",
                 },
             ),
         )
-        stream = AsgiStream(asgi_app, {"message": "查询贵州茅台"})
+        # 直连 ASGI 的通道不走 TestClient，因此先注册一个用户取得令牌。
+        from tests.server.conftest import register_and_login
+
+        token, _ = register_and_login(TestClient(asgi_app))
+        stream = AsgiStream(asgi_app, {"message": "查询贵州茅台"}, token=token)
         task = stream.start()
         await stream.wait_for('"status": "started"')
         session_id = session_id_from(stream.text())
@@ -405,7 +428,9 @@ def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session(
             await task
         await wait_until(lambda: data.cancelled)
 
-        second = AsgiStream(asgi_app, {"session_id": session_id, "message": "再问一次"})
+        second = AsgiStream(
+            asgi_app, {"session_id": session_id, "message": "再问一次"}, token=token
+        )
         second_task = second.start()
         await second.wait_for("event: done")
         await second_task
@@ -447,7 +472,7 @@ def test_production_factory_runs_runtime_audit_validation(tmp_path) -> None:
 
 
 def test_production_factory_starts_without_an_api_key(monkeypatch, tmp_path) -> None:
-    """Startup must not require credentials; the UI configures the provider later."""
+    """启动时不得要求凭据；provider 由 UI 稍后配置。"""
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(
@@ -461,3 +486,83 @@ def test_production_factory_starts_without_an_api_key(monkeypatch, tmp_path) -> 
 
     assert app is not None
     assert app.title == "FinHarness"
+
+
+def test_metrics_endpoint_is_absent_when_disabled(tmp_path) -> None:
+    """默认关闭 metrics 时不注册 /metrics，避免暴露一个空端点。"""
+    settings = Settings(
+        model={"provider": "fake"},
+        data={"cache_dir": tmp_path / "cache"},
+        paths={"output_dir": tmp_path / "out", "memory_db": tmp_path / "cache" / "memory.db"},
+    )
+    client = TestClient(create_app(FakeProvider(["hi"]), settings=settings))
+
+    assert client.get("/metrics").status_code == 404
+
+
+def test_metrics_endpoint_reports_request_and_token_counters(tmp_path) -> None:
+    """打开 metrics 后，一次对话应产出请求计数与 token 计数。"""
+    settings = Settings(
+        model={"provider": "fake"},
+        data={"cache_dir": tmp_path / "cache"},
+        paths={
+            "output_dir": tmp_path / "out",
+            "memory_db": tmp_path / "cache" / "memory.db",
+            "auth_db": tmp_path / "cache" / "users.db",
+        },
+        observability={"metrics": {"enabled": True}},
+    )
+    from tests.server.conftest import authed_client
+
+    client = authed_client(TestClient(create_app(FakeProvider(["hello", " world"]), settings=settings)))
+
+    with client.stream("POST", "/v1/chat/stream", json={"message": "question"}) as response:
+        for _ in response.iter_lines():
+            pass
+
+    body = client.get("/metrics").text
+    assert "agent_request_duration_seconds_count" in body
+    assert 'llm_tokens_total{call_type="main",kind="input"' in body
+    assert "model=" in body
+
+
+def test_production_factory_rejects_metrics_without_the_optional_dependency(
+    monkeypatch, tmp_path
+) -> None:
+    """开关打开却没装依赖时必须启动即失败，而不是静默不采集。"""
+    import finharness.config.settings as settings_module
+
+    monkeypatch.setattr(settings_module, "_module_available", lambda name: False)
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "model": {"provider": "fake"},
+                "audit": {"log_path": "audit.jsonl"},
+                "observability": {"metrics": {"enabled": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SettingsError, match="prometheus-client"):
+        create_production_app(settings_path)
+
+
+def test_production_factory_rejects_tracing_without_a_key(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("LANGSMITH_API_KEY", "")
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "model": {"provider": "fake"},
+                "audit": {"log_path": "audit.jsonl"},
+                "observability": {"tracing": {"enabled": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SettingsError, match="LANGSMITH_API_KEY"):
+        create_production_app(settings_path)

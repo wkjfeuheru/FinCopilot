@@ -1,15 +1,15 @@
-"""LocalCache: SQLite index + parquet payloads with TTL-based reuse.
+"""LocalCache：SQLite 索引 + parquet 载荷，基于 TTL 复用。
 
-Layout: ``data_cache/index.db`` and ``data_cache/parquet/<YYYY-MM>/<key>.parquet``.
-The index only locates payloads; the data itself never lives in SQLite.
+布局：``data_cache/index.db`` 与 ``data_cache/parquet/<YYYY-MM>/<key>.parquet``。
+索引仅用于定位载荷；数据本身从不存放在 SQLite 中。
 
-Two digests are tracked per row:
+每行跟踪两个摘要：
 
-* ``lookup_key`` — derived from the request shape (kind + params) only. This is
-  what retrieval matches on, because the data date is unknown until a fetch
-  happens.
-* ``cache_key``  — the documented content key ``sha256(endpoint|params|date)``,
-  used as the parquet filename so identical content maps to one payload.
+* ``lookup_key`` —— 仅由请求形状（kind + params）派生。
+  检索时以此匹配，因为在实际抓取发生之前，
+  数据日期是未知的。
+* ``cache_key``  —— 文档规定的内容键 ``sha256(endpoint|params|date)``，
+  用作 parquet 文件名，使相同内容映射到同一份载荷。
 """
 
 from __future__ import annotations
@@ -48,21 +48,21 @@ class CacheEntry:
 
 
 def make_cache_key(*, endpoint: str, params: dict[str, Any], data_date: str) -> str:
-    """``sha256(endpoint|normalized-params|data_date)[:16]`` (docs 3.5.3)."""
+    """``sha256(endpoint|normalized-params|data_date)[:16]``（docs 3.5.3）。"""
     normalized = json.dumps(params, ensure_ascii=False, sort_keys=True, default=str)
     digest = hashlib.sha256(f"{endpoint}|{normalized}|{data_date}".encode("utf-8")).hexdigest()
     return digest[:16]
 
 
 def make_lookup_key(*, kind: str, params: dict[str, Any]) -> str:
-    """Date-independent digest of the request shape, used for retrieval."""
+    """与日期无关的请求形状摘要，用于检索。"""
     normalized = json.dumps(params, ensure_ascii=False, sort_keys=True, default=str)
     digest = hashlib.sha256(f"{kind}|{normalized}".encode("utf-8")).hexdigest()
     return digest[:16]
 
 
 class LocalCache:
-    """Process-local cache facade. All statements use bound parameters."""
+    """进程内缓存门面。所有语句均使用绑定参数。"""
 
     def __init__(self, cache_dir: str | Path) -> None:
         self.root = Path(cache_dir)
@@ -89,9 +89,9 @@ class LocalCache:
         connection.row_factory = sqlite3.Row
         return connection
 
-    # -- read -----------------------------------------------------------------
+    # -- 读取 -----------------------------------------------------------------
     def get(self, lookup_key: str) -> tuple[pd.DataFrame, CacheEntry] | None:
-        """Return a payload when present and within TTL, else ``None``."""
+        """若载荷存在且在 TTL 内则返回，否则返回 ``None``。"""
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT cache_key, lookup_key, endpoint, params_json, data_date, rows, file_path, ttl_days, created_ts FROM cache_index WHERE lookup_key = ?",
@@ -123,13 +123,14 @@ class LocalCache:
 
     @staticmethod
     def _is_expired(entry: CacheEntry) -> bool:
+        """判断缓存条目是否已超过其 TTL（时间戳无法解析时视为已过期）。"""
         try:
             created = datetime.fromisoformat(entry.created_ts)
         except ValueError:
             return True
         return datetime.now().astimezone() - created > timedelta(days=entry.ttl_days)
 
-    # -- write ----------------------------------------------------------------
+    # -- 写入 ----------------------------------------------------------------
     async def put(
         self,
         *,
@@ -140,7 +141,7 @@ class LocalCache:
         df: pd.DataFrame | None,
         ttl_days: int,
     ) -> CacheEntry | None:
-        """Persist a payload; empty frames are not written (docs 4.2)."""
+        """持久化一份载荷；空数据框不写入（docs 4.2）。"""
         if df is None or len(df) == 0:
             return None
         async with self._write_lock:
@@ -164,6 +165,7 @@ class LocalCache:
         df: pd.DataFrame,
         ttl_days: int,
     ) -> CacheEntry:
+        """同步写入 parquet 文件并更新 SQLite 索引（在写入锁内于线程中调用）。"""
         cache_key = make_cache_key(endpoint=endpoint, params=params, data_date=data_date)
         month_dir = self.parquet_root / data_date[:7]
         month_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +185,7 @@ class LocalCache:
             file_path=str(file_path), ttl_days=int(ttl_days), created_ts=created,
         )
 
-    # -- maintenance ----------------------------------------------------------
+    # -- 维护 ----------------------------------------------------------
     def stats(self) -> CacheStats:
         with self._connect() as connection:
             row = connection.execute("SELECT COUNT(*) AS n FROM cache_index").fetchone()
@@ -197,7 +199,7 @@ class LocalCache:
         )
 
     def gc(self, *, min_entries: int = 1000) -> int:
-        """Drop expired rows and their payloads; skipped when the cache is small."""
+        """清理过期的索引行及其载荷；缓存较小时跳过。"""
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT cache_key, file_path, ttl_days, created_ts FROM cache_index"

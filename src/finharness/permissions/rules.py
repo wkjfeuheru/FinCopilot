@@ -1,14 +1,13 @@
-"""Deny patterns and sandbox scanning (docs 03.7.2).
+"""拒绝模式与沙箱扫描（docs 03.7.2）。
 
-Two rule families run in parallel:
+两类规则并行运行：
 
-1. ``DEFAULT_DENY_PATTERNS`` — intent-level defences against trading actions.
-   They scan ``run_python`` code and every tool's argument snapshot, so a prompt
-   injection that smuggles a trade instruction into a data parameter is caught
-   even though the framework registers no trading tools.
-2. The sandbox import allowlist, which applies to ``run_python`` only.
+1. ``DEFAULT_DENY_PATTERNS`` —— 针对交易动作的意图级防御。它们扫描
+   ``run_python`` 代码以及每个工具的参数快照，因此即便框架没有注册任何交易
+   工具，把交易指令偷偷塞进数据参数的 prompt 注入也会被捕获。
+2. 沙箱导入白名单，仅适用于 ``run_python``。
 
-Hits are reported with the matched rule so refusals stay explainable.
+命中时会连同匹配的规则一并报告，使拒绝保持可解释。
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-# Trading-intent defences. Applied to run_python code and tool argument values.
+# 交易意图防御。应用于 run_python 代码与工具参数值。
 DEFAULT_DENY_PATTERNS: tuple[str, ...] = (
     r"easytrader",
     r"vnpy",
@@ -29,7 +28,7 @@ DEFAULT_DENY_PATTERNS: tuple[str, ...] = (
     r"trade\w*api",
 )
 
-# Import allowlist for run_python (stdlib + analysis stack).
+# run_python 的导入白名单（标准库 + 分析栈）。
 SANDBOX_IMPORT_ALLOW: frozenset[str] = frozenset(
     {
         "pandas", "numpy", "matplotlib", "statistics", "math",
@@ -37,8 +36,8 @@ SANDBOX_IMPORT_ALLOW: frozenset[str] = frozenset(
     }
 )
 
-# Identifier-level denylist: process, network, filesystem and dynamic-execution
-# escape hatches. Matched on word boundaries so "cost" is not mistaken for "os".
+# 标识符级拒绝名单：进程、网络、文件系统与动态执行的逃生通道。按单词边界
+# 匹配，因此 "cost" 不会被误认成 "os"。
 SANDBOX_FORBIDDEN_IDENTIFIERS: tuple[str, ...] = (
     "os", "sys", "subprocess", "socket", "requests", "urllib", "httpx",
     "open", "eval", "exec", "compile", "pickle", "shutil", "pathlib",
@@ -50,7 +49,7 @@ _IMPORT_RE = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", r
 
 @dataclass(frozen=True, slots=True)
 class RuleHit:
-    """A single rule violation, with enough detail to explain the refusal."""
+    """单条规则违规，附带足以解释该拒绝的细节。"""
 
     rule_index: int
     pattern: str
@@ -61,7 +60,7 @@ class RuleHit:
 
 
 def scan_text(text: str, *, where: str = "code") -> RuleHit | None:
-    """Apply the deny patterns to one text blob."""
+    """把拒绝模式应用于一段文本。"""
     for index, pattern in enumerate(DEFAULT_DENY_PATTERNS, start=1):
         if re.search(pattern, text, re.IGNORECASE):
             return RuleHit(rule_index=index, pattern=pattern, where=where)
@@ -69,7 +68,7 @@ def scan_text(text: str, *, where: str = "code") -> RuleHit | None:
 
 
 def scan_args(args: dict) -> RuleHit | None:
-    """Apply the deny patterns to every value in an argument snapshot."""
+    """把拒绝模式应用于参数快照中的每一个值。"""
     for value in args.values():
         if isinstance(value, str):
             hit = scan_text(value, where="args")
@@ -85,7 +84,7 @@ def scan_args(args: dict) -> RuleHit | None:
 
 
 def scan_sandbox(code: str) -> RuleHit | None:
-    """Check run_python code against the import allowlist and identifier denylist."""
+    """依据导入白名单与标识符拒绝名单检查 run_python 代码。"""
     for match in _IMPORT_RE.finditer(code):
         module = (match.group(1) or match.group(2) or "").split(".")[0]
         if module and module not in SANDBOX_IMPORT_ALLOW:

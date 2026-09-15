@@ -1,0 +1,81 @@
+# FinHarness CI: layered so a push never spends real model tokens (docs 03.13).
+#
+#   offline   — every push/PR: the hermetic test suite, no network, no cost.
+#   eval-smoke— nightly + manual: 5 core smoke cases against the real provider.
+#   eval-full — manual only: the whole case set.
+#
+# The eval jobs need the DEEPSEEK_API_KEY secret; without it they skip, so a fork
+# or a repo without secrets still gets the offline gate.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 18 * * *"   # 02:00 Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      eval_set:
+        description: "评估题集（smoke/core/full）"
+        required: false
+        default: smoke
+
+jobs:
+  offline:
+    name: 离线测试（不含 smoke）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,observability]"
+      - name: 运行离线测试
+        run: pytest -m "not smoke" -q
+
+  eval:
+    name: 评估（${{ github.event.inputs.eval_set || 'smoke' }}）
+    # Only the scheduled or manual runs pay for real calls; push/PR is covered by
+    # the offline job above.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: offline
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: 校验用例
+        run: PYTHONPATH=src python -m finharness.eval check
+      - name: 无密钥则跳过
+        id: guard
+        run: |
+          if [ -z "${DEEPSEEK_API_KEY}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "未配置 DEEPSEEK_API_KEY，跳过真实评估。"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 运行评估
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          PYTHONPATH=src python -m finharness.eval run \
+            --set "${{ github.event.inputs.eval_set || 'smoke' }}"
+      - name: 上传评估产物
+        if: always() && steps.guard.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-runs
+          path: evals/runs/
+          if-no-files-found: warn

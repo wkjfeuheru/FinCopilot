@@ -1,20 +1,23 @@
-"""Auto-compaction: fold the middle of a conversation into a digest (docs 3.6.3).
+"""自动压缩：把对话中段折叠成一段摘要（docs 3.6.3）。
 
-Two rules drive the design:
+两条规则驱动整个设计：
 
-* Compaction happens in a turn gap, never inside a request.
-* It must never block the conversation. If summarising fails, the fallback drops
-  the oldest tool results instead, records a warning, and the turn continues.
+* 压缩发生在轮次间隙，绝不发生在某次请求内部。
+* 它绝不能阻塞对话。若摘要生成失败，回退方案改为丢弃最旧的工具结果，
+  记录一条警告，然后本轮继续。
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from finharness.config.settings import Settings
 from finharness.context.memory.summary import SummaryLayer
 from finharness.context.memory.working import KEEP_RECENT_ROUNDS, WorkingMemory
+from finharness.observability import NullObserver
 from finharness.provider.base import Provider
 from finharness.types import Msg, ModelUsage, StreamEvent
 
@@ -42,7 +45,7 @@ class CompactionResult:
 
 
 class AutoCompactor:
-    """Folds history when the next request would exceed the window budget."""
+    """当下一次请求将超出窗口预算时折叠历史。"""
 
     def __init__(
         self,
@@ -54,19 +57,25 @@ class AutoCompactor:
         tools: list[dict] | None = None,
         summary: SummaryLayer | None = None,
         state_text: str = "",
+        observer: Any | None = None,
+        on_usage: Callable[[int, int], None] | None = None,
     ) -> None:
         self.provider = provider
         self.memory = memory
         self.settings = settings
         self.system = system
         self.tools = tools or []
-        # The research-state block rides the request as a trailing message rather
-        # than sitting in ``system`` (docs 3.3), so it must be counted explicitly
-        # or the window would read smaller than it is.
+        # 研究状态块作为尾部消息随请求发送，而不是放在 ``system`` 中（docs 3.3），
+        # 因此必须显式计入，否则窗口读数会比实际偏小。
         self.state_text = state_text
-        # When present, folded history becomes a summary segment rather than a
-        # synthetic user message (docs 03.6.4).
+        # 若提供该字段，被折叠的历史会变成摘要分段，而不是一条合成的用户消息
+        # （docs 03.6.4）。
         self.summary = summary
+        # 压缩摘要本身也是一次 LLM 调用，它的 token 过去完全不计入会话成本
+        # （docs 03.14.2）：这里接上观测与记账，使其以 call_type=compaction
+        # 出现在指标里。
+        self.observer = observer
+        self.on_usage = on_usage
 
     def _count(self) -> int:
         return self.memory.request_tokens(
@@ -79,7 +88,7 @@ class AutoCompactor:
         )
 
     async def compact(self) -> CompactionResult:
-        """Reduce the window, degrading to a drop-oldest fallback on failure."""
+        """缩减窗口；失败时降级为“丢弃最旧内容”的回退方案。"""
         started = time.monotonic()
         before = self._count()
         boundary = _foldable_boundary(self.memory.raw)
@@ -96,23 +105,21 @@ class AutoCompactor:
         warning: str | None = None
         try:
             summary_text = await self._summarize(foldable)
-        except Exception as exc:  # noqa: BLE001 - compaction must not block a turn
+        except Exception as exc:  # noqa: BLE001 - 压缩绝不能阻塞一轮对话
             degraded = True
             warning = f"摘要生成失败，已降级为计数式摘要：{exc}"
             summary_text = self._fallback_digest(foldable)
 
         ledger = self._ledger(foldable)
-        # The messages being folded occupy the sequence range starting after
-        # whatever was already discarded.
+        # 被折叠的消息所占的序号区间，从已丢弃内容之后开始。
         seq_from = self.memory.discarded + 1
         seq_to = self.memory.discarded + boundary
 
         removed, _discarded = self.memory.squash()
         after = self._count()
 
-        # Keeping the recent rounds may not suffice when those rounds are large;
-        # tighten until the window is inside budget rather than leaving the next
-        # request over it.
+        # 当近期轮次本身很大时，仅保留它们可能仍然不够；持续收紧直到窗口
+        # 回到预算之内，而不是把下一次请求留在超预算状态。
         threshold = self.settings.context.compaction_ratio * self.settings.context.context_window_tokens
         while after >= threshold:
             extra, _ = self.memory.squash(keep_rounds=1)
@@ -143,11 +150,10 @@ class AutoCompactor:
         )
 
     def _ledger(self, foldable: list[Msg]) -> tuple[str, ...]:
-        """Structured record of what data was fetched in the folded range.
+        """折叠区间内取过哪些数据的结构化记录。
 
-        Compaction removes the tool results from the window, so this is the only
-        way the model can still tell that a fetch already happened — which is
-        what keeps "don't fetch it twice" actionable.
+        压缩会把工具结果移出窗口，因此这是模型仍能判断“某次取数已发生过”的
+        唯一途径——正是它让“不要重复取数”这一约束仍然可执行。
         """
         entries: list[str] = []
         for message in foldable:
@@ -158,36 +164,50 @@ class AutoCompactor:
                     entries.append(label)
         return tuple(entries)
 
-    # -- summarisation --------------------------------------------------------
+    # -- 摘要生成 --------------------------------------------------------------
     async def _summarize(self, messages: list[Msg]) -> str:
-        """Run one summarisation call on the session's own provider.
+        """用会话自身的 provider 执行一次摘要调用。
 
-        The provider surface is streaming-only, so the output is drained into a
-        string rather than changing the provider contract.
+        provider 接口仅支持流式输出，因此把结果收集成一个字符串，
+        而不是改动 provider 的契约。
+
+        这次调用会以 ``call_type=compaction`` 记入指标，并通过 ``on_usage``
+        回填给会话统计，使压缩开销在成本视图里可见而不是凭空消失。
         """
         transcript = _render_transcript(messages)
-        usage = ModelUsage()
         collected: list[str] = []
-        async for chunk in self.provider.stream(
-            system=SUMMARIZE_PROMPT,
-            messages=[Msg.user(transcript)],
-            tools=[],
-            usage=usage,
-        ):
-            if chunk.event is StreamEvent.TEXT_DELTA and chunk.data:
-                collected.append(str(chunk.data))
+        usage: ModelUsage | None = None
+        observer = self.observer if self.observer is not None else NullObserver()
+        model = getattr(self.provider, "model", "") or ""
+        async with observer.llm_span(model=model, call_type="compaction") as span:
+            async for chunk in self.provider.stream(
+                system=SUMMARIZE_PROMPT,
+                messages=[Msg.user(transcript)],
+                tools=[],
+                usage=ModelUsage(),
+            ):
+                if chunk.event is StreamEvent.TEXT_DELTA and chunk.data:
+                    collected.append(str(chunk.data))
+                elif chunk.event is StreamEvent.MESSAGE_END and isinstance(
+                    chunk.data, ModelUsage
+                ):
+                    # provider 把用量放在 MESSAGE_END 载荷里（与主循环读取的位置
+                    # 一致），而不会写回传入的 usage 对象。
+                    usage = chunk.data
+            span.set_usage(usage)
+        if self.on_usage is not None and usage is not None:
+            self.on_usage(usage.input_tokens, usage.output_tokens)
         summary = "".join(collected).strip()
         if not summary:
             raise RuntimeError("摘要调用未返回任何内容")
         return summary
 
     def _fallback_digest(self, foldable: list[Msg]) -> str:
-        """Minimal stand-in summary: counts, not a restatement.
+        """极简的替代摘要：只给计数，不做复述。
 
-        The fallback exists to shrink the window, so it must be smaller than what
-        it replaces. Keeping every turn's text would defeat that, so only the
-        original goal and the shape of the research survive. The data ledger
-        travels separately and is attached by ``compact`` regardless.
+        回退方案存在的意义是缩小窗口，因此必须比它所替代的内容更小。保留每一轮
+        的原文会破坏这一目的，所以只留下最初的目标与研究的大致轮廓。数据台账
+        单独传递，由 ``compact`` 无论如何都会附带上去。
         """
         questions = [m.content for m in foldable if m.role == "user" and m.content]
         answers = sum(1 for m in foldable if m.role == "assistant" and m.content)
@@ -203,13 +223,14 @@ class AutoCompactor:
 
 
 def _foldable_boundary(messages: list[Msg]) -> int:
-    """Everything before the rounds the budget keeps may be folded."""
+    """预算所保留的轮次之前的内容都可被折叠。"""
     from finharness.context.memory.working import _recent_boundary
 
     return _recent_boundary(messages, KEEP_RECENT_ROUNDS)
 
 
 def _render_transcript(messages: list[Msg]) -> str:
+    """把消息列表渲染成供摘要模型阅读的纯文本对话记录。"""
     lines: list[str] = []
     for message in messages:
         if message.role == "user" and message.content:

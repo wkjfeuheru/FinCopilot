@@ -1,0 +1,18 @@
+# Prometheus 抓取配置（docs 03.14.2）。
+#
+# 前提：应用以 observability.metrics.enabled=true 启动，因此 /metrics 已注册。
+# 浏览器/本机访问 Grafana 面板见 docker-compose.observability.yml。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: finharness
+    metrics_path: /metrics
+    static_configs:
+      # host.docker.internal 让容器内的 Prometheus 能抓到跑在宿主机的应用。
+      # 在 Linux 上需配合 docker-compose 的 extra_hosts（已配置）。
+      - targets: ["host.docker.internal:8000"]
+        labels:
+          service: finharness
+          env: local

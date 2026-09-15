@@ -28,6 +28,9 @@ logs/*
 !logs/.gitkeep
 output/*
 !output/.gitkeep
+# Evaluation run artefacts (per-run case JSON, traces, reports) are reproducible
+# output, not source; keep the case definitions and config tracked.
+evals/runs/
 .mimosa/
 # ZCode IDE session plans and scratch state; not project content.
 .zcode/

@@ -1,8 +1,8 @@
-"""The system prompt is a product asset; guard what it must contain.
+"""system prompt 是一项产品资产；守护它必须包含的内容。
 
-It governs when the agent plans, how it cites, and when it stops. If a future
-edit drops one of those sections the agent silently loses that behaviour, so the
-required directives are asserted here.
+它规定了 agent 何时制定 plan、如何引用，以及何时停止。如果未来的
+修改删掉了其中某个部分，agent 会无声地失去该行为，因此这里对必需的
+指令进行了断言。
 """
 
 import pytest
@@ -28,22 +28,31 @@ def test_prompt_defines_when_to_plan():
     text = system_prompt()
 
     assert "research_plan" in text
-    # It must say when NOT to plan, or trivial questions pay for a plan turn.
+    # 它必须说明何时"不要"制定 plan，否则琐碎问题也要为 plan turn 付出代价。
     assert "不要" in text or "无需" in text
     assert "简单事实" in text
+
+
+def test_prompt_requires_plan_write_back():
+    text = system_prompt()
+
+    # 从未更新的 plan 会永远显示为 pending；prompt 必须说明
+    # 要将状态与结论写回（docs 03.3.9）。
+    assert "update_plan_step" in text
+    assert "record_conclusion" in text
 
 
 def test_prompt_carries_the_citation_and_traceability_rules():
     text = system_prompt()
 
-    assert "{cite:" in text          # the placeholder syntax
+    assert "{cite:" in text          # 占位符语法
     assert "citation" in text.lower()
     assert "溯源" in text or "回溯" in text
-    assert "无来源" in text           # the unsourced-number marker
+    assert "无来源" in text           # 无来源数字的标记
 
 
 def test_prompt_requires_convergence():
-    """Convergence is the direct antidote to the over-running sessions."""
+    """收敛是应对会话超长运行的直接解药。"""
     text = system_prompt()
 
     assert "收敛" in text
@@ -54,19 +63,38 @@ def test_prompt_routes_skills_and_reports():
     text = system_prompt()
 
     assert "load_skill" in text
-    assert "report-template" in text
+    for scenario in (
+        "equity-research",
+        "industry-research",
+        "macro-research",
+        "quant-factor",
+    ):
+        assert scenario in text
     assert "write_report" in text
 
 
 def test_prompt_states_when_not_to_produce_deliverables():
-    """Without this boundary the agent upgrades an analysis into a report itself."""
+    """缺少这一边界，agent 会自行把一次分析升级为一份 report。"""
     text = system_prompt()
 
     assert "调用边界" in text
     assert "make_chart" in text
-    # It must say the deliverable is opt-in, not the default outcome of analysis.
-    assert "明确要求" in text
+    # report 是可选项，而不是分析的默认产出。
+    assert "明确说出" in text
+    assert "不得把分析自行升级成成稿" in text
     assert "不要" in text
+
+
+def test_prompt_makes_charts_scenario_driven_not_strictly_opt_in():
+    """图表用于增强解释；当结论本身就是一个趋势或一次对比时，模型可以主动
+    绘图——report 仍然是可选项。"""
+    text = system_prompt()
+    section = text.split("## 工具与技能的调用边界", 1)[1].split("\n## ", 1)[0]
+
+    assert "配图按场景判断" in text
+    # 各 skill 所依赖的具体触发条件。
+    assert "净值曲线" in section
+    assert "series" in section
 
 
 def test_prompt_flags_an_unreviewed_report():
@@ -81,24 +109,60 @@ def test_prompt_states_output_discipline():
     assert "买卖建议" in text
 
 
-# --- role, capability boundary and refusal policy (prompt design pass) --------
+def test_prompt_names_the_research_report_tool():
+    """report 工具是懒加载的，因此 prompt 是模型发现它的途径。"""
+    text = system_prompt()
+    section = text.split("联网与回测能力是懒加载的", 1)[1].split("\n## ", 1)[0]
+
+    assert "get_research_reports" in section
+    # 它必须说明这些参数存在，否则模型不会进行筛选。
+    assert "行业" in section and "机构" in section
+    # 并说明正文是第三方文本。
+    assert "不得臆测" in section or "仅作事实参考" in section
+
+
+def test_prompt_explains_when_to_spawn_and_what_it_costs():
+    """spawn_agent 是懒加载且代价高昂的；prompt 是模型唯一能同时了解到
+    其触发条件（是隔离，而非提速）与边界（子代理不取数）的地方。"""
+    text = system_prompt()
+    section = text.split("## 子代理与上下文隔离", 1)[1].split("\n## ", 1)[0]
+
+    assert "spawn_agent" in section
+    # 理由必须是隔离，并且要排除单纯的并行抓取。
+    assert "隔离" in section
+    assert "不要" in section and "并行" in section
+    # 子代理不取数：素材是交给它们的。
+    assert "不取数" in section
+
+
+def test_prompt_names_the_backtest_tool_and_its_discipline():
+    """run_backtest 同样是懒加载的；prompt 必须指向它，但不能承诺
+    可以执行任意代码。"""
+    text = system_prompt()
+    section = text.split("联网与回测能力是懒加载的", 1)[1].split("\n## ", 1)[0]
+
+    assert "run_backtest" in section
+    assert "不执行任意代码" in section
+
+
+# --- 角色、能力边界与拒绝策略（prompt 设计阶段） --------
 
 def test_prompt_defines_a_specific_role_and_capability_boundary():
-    """A vague "you are an assistant" leaves the model free to improvise."""
+    """含糊的"你是一个助手"会让模型随意发挥。"""
     text = system_prompt()
 
     assert "角色与能力边界" in text
     assert "A 股" in text
-    # Both sides must be stated, or the model cannot tell what to decline.
+    # 必须把两面都写明，否则模型无法判断该拒绝什么。
     assert "你能做" in text or "能做" in text
     assert "不能做" in text or "不能" in text
-    # The named gaps are what makes the boundary operational.
+    # 点名这些能力缺口，才让边界真正可操作。
     assert "港股" in text or "美股" in text
     assert "预测" in text
 
 
 def test_prompt_states_the_knowledge_boundary():
-    """Params carry data; the model's own memory must not be a number source."""
+    """参数中携带数据；模型自身的记忆绝不能作为数字来源。"""
     text = system_prompt()
 
     assert "知识边界" in text
@@ -106,20 +170,20 @@ def test_prompt_states_the_knowledge_boundary():
 
 
 def test_prompt_shows_the_citation_format_by_example():
-    """A bare description is weaker than description + a concrete example."""
+    """仅有描述，比描述加一个具体示例要弱。"""
     text = system_prompt()
 
     assert "正确示例" in text
     assert "错误示例" in text
-    # The examples must actually use the placeholder syntax they teach.
+    # 这些示例必须真正使用它们所教的占位符语法。
     assert text.count("{cite:") >= 3
 
 
 def test_prompt_report_example_matches_the_real_schema():
-    """The JSON example must keep validating against ReportInput.
+    """JSON 示例必须始终能通过 ReportInput 的校验。
 
-    An example that drifts from the schema teaches the model a shape the tool
-    will reject, which is worse than having no example at all.
+    偏离 schema 的示例会让模型学到一种会被工具拒绝的数据形状，
+    这比完全没有示例更糟。
     """
     import json
     import re
@@ -133,26 +197,38 @@ def test_prompt_report_example_matches_the_real_schema():
         ReportInput.model_validate(json.loads(block))
 
 
-def test_prompt_has_a_refusal_policy():
-    """Without this the model answers out of range instead of declining.
+def test_prompt_forbids_calling_unfetched_data_unavailable():
+    """当模型只是没有取数时却说"数据不可用"，会产生误导。
 
-    Declining is a consequence of the capability boundary, so the policy lives
-    inside that section rather than as a topic of its own; the test asserts that
-    placement, not just the wording's presence somewhere in the file.
+    读者无法区分"数据源没有这个数字"与"agent 跳过了这次调用"；后者读起来
+    像是一种根本不属实的数据限制。
+    """
+    text = system_prompt()
+    role_section = text.split("## 角色与能力边界", 1)[1].split("\n## ", 1)[0]
+
+    assert "没取" in role_section
+    assert "未取得" in role_section
+
+
+def test_prompt_has_a_refusal_policy():
+    """缺少这一点，模型会越界作答，而不是拒绝。
+
+    拒绝是能力边界的后果，因此该策略位于能力边界这一节之内，而不是作为
+    独立主题；本测试断言的是这一位置，而不仅仅是措辞出现在了文件某处。
     """
     text = system_prompt()
     role_section = text.split("## 角色与能力边界", 1)[1].split("\n## ", 1)[0]
 
     assert "做不到" in role_section
     assert "不要勉强" in role_section or "不硬撑" in role_section
-    assert "ask_user" in role_section          # missing input -> clarify
-    # The anti-hallucination rule, stated as the bottom line.
+    assert "ask_user" in role_section          # 缺少输入 -> 澄清
+    # 反幻觉规则，作为底线明确写出。
     assert "不得猜测" in role_section or "不得编造" in role_section
     assert "取不到" in role_section
 
 
 def test_prompt_has_no_standalone_refusal_section():
-    """Guards the consolidation: the policy must not drift back out on its own."""
+    """守护这一合并：该策略不得自行游离出去。"""
     text = system_prompt()
 
     assert "## 超出能力范围时" not in text
@@ -172,7 +248,7 @@ def test_empty_asset_raises(tmp_path):
 
 
 def test_server_uses_the_same_prompt_as_the_loader():
-    """One definition: the shipped prompt and the server constant must agree."""
+    """单一来源：随包发布的 prompt 与 server 常量必须一致。"""
     from finharness.server.api import DEFAULT_SYSTEM_PROMPT
 
     assert DEFAULT_SYSTEM_PROMPT == system_prompt()

@@ -1,1 +1,1 @@
-"""CLI entry point reserved for the later REPL milestone."""
+"""为后续 REPL 里程碑预留的 CLI 入口点。"""

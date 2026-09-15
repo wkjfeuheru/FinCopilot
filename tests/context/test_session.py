@@ -1,4 +1,4 @@
-"""ResearchContext: plan lifecycle, conclusions, and system injection (docs 03.6.2)."""
+"""ResearchContext：plan 生命周期、结论与系统注入（文档 03.6.2）。"""
 
 import pytest
 
@@ -28,7 +28,7 @@ def test_set_plan_installs_then_revises():
 
     second = ctx.set_plan("分析茅台并对比", [PlanStep(seq=1, action="取行情")])
     assert second.revision == 2
-    assert second.plan_id == first.plan_id  # same plan, new revision
+    assert second.plan_id == first.plan_id  # 同一个 plan，新的 revision
 
 
 def test_mark_plan_step_updates_status():
@@ -62,12 +62,41 @@ def test_plan_digest_is_empty_without_a_plan():
     assert make_ctx().plan_digest() == ""
 
 
+def test_plan_progress_counts_done_steps():
+    ctx = make_ctx()
+    plan = ctx.set_plan(
+        "g", [PlanStep(seq=1, action="a"), PlanStep(seq=2, action="b")]
+    )
+
+    assert plan.progress() == (0, 2)
+    ctx.mark_plan_step(1, "done")
+    assert ctx.plan.progress() == (1, 2)
+
+
+def test_plan_digest_renders_progress_and_dependency_state():
+    ctx = make_ctx()
+    ctx.set_plan(
+        "分析茅台",
+        [
+            PlanStep(seq=1, action="取行情", tool_hint=["get_quote"]),
+            PlanStep(seq=2, action="算指标", dep=[1]),
+        ],
+    )
+    ctx.mark_plan_step(1, "done")
+
+    digest = ctx.plan_digest()
+
+    # 头部携带 已完成/总数 的 ledger，step 2 显示其依赖项的状态标记。
+    assert "进度 1/2" in digest
+    assert "依赖：1✓" in digest
+
+
 def test_add_skill_is_idempotent():
     ctx = make_ctx()
 
-    assert ctx.add_skill("dupont-analysis") is True
-    assert ctx.add_skill("dupont-analysis") is False
-    assert ctx.loaded_skills == ["dupont-analysis"]
+    assert ctx.add_skill("equity-research") is True
+    assert ctx.add_skill("equity-research") is False
+    assert ctx.loaded_skills == ["equity-research"]
 
 
 def test_activate_tool_is_idempotent():
@@ -84,7 +113,7 @@ def test_conclusions_keep_their_cids():
 
     assert conclusion.cids == ["cit_000001"]
     assert ctx.conclusions[0].text == "ROE 约 30%"
-    assert conclusion.ts  # timestamped
+    assert conclusion.ts  # 带时间戳
 
 
 def test_state_block_is_empty_when_there_is_nothing_to_report():
@@ -94,11 +123,11 @@ def test_state_block_is_empty_when_there_is_nothing_to_report():
 def test_state_block_includes_plan_skills_and_conclusions():
     ctx = make_ctx()
     ctx.set_plan("分析茅台", [PlanStep(seq=1, action="取行情")])
-    ctx.add_skill("dupont-analysis")
+    ctx.add_skill("equity-research")
     ctx.add_conclusion("ROE 高", ["cit_000001"])
 
     block = ctx.state_block()
 
     assert "研究计划" in block
-    assert "dupont-analysis" in block
+    assert "equity-research" in block
     assert "cit_000001" in block

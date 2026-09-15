@@ -1,7 +1,7 @@
-"""End-to-end acceptance for M2: planning, meta tools and governance.
+"""M2 的端到端验收：planning、meta 工具与 governance。
 
-Hits a real provider and real market data, so it is marked ``smoke``.
-Run with: ``uv run pytest -m smoke``.
+会访问真实 provider 和真实市场数据，因此标记为 ``smoke``。
+运行方式：``uv run pytest -m smoke``。
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from finharness.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.smoke
 
-# Exercise the shipped prompt so the asset itself is under test.
+# 使用随包发布的 prompt，以便该资产本身也处于测试之下。
 SYSTEM_PROMPT = system_prompt()
 
 
@@ -76,7 +76,7 @@ def _build(tmp_path, *, planning_system: str = SYSTEM_PROMPT):
 
 
 def test_complex_question_produces_a_plan_and_grounded_conclusion(tmp_path):
-    """A multi-step question should route through research_plan and real data."""
+    """多步问题应经由 research_plan 和真实数据来回答。"""
     loop, ctx, _ = _build(tmp_path)
 
     async def run():
@@ -87,7 +87,7 @@ def test_complex_question_produces_a_plan_and_grounded_conclusion(tmp_path):
     outcome = asyncio.run(run())
 
     assert outcome.succeeded is True, outcome.error
-    # The plan is the M2 acceptance anchor for complex questions.
+    # 对于复杂问题，plan 是 M2 的验收锚点。
     assert ctx.plan is not None, "a multi-step question should install a plan"
     assert ctx.plan.steps, "the plan should contain steps"
     assert outcome.tool_calls >= 1, "the model should have fetched data"
@@ -95,7 +95,7 @@ def test_complex_question_produces_a_plan_and_grounded_conclusion(tmp_path):
 
 
 def test_simple_question_answers_without_planning(tmp_path):
-    """A trivial lookup should not spend a turn on research_plan."""
+    """简单的查询不应为 research_plan 花费一个轮次。"""
     loop, ctx, _ = _build(tmp_path)
 
     async def run():
@@ -105,7 +105,7 @@ def test_simple_question_answers_without_planning(tmp_path):
 
     assert outcome.succeeded is True, outcome.error
     assert outcome.tool_calls >= 1, "should still fetch the quote"
-    # Planning is not required for a fact lookup (docs 03.6.2 routing).
+    # 事实查询不需要 planning（见文档 03.6.2 的路由）。
     assert ctx.plan is None
 
 

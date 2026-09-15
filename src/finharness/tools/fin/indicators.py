@@ -1,15 +1,15 @@
-"""Financial indicator history (ROE, margins, leverage, ...)."""
+"""财务指标历史（ROE、利润率、杠杆率等）。"""
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from finharness.data.mapping import indicator_field_matches
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool, DataInput, PermissionLevel, ToolGroup
 
 
-class IndicatorsInput(BaseModel):
+class IndicatorsInput(DataInput):
     symbol: str = Field(description="6位A股代码")
     years: int = Field(default=3, description="回溯年数")
     fields: list[str] | None = Field(
@@ -31,11 +31,11 @@ class GetIndicatorsTool(BaseTool):
         return await self.data.indicators(symbol, years=years, fields=fields)
 
     def render(self, raw: RawData) -> tuple[str, list[RawData]]:
-        """Render the frame, naming any requested field the source does not have.
+        """渲染数据框，并标注数据源中不存在的所请求字段。
 
-        A field that matches no column is a real gap (the source lacks it, or it
-        is a derived metric), not an empty value; saying so keeps the reader from
-        reading its absence as a data hole to be filled with an estimate.
+        匹配不到任何列的字段是真实缺口（数据源不提供该指标，或它是由计算
+        推导的指标），而非空值；明确指出这一点，可避免读者把字段缺失误读
+        为需要用估算值填补的数据空洞。
         """
         df = raw.df
         if df is None or not len(df):
@@ -55,5 +55,7 @@ class GetIndicatorsTool(BaseTool):
                 + "（缺失原因可能是该来源不提供此指标，或需由计算工具推导）；回答时不得"
                 "将未返回的指标表述为已取得。"
             )
-        body = self.trim_dataframe(df)
+        body = self.trim_dataframe(
+            df, source_path=raw.parquet_path, detail=self._render_detail(raw)
+        )
         return (("\n".join(lines) + "\n") if lines else "") + body, [raw]

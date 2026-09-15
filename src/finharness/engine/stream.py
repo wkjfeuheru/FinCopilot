@@ -1,1 +1,1 @@
-"""Provider stream normalization reserved for implementation."""
+"""为实现预留的 provider 流式归一化。"""

@@ -1,4 +1,8 @@
-"""FastAPI application and M0 chat routes."""
+"""FastAPI 应用与 M0 聊天路由。
+
+除 ``/v1/health``、``/v1/auth/*`` 与 ``/metrics`` 外，所有端点都要求
+认证，且所有数据访问都按当前用户隔离（docs 03.13）。
+"""
 
 import asyncio
 import contextlib
@@ -7,11 +11,13 @@ import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from finharness.auth.dependency import create_require_user
+from finharness.auth.store import CurrentUser, UserStore
 from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
 from finharness.config.store import ConfigStore
@@ -19,6 +25,7 @@ from finharness.context.memory.store import MemoryStore
 from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
+from finharness.data.adapters.eastmoney_report_adapter import EastmoneyReportAdapter
 from finharness.data.adapters.tavily_adapter import TavilyAdapter
 from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
@@ -26,27 +33,29 @@ from finharness.engine.loop import AgentLoop
 from finharness.engine.prompt import system_prompt
 from finharness.hooks.audit import AuditHook, AuditLogWriter, summarize_args
 from finharness.hooks.base import HookChain
+from finharness.observability import build_observer, setup_logging
 from finharness.permissions.gate import PermissionGate
 from finharness.provider.fake import FakeProvider
 from finharness.provider.registry import build_provider
 from finharness.provider.resolver import NotConfigured, ProviderResolver
+from finharness.server.auth_api import create_auth_router
 from finharness.server.config_api import create_config_router
 from finharness.server.confirm import ConfirmBus
 from finharness.server.sessions import SessionBusyError, SessionRegistry
 from finharness.server.sse import encode_event
 from finharness.tools.registry import ALL_TOOL_CLASSES, ToolRegistry
 
-# One definition, loaded from prompts/system.md so tests exercise the same text
-# the product ships (docs: it governs planning, citation and convergence).
+# 单一定义，从 prompts/system.md 加载，使测试与产品发布使用同一份文本
+# （文档说明：它管控规划、引用与收敛）。
 DEFAULT_SYSTEM_PROMPT = system_prompt()
 
 
 class ChatRequest(BaseModel):
-    # conversation_id is the memory scope and the client's durable handle; it can
-    # be supplied to resume a conversation whose session has expired.
+    # conversation_id 是记忆作用域，也是客户端的持久句柄；可传入它
+    # 以恢复会话已过期的对话。
     conversation_id: str | None = None
-    # session_id is the live execution window; optional and normally omitted,
-    # since the server resolves it from the conversation.
+    # session_id 是活跃的执行窗口；可选，通常省略，
+    # 因为服务端会从对话中解析出它。
     session_id: str | None = None
     message: str
     mode: str = "default"
@@ -68,6 +77,7 @@ class QueueSink:
         self.replay_events: list[dict] = []
 
     async def emit(self, event):
+        """将引擎事件入队，并记录计时与重放所需的元数据。"""
         now = time.monotonic()
         if event.kind == "text_delta" and self.first_token_at is None:
             self.first_token_at = now
@@ -77,7 +87,11 @@ class QueueSink:
             "tool_status",
             "context_compacted",
             "loop_guard",
+            "plan_progress",
             "interactive_request",
+            # ``answer`` 与终态的 ``done`` 也属于失败轮次的重放记录：
+            # 重新加载的对话仍须展示本次运行已确立的部分发现。
+            "answer",
             "done",
         }:
             self.replay_events.append(
@@ -86,6 +100,7 @@ class QueueSink:
         await self.queue.put(event)
 
     def turn_metadata(self) -> dict | None:
+        """汇总本轮的重放事件与耗时元数据；轮次未完成时返回 None。"""
         if self.done_at is None:
             return None
         return {
@@ -108,8 +123,29 @@ def create_app(
     resolver: ProviderResolver | None = None,
     probe_client_factory=None,
 ) -> FastAPI:
+    """构建 FastAPI 应用，装配缓存、适配器、会话注册表与全部路由。"""
     application = FastAPI(title="FinHarness")
     settings = settings or Settings.from_file()
+
+    # 日志在任何组件之前配置，使启动期的日志本身就带上下文字段。
+    setup_logging(
+        level=settings.observability.logging.level,
+        json_format=settings.observability.logging.json_format,
+        path=settings.observability.logging.path,
+    )
+    # 观测门面：未启用或未安装可选依赖时自动降级为 no-op，绝不影响主流程。
+    observer = build_observer(settings)
+
+    # -- 认证（docs 03.13）-----------------------------------------------------
+    user_store = UserStore(settings.paths.auth_db)
+    application.state.user_store = user_store
+    require_user = create_require_user(user_store)
+
+    # 对话记忆：一个存储服务所有对话；对话记录、
+    # 引用、结论与摘要分段均以 conversation id 为键。
+    # （提前构造：首个注册用户的存量认领需要它。）
+    memory_store = MemoryStore(settings.paths.memory_db)
+    application.state.memory_store = memory_store
 
     def store_factory() -> ConfigStore:
         nonlocal config_store
@@ -120,74 +156,120 @@ def create_app(
             )
         return config_store
 
+    def _claim_legacy(user_id: str) -> None:
+        """首个注册用户认领单用户时代的存量数据（对话、笔记、供应商配置）。"""
+        memory_store.claim_user(user_id)
+        store_factory().claim_user(user_id)
+
+    application.include_router(
+        create_auth_router(
+            store=user_store,
+            ttl_s=settings.auth.token_ttl_s,
+            secure_cookie=settings.auth.secure_cookie,
+            allow_register=settings.auth.allow_register,
+            claim_legacy=_claim_legacy,
+        )
+    )
+
     if resolver is None:
         resolver = ProviderResolver(store_factory=store_factory, settings=settings)
 
-    # One cache serves the whole process; each session gets its own citation
-    # registry so provenance stays scoped to that conversation. A caller-supplied
-    # DataAccess is used as-is (tests pass hermetic doubles), so it is never
-    # mutated here.
+    # 一个缓存服务整个进程；每个会话有自己的引用注册表，
+    # 使来源信息限定在该对话内。调用方提供的 DataAccess 按原样使用
+    # （测试传入隔离的替身），因此这里绝不改动它。
     data_cache = LocalCache(settings.data.cache_dir)
+    adapters = [
+        AkShareAdapter(throttle_seconds=settings.data.throttle_seconds),
+        # Web 访问走同一条适配器链与缓存；启动时缺少 key 无妨——
+        # 工具在被调用时会报告"未配置"。settings.json 中的内联 key
+        # 优先于环境变量，因此本地配置的 key 无需导出任何东西即可生效。
+        TavilyAdapter(
+            api_key=settings.search.api_key
+            or (os.getenv(settings.search.env_key) if settings.search.env_key else None),
+            base_url=settings.search.base_url,
+            timeout_s=settings.search.timeout_s,
+            proxy=settings.search.proxy,
+        ),
+        # 研报无需 key。``local_pdf_fallback`` 只控制其可选的
+        # 全文，全文会从本机访问文档 CDN。
+        EastmoneyReportAdapter(
+            timeout_s=settings.search.timeout_s,
+            with_text_allowed=settings.search.local_pdf_fallback,
+        ),
+    ]
+
     shared_data = data_access or DataAccess(
-        [
-            AkShareAdapter(throttle_seconds=settings.data.throttle_seconds),
-            # Web access rides the same adapter chain and cache; an absent key is
-            # fine at startup — the tools report "not configured" when called.
-            # An inline key in settings.json wins over the environment variable,
-            # so a locally configured key works without exporting anything.
-            TavilyAdapter(
-                api_key=settings.search.api_key
-                or (os.getenv(settings.search.env_key) if settings.search.env_key else None),
-                base_url=settings.search.base_url,
-                timeout_s=settings.search.timeout_s,
-            ),
-        ],
+        adapters,
         cache=data_cache,
         settings=settings,
     )
 
-    # Governance: one confirm bus bridges every session's interactive requests.
+    # 每个用户的工具级 DataAccess：与 shared_data 共享适配器与缓存，
+    # 只是 output/ 换成了 output/<user>/，因此用户之间互不可见。
+    # 测试注入的 DataAccess 替身按原样使用，不引入用户目录。
+    user_data_access: dict[str, DataAccess] = {}
+
+    def data_for(user_id: str) -> DataAccess:
+        if data_access is not None:
+            return shared_data
+        scoped = user_data_access.get(user_id)
+        if scoped is None:
+            user_settings = settings.model_copy(
+                update={
+                    "paths": settings.paths.model_copy(
+                        update={"output_dir": settings.paths.output_dir / user_id}
+                    )
+                }
+            )
+            scoped = DataAccess(adapters, cache=data_cache, settings=user_settings)
+            user_data_access[user_id] = scoped
+        return scoped
+
+    # 治理：一个确认总线桥接所有会话的交互式请求。
     confirm_bus = ConfirmBus(ttl_s=settings.server.confirm_ttl_s)
-    # Exposed so tests and operators can inspect pending interactive requests.
+    # 暴露出来，使测试与运维人员可以检查待处理的交互式请求。
     application.state.confirm_bus = confirm_bus
     session_citations: dict[str, CitationRegistry] = {}
     session_contexts: dict[str, ResearchContext] = {}
-    # Citations also follow the conversation, so they remain addressable after
-    # the execution session that produced them has expired.
+    # 引用也跟随对话，因此产生它们的执行会话过期后仍可寻址。
     conversation_citations: dict[str, CitationRegistry] = {}
     fallback_provider = provider
 
-    # Conversation memory: one store serves every conversation; the transcript,
-    # citations, conclusions and summary segments are keyed by conversation id.
-    memory_store = MemoryStore(settings.paths.memory_db)
-    application.state.memory_store = memory_store
     memory_store.prune(
         max_conversations=settings.context.retention_conversations,
         max_age_days=settings.context.retention_days,
     )
 
     def loop_factory(
-        session_id: str | None = None, conversation_id: str | None = None
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        user_id: str = "",
     ) -> AgentLoop:
+        """为一次会话构建 AgentLoop，并接线引用、上下文、权限门与审计钩子。"""
         if fallback_provider is not None:
             selected = fallback_provider
         else:
-            selected = resolver.current()
+            selected = resolver.current(user_id)
         citations = CitationRegistry()
         ctx = ResearchContext(cite=citations, settings=settings)
-        # Index by both ids: citations and context follow the conversation, and
-        # the session id is just this execution window's handle.
+        # 用两个 id 索引：引用与上下文跟随对话，
+        # 而 session id 只是本次执行窗口的句柄。
         if session_id:
             session_citations[session_id] = citations
             session_contexts[session_id] = ctx
         if conversation_id:
             conversation_citations[conversation_id] = citations
 
-        # Tool schemas are generated per session because lazy activation is
-        # session-scoped; ctx and registry are wired to each other.
-        registry_for_session = ToolRegistry(shared_data, ctx=ctx, settings=settings)
+        # 工具 schema 按会话生成，因为惰性激活是会话作用域的；
+        # ctx 与 registry 相互接线。产物经由 data_for(user_id) 写入
+        # output/<user>/，因此用户之间互不可见。
+        registry_for_session = ToolRegistry(
+            data_for(user_id), ctx=ctx, settings=settings
+        )
         audit = AuditHook(
-            AuditLogWriter(settings.audit.log_path), session_id=session_id or "local"
+            AuditLogWriter(settings.audit.log_path),
+            session_id=session_id or "local",
+            user_id=user_id,
         )
         gate = PermissionGate(
             settings=settings,
@@ -209,20 +291,23 @@ def create_app(
             hooks=HookChain([audit]),
             conversation_id=conversation_id,
             store=memory_store,
+            user_id=user_id,
+            observer=observer,
         )
 
         async def _ask(kind: str, prompt: str, options: list[str]):
-            """Announce the request over SSE, then await the client's answer."""
+            """经由 SSE 宣告请求，然后 await 客户端的应答。"""
             _, answer = await confirm_bus.request(
                 session_id=session_id or "local",
                 kind=kind,
                 prompt=prompt,
                 options=options,
+                user_id=user_id,
                 announce=lambda payload: loop._emit("interactive_request", payload),
             )
             return answer
 
-        # Injected after construction so the callback can emit through this loop.
+        # 构造之后注入，使回调可以通过此 loop 发送事件。
         loop.interactive = _ask
         loop.audit = audit
         return loop
@@ -235,6 +320,7 @@ def create_app(
             resolver=resolver,
             settings=settings,
             probe_client_factory=probe_client_factory,
+            require_user=require_user,
         )
     )
     frontend_dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
@@ -247,11 +333,28 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    metrics_recorder = getattr(observer, "metrics", None)
+    if metrics_recorder is not None:
+
+        @application.get("/metrics")
+        async def metrics_endpoint() -> Response:
+            """Prometheus 抓取端点；仅在 metrics 启用时注册。"""
+            return Response(
+                content=metrics_recorder.render(),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+
     @application.get("/v1/tools")
-    async def tools(session_id: str | None = None) -> dict:
-        """List the catalogue; with a session id, report its activation state."""
+    async def tools(
+        session_id: str | None = None, user: CurrentUser = Depends(require_user)
+    ) -> dict:
+        """列出工具目录；给定 session id 时报告其激活状态。"""
         if session_id and session_id in registry.sessions:
-            reg = registry.sessions[session_id].loop.registry
+            session = registry.sessions[session_id]
+            # 会话句柄是全局的：他人的 session_id 视同不存在。
+            if session.user_id != user.id:
+                raise HTTPException(status_code=404, detail="会话或对话不存在")
+            reg = session.loop.registry
             return {
                 "tools": reg.names(),
                 "resident": reg.resident_names(),
@@ -261,15 +364,21 @@ def create_app(
         return {"tools": [cls.name for cls in ALL_TOOL_CLASSES]}
 
     @application.post("/v1/chat/respond")
-    async def chat_respond(body: RespondRequest) -> dict:
-        """Answer a pending interactive request (write confirmation / ask_user)."""
-        ok = confirm_bus.respond(request_id=body.request_id, value=body.response)
+    async def chat_respond(
+        body: RespondRequest, user: CurrentUser = Depends(require_user)
+    ) -> dict:
+        """应答一个待处理的交互式请求（写确认 / ask_user）。"""
+        # 只挂起它的用户可以应答；他人的 request_id 视同不存在。
+        ok = confirm_bus.respond(
+            request_id=body.request_id, value=body.response, user_id=user.id
+        )
         if not ok:
             raise HTTPException(status_code=404, detail="请求不存在或已超时")
         return {"ok": True}
 
     @application.get("/v1/cache/stats")
-    async def cache_stats() -> dict:
+    async def cache_stats(user: CurrentUser = Depends(require_user)) -> dict:
+        """返回本地数据缓存的命中统计。"""
         snapshot = data_cache.stats()
         return {
             "entries": snapshot.entries,
@@ -279,15 +388,18 @@ def create_app(
         }
 
     @application.get("/v1/memory")
-    async def memory_view(conversation_id: str | None = None, limit: int = 20) -> dict:
-        """Read-only view of accumulated memory.
+    async def memory_view(
+        conversation_id: str | None = None,
+        limit: int = 20,
+        user: CurrentUser = Depends(require_user),
+    ) -> dict:
+        """累积记忆的只读视图。
 
-        Replaces the MEMORY.md file view the design once proposed: the web layer
-        is where a human reads this, and it stays structured rather than being
-        rewritten to a file on every turn.
+        取代了设计曾提出的 MEMORY.md 文件视图：Web 层正是人类阅读
+        它的地方，而且它保持结构化，而不是每轮都重写到一个文件。
         """
         return {
-            "notes": memory_store.get_notes(),
+            "notes": memory_store.get_notes(user_id=user.id),
             "conversations": [
                 {
                     "conversation_id": record.conversation_id,
@@ -295,7 +407,9 @@ def create_app(
                     "created_at": record.created_at,
                     "last_active_at": record.last_active_at,
                 }
-                for record in memory_store.list_conversations(limit=limit)
+                for record in memory_store.list_conversations(
+                    user_id=user.id, limit=limit
+                )
             ],
             "conclusions": (
                 [
@@ -310,20 +424,27 @@ def create_app(
                     )
                 ]
                 if conversation_id
+                # 归属不符视同不存在。
+                and memory_store.get_conversation(conversation_id, user_id=user.id)
+                is not None
                 else []
             ),
         }
 
     @application.get("/v1/artifacts")
-    async def download_artifact(path: str):
-        """Serve a produced file, restricted to the artefact directories.
+    async def download_artifact(
+        path: str, user: CurrentUser = Depends(require_user)
+    ):
+        """提供产出的文件，范围限于该用户自己的产物目录与缓存数据。
 
-        Containment is enforced after resolution, mirroring read_file; without
-        it this endpoint would be an arbitrary file read.
+        在解析之后强制校验包含关系，与 read_file 一致；没有它，
+        该 endpoint 就会变成任意文件读取。缓存侧只开放 ``parquet/``
+        子树——打开整个 data_cache/ 会连带暴露 users.db（口令哈希）
+        与 memory.db（全部用户的对话）。
         """
         allowed_roots = [
-            Path(settings.paths.output_dir).resolve(),
-            Path(settings.data.cache_dir).resolve(),
+            (Path(settings.paths.output_dir) / user.id).resolve(),
+            (Path(settings.data.cache_dir) / "parquet").resolve(),
         ]
         try:
             target = Path(path).resolve()
@@ -342,30 +463,34 @@ def create_app(
 
     @application.get("/v1/citations")
     async def citations(
-        session_id: str | None = None, conversation_id: str | None = None
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        user: CurrentUser = Depends(require_user),
     ) -> dict:
-        """Citations for a conversation (preferred) or a live session."""
+        """某对话（优先）或某活跃会话的引用。"""
         if conversation_id:
+            # 无论走内存还是落库，都先确认对话属于当前用户。
+            if memory_store.get_conversation(conversation_id, user_id=user.id) is None:
+                raise HTTPException(status_code=404, detail="会话或对话不存在")
             registry = conversation_citations.get(conversation_id)
             if registry is not None:
                 records = registry.all()
             else:
-                # A conversation outlives the process that served it, so fall back
-                # to the persisted citations: a resumed conversation keeps showing
-                # its sources even after a server restart.
-                if memory_store.get_conversation(conversation_id) is None:
-                    raise HTTPException(status_code=404, detail="会话或对话不存在")
+                # 对话比服务它的进程更长寿，因此回退到持久化的引用：
+                # 恢复的对话即使在服务端重启后仍能显示其来源。
                 records = memory_store.load_citations(conversation_id)
         elif session_id:
-            registry = session_citations.get(session_id)
-            if registry is None:
+            session = registry.sessions.get(session_id)
+            if session is None or session.user_id != user.id:
                 raise HTTPException(status_code=404, detail="会话或对话不存在")
-            records = registry.all()
+            records = session_citations[session_id].all()
         else:
+            # 无过滤参数：只汇总该用户各会话的引用。
             records = [
                 item
-                for registry in session_citations.values()
-                for item in registry.all()
+                for sid, s in registry.sessions.items()
+                if s.user_id == user.id
+                for item in session_citations[sid].all()
             ]
         items: list[dict] = [
             {
@@ -385,8 +510,10 @@ def create_app(
         return {"citations": items, "count": len(items)}
 
     @application.get("/v1/conversations")
-    async def conversations(limit: int = 50) -> dict:
-        """List stored conversations, newest activity first, for a picker."""
+    async def conversations(
+        limit: int = 50, user: CurrentUser = Depends(require_user)
+    ) -> dict:
+        """列出已存储的对话，最近活动在前，供选择器使用。"""
         return {
             "conversations": [
                 {
@@ -395,17 +522,26 @@ def create_app(
                     "created_at": record.created_at,
                     "last_active_at": record.last_active_at,
                 }
-                for record in memory_store.list_conversations(limit=limit)
+                for record in memory_store.list_conversations(
+                    user_id=user.id, limit=limit
+                )
             ]
         }
 
     @application.get("/v1/conversations/{conversation_id}/messages")
-    async def conversation_messages(conversation_id: str, limit: int = 200) -> dict:
-        """Replay a conversation's transcript so a client can restore its view.
+    async def conversation_messages(
+        conversation_id: str,
+        limit: int = 200,
+        user: CurrentUser = Depends(require_user),
+    ) -> dict:
+        """重放对话记录，使客户端可以恢复其视图。
 
-        Only user turns and final answers are returned: the intermediate tool
-        frames are working state, not something a reader should scroll through.
+        只返回用户轮次与最终回答：中间的工具帧属于工作状态，
+        不是读者应该滚动浏览的内容。
         """
+        # 先校验归属，再读取：不属当前用户的对话视同不存在。
+        if memory_store.get_conversation(conversation_id, user_id=user.id) is None:
+            raise HTTPException(status_code=404, detail="对话不存在或无消息")
         messages = memory_store.load_messages(conversation_id)
         if not messages:
             raise HTTPException(status_code=404, detail="对话不存在或无消息")
@@ -424,16 +560,18 @@ def create_app(
         }
 
     @application.delete("/v1/conversations/{conversation_id}")
-    async def delete_conversation(conversation_id: str) -> dict:
-        """Delete a conversation and everything scoped to it.
+    async def delete_conversation(
+        conversation_id: str, user: CurrentUser = Depends(require_user)
+    ) -> dict:
+        """删除一个对话及其作用域内的所有内容。
 
-        Removes the transcript, summaries, citations, conclusions and symbol
-        pool. User preferences are global and deliberately unaffected.
+        移除对话记录、摘要、引用、结论与标的池。
+        用户偏好是用户作用域的，刻意不受影响。
 
-        Refused while the conversation is mid-request: deleting the store out
-        from under a running loop would leave it persisting into nothing.
+        当对话正处于请求处理中时拒绝：在运行中的 loop 底下删掉存储
+        会让它持久化到空处。
         """
-        if memory_store.get_conversation(conversation_id) is None:
+        if memory_store.get_conversation(conversation_id, user_id=user.id) is None:
             raise HTTPException(status_code=404, detail="对话不存在")
         active = registry.find_by_conversation(conversation_id)
         if active is not None and active.busy:
@@ -457,31 +595,51 @@ def create_app(
         return HTMLResponse("<html><body><div id='root'>FinHarness</div></body></html>")
 
     @application.post("/v1/report")
-    async def report_stream(request: ChatRequest):
-        """Turn the conversation into a report.
+    async def report_stream(
+        request: ChatRequest, user: CurrentUser = Depends(require_user)
+    ):
+        """将对话转化为一份报告。
 
-        This endpoint adds no fixed pipeline of its own: it submits an ordinary
-        request in the session, so the model loads the report-template skill and
-        calls write_report exactly as it would if the user had typed it. The
-        resulting files then arrive as tool_status attachments.
+        该 endpoint 不添加自己的固定流水线：它在会话中提交一个普通
+        请求，因此模型会加载匹配的场景 skill、读取其报告模板并调用
+        write_report，与用户亲自输入时完全一样。产出的文件随后
+        以 tool_status 附件的形式到达。
         """
         prompt = (
             request.message.strip()
-            or "请基于本次会话的研究内容生成一份研报，先加载 report-template 技能再成稿。"
+            or "请基于本次会话的研究内容生成一份研报，先加载对应场景技能并参考其报告模板再成稿。"
         )
         return await chat_stream(
-            ChatRequest(session_id=request.session_id, message=prompt)
+            ChatRequest(
+                session_id=request.session_id,
+                conversation_id=request.conversation_id,
+                message=prompt,
+            ),
+            user=user,
         )
 
     @application.post("/v1/chat/stream")
-    async def chat_stream(request: ChatRequest):
+    async def chat_stream(
+        request: ChatRequest, user: CurrentUser = Depends(require_user)
+    ):
+        """运行一轮对话并以 SSE 流式返回引擎事件。"""
         from fastapi import HTTPException
 
+        # 归属校验：对话已存在但属于他人时视同不存在（404 而非 403，
+        # 不泄露存在性）。完全未知的 id 则按新对话开始——客户端可能
+        # 回传一个已被删除的 id，那应当从头开始，而不是报错。
+        if request.conversation_id:
+            existing = memory_store.get_conversation(request.conversation_id)
+            if existing is not None and existing.user_id != user.id:
+                raise HTTPException(status_code=404, detail="对话不存在")
         try:
             session = await registry.ensure(
-                request.session_id, conversation_id=request.conversation_id
+                request.session_id,
+                conversation_id=request.conversation_id,
+                user_id=user.id,
             )
         except SessionBusyError as exc:
+            # 会话正忙与“会话属于他人”同消息：不泄露归属信息。
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except NotConfigured as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -496,11 +654,24 @@ def create_app(
                 provider=type(session.loop.provider).__name__,
                 model=getattr(session.loop.provider, "model", ""),
             )
+        # trace_id 在请求入口生成并绑定到当前上下文；``create_task`` 会复制
+        # context，因此引擎任务与所有日志自动携带同一个 id。
+        observer.bind_request(
+            session_id=session.session_id,
+            conversation_id=session.conversation_id,
+            mode=request.mode,
+        )
         task = asyncio.create_task(session.loop.run(request.message))
 
         async def events() -> AsyncIterator[str]:
-            # Both ids travel: the client persists conversation_id (durable) and
-            # may echo session_id back for efficiency within one window.
+            """SSE 事件生成器：转发引擎事件并在结束时补齐元数据。
+
+            请求级的耗时/根 Span 由 ``AgentLoop.run`` 持有——它才是服务端、
+            eval 与脚本共同的执行边界，在这里再开一个只会重复计数。本层只
+            负责绑定 trace id 与传输。
+            """
+            # 两个 id 都会传递：客户端持久化 conversation_id（持久），
+            # 并可能回传 session_id 以在同一窗口内提高效率。
             yield encode_event(
                 "session",
                 {
@@ -520,10 +691,9 @@ def create_app(
                             "session_id": session.session_id,
                             "conversation_id": session.conversation_id,
                         }
-                        # The engine emits ``done`` just before it flushes the
-                        # final answer to memory. Finish that flush and attach
-                        # the replay record before the browser can observe
-                        # completion and refresh the page.
+                        # 引擎在将最终回答刷入记忆之前发出 ``done``。
+                        # 在浏览器可能观察到完成并刷新页面之前，
+                        # 先完成该刷写并附上重放记录。
                         await task
                         turn_metadata = sink.turn_metadata()
                         if turn_metadata is not None:
@@ -532,8 +702,8 @@ def create_app(
                                 metadata={"turn": turn_metadata},
                                 after_seq=persisted_before,
                             )
-                    # The request_id belongs to the confirm bus, not the engine
-                    # payload shape, so it is added at the transport edge.
+                    # request_id 属于确认总线，而非引擎载荷的形状，
+                    # 因此在传输边缘添加。
                     yield encode_event(_event_name(event.kind), data)
                     if event.kind == "done":
                         break
@@ -546,7 +716,7 @@ def create_app(
                     )
             except (asyncio.CancelledError, GeneratorExit):
                 task.cancel()
-                # A dropped stream must not leave the model waiting forever.
+                # 中断的流不能一直让模型等待下去。
                 confirm_bus.cancel_session(session.session_id)
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
@@ -560,9 +730,10 @@ def create_app(
 
 
 def create_production_app(path: str | Path = "settings.json") -> FastAPI:
+    """构建生产用应用：从文件加载设置并校验运行前提后创建应用。"""
     settings = Settings.from_file(path, require_api_key=False)
-    # The API key is resolved lazily (database config first, then environment),
-    # so startup validates structure and audit writability but not credentials.
+    # API key 延迟解析（先数据库配置，后环境变量），
+    # 因此启动时只校验结构与审计可写性，不校验凭据。
     settings.validate_runtime(require_api_key=False)
     return create_app(settings=settings)
 

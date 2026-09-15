@@ -8,8 +8,21 @@ from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
 from finharness.config.store import ConfigStore
 from finharness.server.api import create_app
+from tests.server.conftest import authed_client
 
 FAKE_KEY = "placeholder-value-a"
+
+
+def _settings(tmp_path) -> Settings:
+    """把用户库与记忆库都限定在临时目录，避免污染开发者的真实 store。"""
+    return Settings(
+        data={"cache_dir": tmp_path / "cache"},
+        paths={
+            "output_dir": tmp_path / "output",
+            "memory_db": tmp_path / "cache" / "memory.db",
+            "auth_db": tmp_path / "cache" / "users.db",
+        },
+    )
 
 
 @pytest.fixture
@@ -18,9 +31,9 @@ def store(tmp_path):
 
 
 @pytest.fixture
-def client(store):
-    app = create_app(settings=Settings(), config_store=store)
-    return TestClient(app)
+def client(store, tmp_path):
+    app = create_app(settings=_settings(tmp_path), config_store=store)
+    return authed_client(TestClient(app))
 
 
 def create_payload(**overrides):
@@ -118,7 +131,8 @@ def test_update_without_key_keeps_the_stored_secret(client, store):
     assert response.status_code == 200
     assert response.json()["config"]["model"] == "deepseek-reasoner"
     assert response.json()["config"]["has_key"] is True
-    assert store.resolve_key(created["id"]) == FAKE_KEY
+    # 密钥按用户存储：直接查库要带上测试用户的归属。
+    assert store.resolve_key(created["id"], user_id=client.finharness_user["id"]) == FAKE_KEY
 
 
 def test_delete_refuses_active_config_while_others_remain(client):
@@ -156,16 +170,21 @@ def test_presets_endpoint_lists_documented_and_custom_kinds(client):
 
 
 def _app_with_probe_transport(handler, tmp_path) -> object:
-    """Create an app whose probe uses a MockTransport-backed client."""
+    """创建一个应用，其探测使用由 MockTransport 支撑的客户端。"""
 
     def client_factory(first_byte: float, idle: float) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     return create_app(
-        settings=Settings(),
+        settings=_settings(tmp_path),
         config_store=ConfigStore(tmp_path / "probe.db", cipher=SecretCipher(tmp_path / "probe.key")),
         probe_client_factory=client_factory,
     )
+
+
+def _probe_client(handler, tmp_path) -> TestClient:
+    """带上认证的探测客户端。"""
+    return authed_client(TestClient(_app_with_probe_transport(handler, tmp_path)))
 
 
 def test_probe_reports_success_against_a_scripted_endpoint(tmp_path):
@@ -177,7 +196,7 @@ def test_probe_reports_success_against_a_scripted_endpoint(tmp_path):
             content=f"data: {line}\n\ndata: [DONE]\n\n".encode(),
         )
 
-    probe_client = TestClient(_app_with_probe_transport(handler, tmp_path))
+    probe_client = _probe_client(handler, tmp_path)
 
     response = probe_client.post(
         "/v1/config/probe",
@@ -195,7 +214,7 @@ def test_probe_reports_auth_failure_as_clean_error(tmp_path):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401)
 
-    probe_client = TestClient(_app_with_probe_transport(handler, tmp_path))
+    probe_client = _probe_client(handler, tmp_path)
 
     response = probe_client.post(
         "/v1/config/probe",
@@ -233,10 +252,10 @@ def test_probe_accepts_fake_kind_without_network(client):
 def test_chat_without_configuration_returns_a_clear_error(tmp_path, monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     app = create_app(
-        settings=Settings(),
+        settings=_settings(tmp_path),
         config_store=ConfigStore(tmp_path / "c.db", cipher=SecretCipher(tmp_path / "k.key")),
     )
-    client = TestClient(app, raise_server_exceptions=False)
+    client = authed_client(TestClient(app, raise_server_exceptions=False))
 
     response = client.post("/v1/chat/stream", json={"message": "你好"})
 

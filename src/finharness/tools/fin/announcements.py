@@ -1,20 +1,20 @@
-"""Company announcements over a date range."""
+"""指定日期范围内的公司公告。"""
 
 from __future__ import annotations
 
 from datetime import date, timedelta
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool, DataInput, PermissionLevel, ToolGroup
 
 
 def _default_since() -> str:
     return (date.today() - timedelta(days=180)).isoformat()
 
 
-class AnnouncementsInput(BaseModel):
+class AnnouncementsInput(DataInput):
     symbol: str = Field(description="6位A股代码")
     since: str = Field(
         default_factory=_default_since, description="起始日期 YYYY-MM-DD，默认近半年"

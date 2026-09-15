@@ -1,9 +1,8 @@
-"""The M5 demo script must stay runnable.
+"""M5 demo 脚本必须保持可运行。
 
-The demo itself needs a live server and a real provider, so it cannot run in the
-offline suite. What *can* be checked cheaply is that the script still starts and
-parses its arguments — a broken import or a typo'd flag would otherwise only
-surface when someone tries to run the demo by hand.
+demo 本身需要实时服务器和真实 provider，因此无法在离线测试集中运行。
+能以低成本检查的是：脚本仍可启动并解析其参数——否则，一个损坏的 import
+或一个拼错的 flag 只会在有人手动运行 demo 时才暴露出来。
 """
 
 from __future__ import annotations

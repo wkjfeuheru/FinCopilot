@@ -1,1 +1,1 @@
-"""Data access and adapters."""
+"""数据访问与适配器。"""

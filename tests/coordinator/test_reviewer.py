@@ -1,4 +1,4 @@
-"""Tests for the risk-review sub-agent (docs 03.10)."""
+"""risk-review sub-agent 的测试（文档 03.10）。"""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from finharness.types import (
 
 
 class Adapter(DataAdapter):
-    """Minimal fetch surface: enough for the reviewer to re-fetch a quote."""
+    """最小的 fetch 接口：足以让 reviewer 重新获取一次 quote。"""
 
     name = "fake"
 
@@ -37,7 +37,7 @@ class Adapter(DataAdapter):
 
 
 class ScriptedProvider(Provider):
-    """Replays canned rounds and records every request the sub-agent makes."""
+    """回放预设轮次，并记录 sub-agent 发出的每次请求。"""
 
     def __init__(self, rounds=None, *, error: Exception | None = None):
         self.rounds = list(rounds or [])
@@ -105,15 +105,15 @@ def run(coro):
     return asyncio.run(coro)
 
 
-# -- the restricted catalogue -------------------------------------------------
+# -- 受限的 tool 目录 ---------------------------------------------------------
 
 
 def test_review_catalogue_is_read_only_data_tools_plus_read_file():
     names = set(review_tool_names())
 
     assert {"get_quote", "get_financials", "get_indicators", "read_file"} <= names
-    # Writes, output tools and every META tool are excluded. load_tool matters
-    # most: it would let the reviewer widen its own catalogue.
+    # Writes、output tools 以及所有 META tool 都被排除。load_tool 最关键：
+    # 它会让 reviewer 扩大自己的 tool 目录。
     assert not {"write_report", "write_file", "make_chart"} & names
     assert not {
         "research_plan",
@@ -124,11 +124,11 @@ def test_review_catalogue_is_read_only_data_tools_plus_read_file():
         "load_skill",
         "list_skills",
     } & names
-    # Pure calculators cannot fetch anything, so they add no verification power.
+    # 纯计算器无法获取任何数据，因此不增加校验能力。
     assert not {"calc_metrics", "calc_valuation"} & names
 
 
-# -- isolation ----------------------------------------------------------------
+# -- 隔离 ---------------------------------------------------------------------
 
 
 def test_review_reads_the_checklist_and_cannot_see_the_main_transcript(tmp_path):
@@ -141,7 +141,7 @@ def test_review_reads_the_checklist_and_cannot_see_the_main_transcript(tmp_path)
     request = provider.requests[0]
     assert "风险终审" in request["system"]
     assert "风险核查清单" in request["system"]
-    # The report is the reviewer's only input: exactly one user message.
+    # 报告是 reviewer 的唯一输入：恰好一条 user 消息。
     assert len(request["messages"]) == 1
     assert request["messages"][0].role == "user"
     assert "贵州茅台" in request["messages"][0].content
@@ -166,24 +166,23 @@ def test_review_uses_only_the_restricted_tool_schemas(tmp_path):
 
 
 def test_review_leaves_no_conversation_memory_behind(tmp_path):
-    """The sub-agent has no store, so it cannot pollute the conversation scope."""
+    """sub-agent 没有存储，因此不会污染对话作用域。"""
     provider = ScriptedProvider([text_round("ok")])
     coordinator = make_coordinator(tmp_path, provider)
 
     result = run(coordinator.review_risk(topic="t", markdown="body"))
 
-    # A review is an episode, not memory: nothing but its own summary comes back.
+    # review 是一次片段，而非记忆：除了它自己的 summary 什么都不会返回。
     assert result.summary == "ok"
 
 
-# -- budget -------------------------------------------------------------------
+# -- 预算 ---------------------------------------------------------------------
 
 
 def test_reviewer_turn_budget_is_tightened_without_touching_the_main_settings(tmp_path):
     settings = make_settings(tmp_path, max_turns=30)
-    # More distinct calls than the reviewer's budget: distinct arguments keep the
-    # loop guard out of the way, so the only thing that can stop the run is the
-    # reviewer's own turn budget.
+    # 不同的调用次数多于 reviewer 的预算：不同参数可避开 loop guard，
+    # 因此唯一能终止运行的就是 reviewer 自身的 turn 预算。
     provider = ScriptedProvider(
         [
             *[tool_round(ToolUse(f"c{i}", "get_quote", {"symbol": f"60000{i}"})) for i in range(8)],
@@ -196,16 +195,16 @@ def test_reviewer_turn_budget_is_tightened_without_touching_the_main_settings(tm
 
     assert len(provider.requests) == REVIEW_MAX_TURNS
     assert result.turns == REVIEW_MAX_TURNS
-    # The main session's budget is untouched.
+    # 主会话的预算未受影响。
     assert settings.context.max_turns == 30
 
 
 def test_reviewer_budget_leaves_room_to_verify_several_figures(tmp_path):
-    """The read plus several independent checks must fit, or reviews ship empty."""
+    """读取加上若干独立核对必须放得下，否则 review 会空着发布。"""
     assert REVIEW_MAX_TURNS >= 5
 
 
-# -- accounting ---------------------------------------------------------------
+# -- 账目统计 -----------------------------------------------------------------
 
 
 def test_review_folds_its_tokens_into_the_session_totals_and_breakdown(tmp_path):
@@ -225,14 +224,14 @@ def test_review_folds_its_tokens_into_the_session_totals_and_breakdown(tmp_path)
         "output_tokens": 2,
         "runs": 1,
     }
-    # The reviewer's tool calls must not appear in the main loop's per-tool view.
+    # reviewer 的 tool 调用不得出现在主 loop 的 per-tool 视图中。
     assert "get_quote" not in stats.snapshot().per_tool
 
 
 def test_review_citations_continue_the_session_numbering(tmp_path):
     settings = make_settings(tmp_path)
     cite = CitationRegistry()
-    # A pre-existing citation, as if the main agent had already fetched data.
+    # 一个已存在的 citation，仿佛主 agent 已经获取过数据。
     cite.register(
         tool="get_quote",
         endpoint="fake:fake_quote",
@@ -263,7 +262,7 @@ def test_review_without_accounting_wiring_still_runs(tmp_path):
     assert result.input_tokens == 5
 
 
-# -- failure isolation --------------------------------------------------------
+# -- 失败隔离 -----------------------------------------------------------------
 
 
 def test_provider_failure_degrades_to_a_structured_error(tmp_path):
@@ -279,10 +278,10 @@ def test_provider_failure_degrades_to_a_structured_error(tmp_path):
 
 
 def test_failed_review_charges_no_tokens_to_the_session(tmp_path):
-    """A run that spent nothing must not inflate the totals.
+    """没有花费任何东西的运行不得虚增总量。
 
-    The failed attempt is still *counted* as a run — that is useful signal about
-    how often review fails — but it must move no tokens.
+    失败的尝试仍会被 *计入* 为一次运行——这是关于 review 失败频率的有用信号——
+    但它不得移动任何 token。
     """
     provider = ScriptedProvider(error=RuntimeError("boom"))
     stats = SessionStats()
@@ -296,3 +295,35 @@ def test_failed_review_charges_no_tokens_to_the_session(tmp_path):
     assert snapshot.output_tokens == 0
     assert usage.input_tokens == 0
     assert snapshot.per_agent["risk"]["runs"] == 1
+
+
+def test_subagent_tokens_are_tagged_once_and_not_double_counted(tmp_path):
+    """子代理的模型调用以 call_type=subagent 记一次；协调器只汇总量、不重发指标。
+
+    否则同一次调用会在 llm_tokens_total 里出现两次，成本视图直接翻倍。
+    """
+    from finharness.observability.metrics import MetricsRecorder
+    from finharness.observability.observer import Observer
+
+    metrics = MetricsRecorder()
+    observer = Observer(metrics=metrics)
+    provider = ScriptedProvider([text_round("意见"), text_round("再一轮")])
+    stats = SessionStats()
+    usage = ModelUsage()
+    settings = make_settings(tmp_path)
+    data = DataAccess([Adapter()], cache=LocalCache(tmp_path / "cache"), settings=settings)
+    coordinator = Coordinator(
+        provider=provider, data=data, settings=settings, cite=CitationRegistry()
+    )
+    coordinator.bind_accounting(usage=usage, stats=stats, observer=observer)
+
+    result = run(coordinator.review_risk(topic="t", markdown="body"))
+
+    assert result.input_tokens == 5
+    # 会话总量只累加一次：token 指标由子循环自己发出，协调器只汇总量，不重发。
+    assert stats.input_tokens == 5
+    rendered = metrics.render().decode()
+    assert 'llm_tokens_total{call_type="subagent",kind="input"' in rendered
+    assert rendered.count('llm_tokens_total{call_type="subagent",kind="input",model="unknown"} 5.0') == 1
+    # 子代理不是用户请求：请求级直方图不得因此出现样本。
+    assert "agent_request_duration_seconds_count" not in rendered

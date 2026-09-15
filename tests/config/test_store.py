@@ -8,8 +8,8 @@ from finharness.config.store import (
     DuplicateConfigName,
 )
 
-# Neutral placeholder values: these are fabricated strings for offline tests,
-# never real credentials.
+# 中性占位值：这些是为离线测试伪造的字符串，
+# 绝非真实凭证。
 FAKE_A = "placeholder-value-a"
 FAKE_B = "placeholder-value-b"
 FAKE_C = "placeholder-value-c"

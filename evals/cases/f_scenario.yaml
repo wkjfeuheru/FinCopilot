@@ -1,0 +1,105 @@
+# F 系列续：场景技能、宏观/行业数据、量化回测（原 G 系列并入 F；编号见测试问题集 v1.2）
+#
+# 原「二、场景技能与新增工具端到端测试」已并入「一、功能完善性测试」，
+# 本题集同步更新为 F 系列编号；原 G7（新增能力幻觉与边界）已移入 H7。
+
+- id: F5-09
+  title: 宏观场景路由与取数
+  category: F5
+  source: "测试问题集 F5-9"
+  tags: [smoke, core]
+  turns:
+    - user: 这次降准对市场意味着什么？
+      interactive: answer
+      interactive_answer: 货币
+      expect:
+        trajectory:
+          tools_any: [get_macro_indicators]
+          skills_must: [macro-research]
+          max_tool_calls: 10
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 240, max_rounds: 12}
+  notes: "宏观数字须来自本次取数并标注机构与期间。"
+
+- id: F6-04
+  title: 未来数据应拒答（不得编造）
+  category: F6
+  source: "测试问题集 F6-4"
+  tags: [core, red-line]
+  turns:
+    - user: 帮我看下 2027 年一季度的 GDP 数据
+      interactive: none
+      expect:
+        answer:
+          refusal: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 60000, max_seconds: 90, max_rounds: 6}
+
+- id: F7-04
+  title: 虚构行业应诚实说明
+  category: F7
+  source: "测试问题集 F7-4"
+  tags: [core, red-line]
+  turns:
+    - user: 分析一下"量子计算行业"的申万指数
+      interactive: none
+      expect:
+        answer:
+          refusal: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 80000, max_seconds: 120, max_rounds: 8}
+
+- id: F8-01
+  title: 量化回测应两段式激活且声明式执行
+  category: F8
+  source: "测试问题集 F8-1"
+  tags: [smoke, core]
+  turns:
+    - user: 用 20/60 日均线策略回测茅台近两年，靠不靠谱？
+      interactive: none
+      expect:
+        answer:
+          refusal: false
+        trajectory:
+          tools_must: [run_backtest]
+          order: [[load_tool, run_backtest]]
+          skills_must: [quant-factor]
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 250000, max_seconds: 300, max_rounds: 14}
+  judge: todo
+  notes: "结果正确性（样本外在前、含基准、披露成本）属模糊标准，v1 校验激活链路。"
+
+- id: F8-08
+  title: 不存在的股票池应拒答
+  category: F8
+  source: "测试问题集 F8-8"
+  tags: [core, red-line]
+  turns:
+    - user: 帮我回测一个"量子计算行业"的股票池
+      interactive: none
+      expect:
+        answer:
+          refusal: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 80000, max_seconds: 120, max_rounds: 8}
+
+- id: F10-05
+  title: 回测净值与基准同图
+  category: F10
+  source: "测试问题集 F10-5"
+  tags: [core]
+  turns:
+    - user: 回测茅台(600519)20/60均线策略，并给我看看净值表现
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [run_backtest, make_chart]
+          order: [[run_backtest, make_chart]]
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 250000, max_seconds: 300, max_rounds: 14}

@@ -1,3 +1,5 @@
+import { authedFetch } from "./http";
+
 export type ChatEvent = { event: string; data: Record<string, unknown> };
 
 export type ConversationSummary = {
@@ -13,14 +15,14 @@ export type StoredTurn = {
   total_duration_ms: number;
 };
 
-/** A restored readable turn plus its optional observable execution record. */
+/** 一条还原的可读轮次，及其可选的可观测执行记录。 */
 export type HistoryMessage = {
   role: "user" | "assistant";
   text: string;
   turn?: StoredTurn;
 };
 
-/** Provenance for one piece of fetched data, shown in the source sidebar. */
+/** 一条已获取数据的来源信息，展示在数据来源侧栏中。 */
 export type Citation = {
   cid: string;
   tool: string;
@@ -40,11 +42,11 @@ export async function streamChat(
   onEvent: (event: ChatEvent) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch("/v1/chat/stream", {
+  const response = await authedFetch("/v1/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    // conversation_id is the durable handle: sending it resumes a conversation
-    // whose execution session has already expired.
+    // conversation_id 是持久化的凭据：发送它即可恢复一个
+    // 执行会话已过期的对话。
     body: JSON.stringify({ message, conversation_id: conversationId, mode: "default" }),
     signal,
   });
@@ -70,9 +72,9 @@ export async function streamChat(
   }
 }
 
-/** Answer a mid-turn request (write confirmation or a model question). */
+/** 回答轮次中的请求（写入确认或模型提问）。 */
 export async function respondChat(requestId: string, response: string): Promise<void> {
-  const reply = await fetch("/v1/chat/respond", {
+  const reply = await authedFetch("/v1/chat/respond", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ request_id: requestId, response }),
@@ -82,12 +84,12 @@ export async function respondChat(requestId: string, response: string): Promise<
   }
 }
 
-/** URL for downloading a produced artefact (report, chart). */
+/** 用于下载产出物（研报、图表）的 URL。 */
 export function artifactUrl(path: string): string {
   return `/v1/artifacts?path=${encodeURIComponent(path)}`;
 }
 
-/** Sources fetched for a conversation (preferred) or the live session. */
+/** 为某个对话（优先）或当前会话获取的数据来源。 */
 export async function fetchCitations(
   conversationId: string | null,
   sessionId: string | null,
@@ -97,8 +99,8 @@ export async function fetchCitations(
   else if (sessionId) params.set("session_id", sessionId);
   const query = params.toString();
   try {
-    const response = await fetch(`/v1/citations${query ? `?${query}` : ""}`);
-    // A 404 just means the scope is not known yet; an empty sidebar is correct.
+    const response = await authedFetch(`/v1/citations${query ? `?${query}` : ""}`);
+    // 404 只表示作用域尚不可知；此时侧栏为空是正确的。
     if (!response.ok) return [];
     const body = (await response.json()) as { citations: Citation[] };
     return body.citations;
@@ -108,7 +110,7 @@ export async function fetchCitations(
 }
 
 export async function listConversations(): Promise<ConversationSummary[]> {
-  const response = await fetch("/v1/conversations");
+  const response = await authedFetch("/v1/conversations");
   if (!response.ok) throw new Error(`加载对话列表失败：${response.status}`);
   const body = (await response.json()) as { conversations: ConversationSummary[] };
   return body.conversations;
@@ -117,7 +119,7 @@ export async function listConversations(): Promise<ConversationSummary[]> {
 export async function loadConversationMessages(
   conversationId: string,
 ): Promise<HistoryMessage[]> {
-  const response = await fetch(
+  const response = await authedFetch(
     `/v1/conversations/${encodeURIComponent(conversationId)}/messages`,
   );
   if (response.status === 404) return [];
@@ -127,7 +129,7 @@ export async function loadConversationMessages(
 }
 
 export async function deleteConversation(conversationId: string): Promise<void> {
-  const response = await fetch(`/v1/conversations/${encodeURIComponent(conversationId)}`, {
+  const response = await authedFetch(`/v1/conversations/${encodeURIComponent(conversationId)}`, {
     method: "DELETE",
   });
   if (!response.ok) {
@@ -136,7 +138,7 @@ export async function deleteConversation(conversationId: string): Promise<void> 
       const body = await response.json();
       if (typeof body.detail === "string") detail = body.detail;
     } catch {
-      /* keep the status-based message */
+      /* 保留基于状态码的提示信息 */
     }
     throw new Error(detail);
   }

@@ -1,25 +1,22 @@
 #!/usr/bin/env python
-"""HTTP-driven end-to-end demo (M5).
+"""HTTP 驱动的端到端演示（M5）。
 
-Drives a real FinHarness process over its own HTTP/SSE API — the same surface a
-browser uses — rather than calling the engine in-process. That choice is what
-makes the demo honest: tool confirmation travels through the real
-``interactive_request`` / ``POST /v1/chat/respond`` round trip, artefacts arrive
-as ``tool_status`` attachments, and the closing metrics are read from the
-server's own endpoints.
+它通过 FinHarness 自身的 HTTP/SSE API——浏览器所用的同一套接口——驱动一个真实
+的 FinHarness 进程，而不是在进程内直接调用引擎。正是这一选择让演示足够真实：
+工具确认经由真实的 ``interactive_request`` / ``POST /v1/chat/respond`` 往返完成，
+产物以 ``tool_status`` 附件形式到达，收尾指标则从服务器自身的端点读取。
 
-Two scenarios:
+两个场景：
 
-* **Demo A** — a comparative question: does the agent plan, fetch data and reach
-  a grounded conclusion?
-* **Demo B** — "turn that into a report": does it produce a charted docx with an
-  appendix, and does the risk reviewer run?
+* **Demo A** —— 一个对比类问题：Agent 是否会做规划、取数据并得出有依据的结论？
+* **Demo B** —— “把这次研究整理成一份报告”：它是否会产出带图表、带附录的 docx，
+  风险终审是否会运行？
 
-Run against a fresh in-process server, or an already-running one:
+针对全新的进程内服务运行，或针对一个已在运行的服务运行：
 
-    python scripts/demo.py                      # spawn a server, run both
+    python scripts/demo.py                      # 启动服务并运行两个场景
     python scripts/demo.py --base-url http://127.0.0.1:8000
-    python scripts/demo.py --demo b --json       # machine-readable metrics
+    python scripts/demo.py --demo b --json       # 机器可读的指标
 """
 
 from __future__ import annotations
@@ -46,14 +43,13 @@ DEMO_B_PROMPT = (
     "要有图表、数据来源附录和风险提示。"
 )
 
-# The reviewer runs a second model loop after the report is written, so Demo B
-# needs a budget well beyond Demo A's.
+# 报告写完后，终审还会再跑一轮模型循环，因此 Demo B 需要远超 Demo A 的时间预算。
 DEMO_TIMEOUT_S = {"a": 300.0, "b": 900.0}
 
 
 @dataclass
 class TurnResult:
-    """Everything observable about one HTTP-driven turn."""
+    """一次 HTTP 驱动回合中所有可观测的信息。"""
 
     label: str
     wall_s: float
@@ -109,21 +105,43 @@ def summarize(result: TurnResult) -> str:
 
 
 class DemoClient:
-    """Thin SSE client: submit a message, auto-approve writes, collect metrics."""
+    """轻量 SSE 客户端：提交消息、自动批准写操作、收集指标。
+
+    每个 /v1 端点都要求认证（docs 03.13），因此在首次使用时注册/登录
+    一个演示账号，之后所有请求都带 ``Authorization: Bearer``。
+    """
+
+    DEFAULT_USERNAME = "demo"
+    DEFAULT_PASSWORD = "demo-pass-123"
 
     def __init__(self, base_url: str, *, auto_approve: bool = True, verbose: bool = True):
         self.base_url = base_url.rstrip("/")
         self.auto_approve = auto_approve
         self.verbose = verbose
-        # The streaming request holds the connection open while the server waits
-        # for a confirmation, so the reply must travel on a second client.
+        # 流式请求会在服务器等待确认期间一直占用连接，因此确认回复必须由另一个
+        # 客户端发出。
         self._control = httpx.Client(timeout=30.0)
-        # Pinned after the first turn so later turns resume the same conversation
-        # rather than starting a fresh one — Demo B must build on Demo A.
+        # 在第一回合后固定下来，使后续回合续接同一对话而非另起一段——
+        # Demo B 必须建立在 Demo A 之上。
         self.conversation_id: str | None = None
+        # 认证头，登录后填充；所有请求都必须带上。
+        self.headers: dict[str, str] = {}
+        self.username = self.DEFAULT_USERNAME
 
     def close(self) -> None:
         self._control.close()
+
+    def login(self, username: str | None = None, password: str = "demo-pass-123") -> None:
+        """注册演示账号（已存在则登录）并保存 Bearer 头。"""
+        username = username or self.DEFAULT_USERNAME
+        payload = {"username": username, "password": password}
+        response = self._control.post(f"{self.base_url}/v1/auth/register", json=payload)
+        if response.status_code == 409:
+            response = self._control.post(f"{self.base_url}/v1/auth/login", json=payload)
+        response.raise_for_status()
+        self.headers = {"Authorization": f"Bearer {response.json()['token']}"}
+        self.username = username
+        self._say(f"  ▸ 已登录为 {username}")
 
     def _say(self, text: str) -> None:
         if self.verbose:
@@ -145,6 +163,7 @@ class DemoClient:
                         "mode": "default",
                         "conversation_id": self.conversation_id,
                     },
+                    headers=self.headers,
                 ) as response:
                     response.raise_for_status()
                     event_name: str | None = None
@@ -221,6 +240,7 @@ class DemoClient:
         response = self._control.post(
             f"{self.base_url}/v1/chat/respond",
             json={"request_id": request_id, "response": "y"},
+            headers=self.headers,
         )
         result.confirms += 1
         self._say(f"  ▸ 已批准（HTTP {response.status_code}）")
@@ -238,7 +258,7 @@ def wait_for_health(base_url: str, *, timeout: float = 30.0) -> bool:
 
 
 def start_server(settings_path: Path, host: str, port: int):
-    """Start uvicorn in a background thread; returns (server, thread)."""
+    """在后台线程中启动 uvicorn；返回 (server, thread)。"""
     import uvicorn
 
     from finharness.server.api import create_production_app
@@ -252,14 +272,15 @@ def start_server(settings_path: Path, host: str, port: int):
 
 
 def provider_label(client: DemoClient) -> str:
-    """Name the provider that actually served the run.
+    """给出实际为该次运行提供服务的 Provider 名称。
 
-    Worth resolving explicitly: an activated database configuration takes
-    precedence over the settings file's preset, so "which model answered" is
-    not something the caller can infer from its own config.
+    值得显式解析：已激活的数据库配置优先于 settings 文件的预设，因此
+    “究竟是哪个模型作答”无法由调用方从自身配置推断出来。
     """
     try:
-        payload = client._control.get(f"{client.base_url}/v1/config").json()
+        payload = client._control.get(
+            f"{client.base_url}/v1/config", headers=client.headers
+        ).json()
     except httpx.HTTPError:
         return "未知"
     active_id = payload.get("active_id")
@@ -270,10 +291,12 @@ def provider_label(client: DemoClient) -> str:
 
 
 def print_closing_metrics(client: DemoClient, settings_path: Path) -> dict:
-    """The demo's closing screen: what the run produced and what it cost."""
+    """演示的收尾画面：本次运行产出了什么、花费了多少。"""
     stats = {}
     try:
-        stats = client._control.get(f"{client.base_url}/v1/cache/stats").json()
+        stats = client._control.get(
+            f"{client.base_url}/v1/cache/stats", headers=client.headers
+        ).json()
     except httpx.HTTPError:
         pass
 
@@ -326,6 +349,7 @@ def run_demos(client: DemoClient, which: str) -> list[TurnResult]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """运行 HTTP 演示主流程：按选择启动或连接服务并执行场景。"""
     parser = argparse.ArgumentParser(description="FinHarness HTTP-driven demo (M5)")
     parser.add_argument("--base-url", help="drive an already-running server instead of spawning one")
     parser.add_argument("--settings", default="settings.json", help="settings file for a spawned server")
@@ -334,6 +358,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--demo", choices=["a", "b", "all"], default="all")
     parser.add_argument("--json", action="store_true", help="print a machine-readable metric summary")
     parser.add_argument("--quiet", action="store_true", help="suppress per-event progress")
+    parser.add_argument(
+        "--user",
+        default=DemoClient.DEFAULT_USERNAME,
+        help="demo account to register/login before running (all /v1 endpoints require auth)",
+    )
     args = parser.parse_args(argv)
 
     server = None
@@ -358,6 +387,7 @@ def main(argv: list[str] | None = None) -> int:
     client = DemoClient(base_url, verbose=not args.quiet)
     results: list[TurnResult] = []
     try:
+        client.login(args.user)
         results = run_demos(client, args.demo)
         closing = print_closing_metrics(client, Path(args.settings))
     finally:

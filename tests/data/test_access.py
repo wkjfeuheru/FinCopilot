@@ -19,7 +19,7 @@ class Adapter(DataAdapter):
 def test_data_access_runs_sync_adapter_off_event_loop():
     raw = asyncio.run(DataAccess([Adapter()]).quote("600519"))
 
-    # endpoint names the interface that actually served the data (docs 3.5.2).
+    # endpoint 标明实际提供数据的 interface（文档 3.5.2）。
     assert raw.endpoint == "fake:fake_quote_api"
     assert raw.df.iloc[0]["close"] == 100.0
     assert raw.from_cache is False

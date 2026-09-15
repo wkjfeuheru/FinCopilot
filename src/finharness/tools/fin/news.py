@@ -1,14 +1,14 @@
-"""Individual-stock or topic market news."""
+"""个股或主题相关的市场新闻。"""
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool, DataInput, PermissionLevel, ToolGroup
 
 
-class NewsInput(BaseModel):
+class NewsInput(DataInput):
     symbol: str | None = Field(default=None, description="个股新闻的6位A股代码，可选")
     topic: str | None = Field(default=None, description="主题关键词（无 symbol 时使用）")
     top_n: int = Field(default=10, description="返回条数")

@@ -17,8 +17,8 @@ export function MessageList({
   messages: Message[];
   citations: Citation[];
 }) {
-  // The same cid keeps the same number across every message, matching the source
-  // sidebar's numbering, so a `[n]` link always lands on the right card.
+  // 同一个 cid 在每条消息中保持相同编号，与数据来源
+  // 侧栏的编号一致，因此 `[n]` 链接总能落到正确的卡片上。
   const citationOrder = useMemo(
     () => new Map(citations.map((item, index) => [item.cid, index + 1])),
     [citations],

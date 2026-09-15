@@ -82,7 +82,9 @@
       "kline": 1,
       "indicators": 7,
       "financials": 365,
-      "announcements": 7
+      "announcements": 7,
+      "macro": 7,
+      "industry": 1
     }
   },
   "context": {
@@ -98,6 +100,25 @@
   "audit": {
     "log_path": "logs/audit.jsonl"
   },
+  "observability": {
+    "logging": {
+      "level": "INFO",
+      "json_format": true,
+      "path": null,
+      "capture_payloads": false,
+      "max_payload_chars": 4000
+    },
+    "metrics": {
+      "enabled": false
+    },
+    "tracing": {
+      "enabled": false,
+      "backend": "langsmith",
+      "project": "finharness",
+      "env_key": "LANGSMITH_API_KEY",
+      "capture_payloads": false
+    }
+  },
   "server": {
     "host": "127.0.0.1",
     "port": 8000,
@@ -106,9 +127,16 @@
     "static_dir": "src/finharness/server/static",
     "allow_remote": false
   },
+  "auth": {
+    "token_ttl_s": 1209600,
+    "min_password_len": 8,
+    "secure_cookie": false,
+    "allow_register": true
+  },
   "paths": {
     "output_dir": "output",
     "memory_db": "data_cache/memory.db",
+    "auth_db": "data_cache/users.db",
     "skills_dir": "skills"
   },
   "search": {
@@ -116,6 +144,8 @@
     "base_url": "https://api.tavily.com",
     "env_key": "TAVILY_API_KEY",
     "timeout_s": 30.0,
-    "api_key": null
+    "api_key": null,
+    "proxy": null,
+    "local_pdf_fallback": true
   }
 }

@@ -2,7 +2,7 @@ import { Empty, Tag } from "antd";
 import type { Citation } from "../api/client";
 import { artifactUrl } from "../api/client";
 
-/** One live line in the agent activity feed. */
+/** 智能体活动流中的一条实时记录。 */
 export type Activity = {
   key: string;
   label: string;

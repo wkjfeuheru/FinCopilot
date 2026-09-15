@@ -293,3 +293,24 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
   .ant-modal .ant-space-item { min-width: 0; max-width: 100%; }
   .ant-modal .ant-input, .ant-modal .ant-input-affix-wrapper, .ant-modal .ant-select { min-width: 0 !important; max-width: 100%; }
 }
+
+/* 登录/注册门：与工作区同族的纸面卡片，居中占据首屏。 */
+.login-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  padding: 34px 36px 22px;
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 2px 5px #18324804;
+}
+.login-card .eyebrow { color: var(--muted); }
+.login-card h1 { margin-bottom: 4px; }

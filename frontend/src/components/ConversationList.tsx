@@ -23,9 +23,9 @@ function formatTime(value: string): string {
 }
 
 /**
- * The conversation picker. Selecting one resumes it: the store holds its
- * transcript, so the client restores the visible history and continues the same
- * memory scope rather than starting fresh.
+ * 对话选择器。选中某一对话即恢复它：存储中保存着其记录，
+ * 因此客户端会还原可见历史，并延续同一记忆作用域，
+ * 而不是从头开始。
  */
 export function ConversationList({
   conversations,
@@ -58,7 +58,7 @@ export function ConversationList({
               className={item.conversation_id === activeId ? "conversation-item active" : "conversation-item"}
               onClick={() => onSelect(item.conversation_id)}
               actions={[
-                // Deleting is destructive and irreversible, so it asks first.
+                // 删除具有破坏性且不可恢复，所以先询问确认。
                 <Popconfirm
                   key="delete"
                   title="删除该对话？"

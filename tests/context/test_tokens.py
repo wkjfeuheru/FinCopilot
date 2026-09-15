@@ -1,4 +1,4 @@
-"""Token counting: exact path, and the documented fallback when unavailable."""
+"""Token 计数：精确路径，以及编码器不可用时文档化的回退方案。"""
 
 from finharness.context.tokens import CHARS_PER_TOKEN, TokenCounter
 
@@ -16,16 +16,16 @@ def test_exact_count_is_used_when_available():
 
     counted = counter.count("贵州茅台最新股价是多少")
 
-    # Whatever the vocabulary, an exact count is reported as exact.
+    # 无论词表如何，精确计数都会按精确上报。
     if counted.exact:
         assert counted.tokens > 0
-    else:  # pragma: no cover - only when the vocabulary cannot be fetched
+    else:  # pragma: no cover - 仅在无法获取词表时才会走到
         assert counted.tokens == int(len("贵州茅台最新股价是多少") / CHARS_PER_TOKEN)
 
 
 def test_fallback_estimates_when_the_encoder_is_unavailable():
     counter = TokenCounter()
-    counter._failed = True  # simulate an unavailable vocabulary
+    counter._failed = True  # 模拟词表不可用
     counter._encoder = None
 
     counted = counter.count("a" * 17)

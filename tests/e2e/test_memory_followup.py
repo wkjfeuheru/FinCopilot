@@ -1,11 +1,10 @@
-"""M4 acceptance on a real provider: a follow-up reuses earlier fetches.
+"""在真实 provider 上进行的 M4 验收：后续追问复用先前的获取结果。
 
-The criterion is "a follow-up fetches incrementally". Here that means the second
-question, asked about a symbol already fetched in the same conversation, should
-not trigger another adapter call — the data is in the conversation's memory and
-the prompt tells the model so.
+验收标准是「后续追问按增量获取」。在这里，这意味着：针对同一会话中已经获取过的
+symbol 再次提问时，不应触发另一次 adapter 调用——数据已在会话的 memory 中，
+prompt 也会告知模型这一点。
 
-Marked ``smoke``: real provider, real data.
+标记为 ``smoke``：真实 provider、真实数据。
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ pytestmark = pytest.mark.smoke
 
 
 class CountingAkShare(AkShareAdapter):
-    """Real adapter that also counts how many fetches actually happened."""
+    """真实 adapter，同时统计实际发生了多少次获取。"""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -91,7 +90,7 @@ def _build(tmp_path):
 
 
 def test_follow_up_reuses_data_and_persists_memory(tmp_path):
-    """Two questions about the same symbol: the second should re-fetch nothing."""
+    """关于同一 symbol 的两个问题：第二次不应重新获取任何数据。"""
     loop, adapter, store = _build(tmp_path)
 
     async def run():
@@ -108,18 +107,18 @@ def test_follow_up_reuses_data_and_persists_memory(tmp_path):
 
     assert first.succeeded is True, first.error
     assert second.succeeded is True, second.error
-    # The conversation's memory persisted, so it can be resumed or inspected.
+    # 会话的 memory 已持久化，因此可以恢复或检查。
     assert store.count_messages("smoke_memory") > 0
     assert store.load_symbols("smoke_memory"), "the covered symbol should be recorded"
-    # The transcript is complete: every question and answer is stored.
+    # 记录是完整的：每个问题和回答都被存储。
     contents = [m.content for m in store.load_messages("smoke_memory")]
     assert any("600519" in (text or "") for text in contents)
-    # The follow-up did not re-fetch everything from scratch.
+    # 后续追问没有从头重新获取全部数据。
     assert adapter.fetches >= fetches_after_first
 
 
 def test_memory_endpoint_reflects_a_real_session(tmp_path):
-    """The read-only memory view is populated by a real run."""
+    """只读的 memory 视图由一次真实运行填充。"""
     loop, _adapter, store = _build(tmp_path)
 
     async def run():

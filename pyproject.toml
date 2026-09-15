@@ -17,8 +17,10 @@ dependencies = [
     "pyarrow>=25.0.1",
     "pydantic>=2.10",
     "pydantic-settings>=2.6",
+    "pypdf>=5.0",
     "python-docx>=1.2.0",
     "pyyaml>=6.0.3",
+    "scipy>=1.14",
     "tiktoken>=0.14.0",
     "uvicorn[standard]>=0.30",
 ]
@@ -28,17 +30,33 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
 ]
+# 可观测性后端（docs 03.14）：核心依赖不含它们，未安装时 metrics/tracing
+# 自动降级为 no-op，只有日志（纯标准库）始终可用。
+observability = [
+    "prometheus-client>=0.21",
+    "langsmith>=0.1.100",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-# Runtime content assets: the system prompt and the skill catalogue are read
-# from disk at run time, so they must ship with the package.
-finharness = ["prompts/*.md", "skills/*/SKILL.md"]
+# Runtime content assets: the system prompt and the scenario skills (a SKILL.md
+# plus its references/*.md and assets/*.md) are read from disk at run time, so
+# all of them must ship with the package.
+finharness = [
+    "prompts/*.md",
+    "skills/*/SKILL.md",
+    "skills/*/references/*.md",
+    "skills/*/assets/*.md",
+]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# The repo root is on the path as well as src/: a few test modules import sibling
+# helpers by their package path (``from tests.data.pdf_fixtures import ...``), and
+# ``tests/`` is a namespace package without an ``__init__.py``, so those imports
+# only resolve when the root itself is importable.
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 # Smoke tests hit real providers and data sources; they run only on demand
 # (``uv run pytest -m smoke``).

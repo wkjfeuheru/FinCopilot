@@ -1,1 +1,1 @@
-"""HTTP and SSE service layer."""
+"""HTTP 与 SSE 服务层。"""

@@ -15,9 +15,9 @@ type Props = {
 };
 
 /**
- * Mid-turn prompt for both cases the engine pauses on: a write tool asking for
- * confirmation (y/n) and the model asking a clarifying question. They share one
- * channel, so they share one dialog.
+ * 用于引擎暂停的两种情形的轮次中提示：写入工具请求
+ * 确认（y/n），以及模型提出澄清问题。它们共用同一个
+ * 通道，因此共用同一个对话框。
  */
 export function InteractionPrompt({ interaction, onRespond, busy }: Props) {
   const [freeText, setFreeText] = useState("");

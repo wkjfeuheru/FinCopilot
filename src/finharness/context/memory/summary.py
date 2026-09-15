@@ -1,14 +1,12 @@
-"""Segmented conversation summaries: the "earlier history" half of L1.
+"""分段式对话摘要：L1 中“更早历史”的那一半。
 
-Compaction does not overwrite one rolling digest. That degrades into a summary of
-a summary — each pass re-summarising the previous one — and loses the oldest
-detail first. Instead every compaction appends a segment covering a message
-range, and only when the segments collectively exceed their budget are the
-*oldest* ones merged into a coarser segment.
+压缩不会覆盖单一滚动摘要。那种做法会退化成“摘要的摘要” —— 每一轮都在重新
+摘要上一轮的摘要 —— 并且最先丢失最旧的细节。相反，每次压缩都会追加一个覆盖
+某段消息区间的分段，只有当这些分段合计超出预算时，才把 *最旧* 的分段合并成
+一个更粗的分段。
 
-The result is graceful decay rather than sudden collapse: recent history keeps
-its fidelity, distant history loses resolution, and each segment records the
-range and tier it covers so the degradation is inspectable.
+结果是优雅地衰减，而不是突然崩塌：近期历史保持其保真度，久远历史降低分辨率，
+每个分段都记录它所覆盖的区间与层级，使这种降级可被检查。
 """
 
 from __future__ import annotations
@@ -23,11 +21,11 @@ LEDGER_CAP = 20
 
 @dataclass
 class SummaryLayer:
-    """Ordered summary segments for one conversation.
+    """某个对话的有序摘要分段。
 
-    ``store`` is optional so the layer also works without persistence (tests,
-    stateless runs): segments then live only in memory for the duration of the
-    loop, which keeps the layered behaviour intact without requiring a database.
+    ``store`` 是可选的，因此该层在没有持久化时也能工作（测试、无状态运行）：
+    此时分段仅在 loop 运行期间存在于内存中，从而在不需要数据库的情况下保持
+    分层行为不变。
     """
 
     conversation_id: str
@@ -58,7 +56,7 @@ class SummaryLayer:
     def add(
         self, *, seq_from: int, seq_to: int, text: str, ledger: list[str] | None = None
     ) -> SummarySegment:
-        """Append a segment covering a message range, then enforce the budget."""
+        """追加一个覆盖某段消息区间的分段，然后强制执行预算。"""
         if self.store is not None:
             segment = self.store.add_summary_segment(
                 self.conversation_id,
@@ -82,27 +80,26 @@ class SummaryLayer:
         return segment
 
     def tokens(self) -> int:
+        """统计本层所有分段占用的 token 总数。"""
         return sum(self.counter.count(segment.text).tokens for segment in self.segments)
 
     def enforce_budget(self) -> int:
-        """Merge the oldest segments until the layer fits, returning merges made.
+        """合并最旧的分段直到本层符合预算，并返回合并次数。
 
-        Merging is deterministic (concatenate, then trim to a share of the
-        budget) rather than another model call: coarsening distant history should
-        be cheap and must not be able to fail.
+        合并是确定性的（先拼接，再裁剪到预算的一个份额），而不是再调用一次模型：
+        粗化久远历史应当开销低廉，且绝不能失败。
         """
         merges = 0
-        # Merge only while more than two segments remain. Collapsing to a single
-        # segment would discard the newest history along with the oldest, which
-        # is the opposite of the intent; the hard cap is applied at render time
-        # by `render(max_tokens)`, so a slightly over-budget pair is fine.
+        # 仅在剩余分段多于两个时才合并。塌缩成单个分段会连同最旧历史一起丢弃
+        # 最新历史，这与本意相反；硬性上限在渲染时由 `render(max_tokens)` 施加，
+        # 因此一对略微超预算的分段是可以接受的。
         while (
             self.budget_tokens > 0
             and len(self.segments) > 2
             and self.tokens() > self.budget_tokens
         ):
             first, second = self.segments[0], self.segments[1]
-            # The merged pair may only take what the newer segments leave free.
+            # 合并后的这一对只能占用较新分段留下的空闲额度。
             remaining = sum(
                 self.counter.count(segment.text).tokens for segment in self.segments[2:]
             )
@@ -122,7 +119,7 @@ class SummaryLayer:
         return merges
 
     def ledger(self) -> tuple[str, ...]:
-        """Aggregate the data-fetch ledger across segments, oldest first."""
+        """汇总各分段的取数台账，按最旧在前排序。"""
         aggregated: list[str] = []
         for segment in self.segments:
             for item in segment.ledger:
@@ -131,7 +128,7 @@ class SummaryLayer:
         return tuple(aggregated)
 
     def render(self, *, max_tokens: int = 0) -> str:
-        """Render for system injection; empty when there is no history yet."""
+        """渲染以供系统注入；尚无历史时返回空字符串。"""
         if not self.segments:
             return ""
         lines = ["【历史摘要】"]
@@ -146,6 +143,7 @@ class SummaryLayer:
 
 
 def _merge_ledger(first: tuple[str, ...], second: tuple[str, ...]) -> tuple[str, ...]:
+    """合并两段台账并去重，只保留最近 ``LEDGER_CAP`` 条。"""
     merged = list(first)
     for item in second:
         if item not in merged:

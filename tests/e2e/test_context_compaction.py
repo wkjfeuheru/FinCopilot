@@ -1,13 +1,12 @@
-"""M4 acceptance: the window stays bounded on a long real session.
+"""M4 验收：在长时间的真实会话中，window 保持有界。
 
-WBS M4 asks for "10 turns without blowing the window". The claim under test is
-therefore about the *window*, not about whether an open-ended research task
-finishes within a turn budget — that depends on the model re-fetching data,
-which is L2's job (deferred). So this asserts:
+WBS M4 的要求是「10 轮而不撑爆 window」。因此这里要检验的主张是关于 *window* 的，
+而不是开放式研究任务能否在轮次预算内完成——那取决于模型是否重新获取数据，
+属于 L2 的职责（已推迟）。因此这里断言：
 
-* compaction engages once the transcript grows,
-* it brings the window back under the budget, and
-* the final window is still inside the model's limit.
+* 一旦记录增长，compaction 就会启动，
+* 它把 window 拉回预算之内，且
+* 最终的 window 仍处于模型的限制之内。
 """
 
 from __future__ import annotations
@@ -32,10 +31,10 @@ from finharness.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.smoke
 
-# Exercise the shipped prompt so the asset itself is under test.
+# 使用随包发布的 prompt，以便该资产本身也处于测试之下。
 SYSTEM_PROMPT = system_prompt()
 
-# Deliberately small so a normal multi-step task crosses it and must compact.
+# 故意设得很小，使常规的多步任务会越过它并必须触发 compact。
 WINDOW_TOKENS = 12000
 
 
@@ -82,7 +81,7 @@ def _build(tmp_path):
 
 
 def test_long_session_keeps_the_window_bounded(tmp_path):
-    """A data-heavy session must compact and stay inside the window."""
+    """数据密集的会话必须触发 compact，并保持在 window 之内。"""
     loop, settings = _build(tmp_path)
 
     async def run():
@@ -96,13 +95,13 @@ def test_long_session_keeps_the_window_bounded(tmp_path):
 
     outcome = asyncio.run(run())
 
-    # A transient provider failure means the window was never really exercised;
-    # report that honestly rather than passing vacuously.
+    # 临时的 provider 故障意味着 window 从未被真正触发；
+    # 应如实报告，而不是空泛地让测试通过。
     if outcome.reason == "provider_error":
         pytest.skip(f"provider error, window not exercised: {outcome.error}")
 
-    # The run may or may not finish within the turn budget, but it must never
-    # have blown the window — that is what M4 delivers.
+    # 该次运行可能在轮次预算内完成，也可能没有，但它绝不能
+    # 撑爆 window——这正是 M4 所保证的。
     hard_limit = WINDOW_TOKENS
     assert loop.compactions, "the session should have grown enough to compact"
     assert loop._window_tokens() < hard_limit, (
@@ -111,12 +110,12 @@ def test_long_session_keeps_the_window_bounded(tmp_path):
     for result in loop.compactions:
         assert result.after_tokens < hard_limit, "compaction must leave room to continue"
         assert result.compacted is True
-    # Either it converged, or it ran out of turns having kept the window small.
+    # 要么它已收敛，要么它在保持 window 较小的前提下用尽了轮次。
     assert outcome.succeeded is True or outcome.reason == "max_turns_exhausted"
 
 
 def test_compaction_engages_on_a_multi_step_task(tmp_path):
-    """A task that crosses the small window must actually trigger compaction."""
+    """越过小 window 的任务必须真正触发 compaction。"""
     loop, _ = _build(tmp_path)
 
     async def run():
@@ -131,6 +130,6 @@ def test_compaction_engages_on_a_multi_step_task(tmp_path):
 
     assert loop.compactions, "a multi-step data task should exceed the small window"
     first = loop.compactions[0]
-    # The reduction must be real, not incidental.
+    # 这种缩减必须是实质性的，而非偶然。
     assert first.after_tokens < first.before_tokens
     assert first.removed > 0

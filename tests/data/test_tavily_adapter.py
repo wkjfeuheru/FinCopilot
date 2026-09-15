@@ -1,8 +1,7 @@
-"""Tavily adapter: request shaping, response parsing, failure isolation.
+"""Tavily adapter：请求构造、响应解析、故障隔离。
 
-Uses httpx's MockTransport so nothing here touches the network — the adapter is
-the boundary where a bad payload would otherwise become a confusing crash
-somewhere downstream.
+使用 httpx 的 MockTransport，因此这里不会触及网络——adapter 正是这样一个
+边界：否则一个坏的 payload 会在下游某处变成令人困惑的崩溃。
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ import pytest
 
 from finharness.data.adapters.base import AdapterError
 from finharness.data.adapters.tavily_adapter import (
-    EXTRACT_INTERFACE,
     SEARCH_INTERFACE,
     TavilyAdapter,
     validate_web_url,
@@ -29,11 +27,11 @@ def make_adapter(handler, *, api_key="k"):
 
 
 def sent_payload(request: httpx.Request) -> dict:
-    """The JSON body the adapter sent, parsed rather than string-matched."""
+    """adapter 发送的 JSON body，经解析得到，而非做字符串匹配。"""
     return json.loads(request.read().decode())
 
 
-# -- search -------------------------------------------------------------------
+# -- 搜索 -------------------------------------------------------------------
 
 
 def test_search_parses_results_into_a_title_url_content_frame():
@@ -60,7 +58,7 @@ def test_search_parses_results_into_a_title_url_content_frame():
     assert result.df.iloc[0]["title"] == "茅台公告"
     assert result.df.iloc[1]["url"] == "https://y.com/b"
     assert captured["url"] == "https://api.tavily.com/search"
-    # The key travels as a bearer header, not as a query parameter.
+    # key 以 bearer header 的形式传输，而不是作为查询参数。
     assert captured["auth"] == "Bearer k"
 
 
@@ -92,7 +90,7 @@ def test_search_omits_filters_when_not_requested():
 
     assert "topic" not in seen["payload"]
     assert "time_range" not in seen["payload"]
-    # Full pages and model-authored answers are deliberately never requested.
+    # 完整页面和由模型生成的答案都刻意从不请求。
     assert seen["payload"]["include_answer"] is False
     assert seen["payload"]["include_raw_content"] is False
 
@@ -118,68 +116,16 @@ def test_search_tolerates_a_missing_results_key():
     assert list(result.df.columns) == ["title", "url", "content"]
 
 
-# -- fetch --------------------------------------------------------------------
-
-
-def test_fetch_url_returns_raw_content():
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["url"] = str(request.url)
-        captured["payload"] = sent_payload(request)
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    {"url": "https://x.com/a", "raw_content": "# 正文\n内容"},
-                ],
-                "failed_results": [],
-            },
-        )
-
-    adapter = make_adapter(handler)
-    result = adapter.fetch_url("https://x.com/a", query="主营构成")
-
-    assert result.interface == EXTRACT_INTERFACE
-    assert result.df.iloc[0]["content"] == "# 正文\n内容"
-    assert captured["url"] == "https://api.tavily.com/extract"
-    assert captured["payload"]["format"] == "markdown"
-    assert captured["payload"]["query"] == "主营构成"
-
-
-def test_fetch_url_reports_the_failed_url_reason():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "results": [],
-                "failed_results": [{"url": "https://x.com/a", "error": "404 Not Found"}],
-            },
-        )
-
-    adapter = make_adapter(handler)
-    with pytest.raises(AdapterError) as exc:
-        adapter.fetch_url("https://x.com/a")
-
-    assert "404 Not Found" in str(exc.value)
+# -- url 筛查（与本地 PDF 抓取共用） --------------------------
 
 
 @pytest.mark.parametrize(
     "url",
     ["file:///etc/passwd", "ftp://host/x", "not-a-url", "javascript:alert(1)"],
 )
-def test_non_http_urls_are_refused_before_any_request(url):
-    called = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        called.append(request)
-        return httpx.Response(200, json={"results": []})
-
-    adapter = make_adapter(handler)
+def test_non_http_urls_are_refused(url):
     with pytest.raises(ValueError):
-        adapter.fetch_url(url)
-
-    assert called == []
+        validate_web_url(url)
 
 
 def test_validate_web_url_accepts_http_and_https():
@@ -187,7 +133,7 @@ def test_validate_web_url_accepts_http_and_https():
     assert validate_web_url("http://example.com") == "http://example.com"
 
 
-# -- failures -----------------------------------------------------------------
+# -- 失败 -----------------------------------------------------------------
 
 
 def test_missing_key_is_reported_as_a_clear_adapter_error():
@@ -198,6 +144,46 @@ def test_missing_key_is_reported_as_a_clear_adapter_error():
 
     assert "未配置" in str(exc.value)
     assert not exc.value.retryable
+
+
+def test_adapter_uses_the_os_proxy_when_none_is_configured(monkeypatch):
+    """httpx 只读取环境变量；requests（以及 akshare）还会读取操作系统的
+    proxy。没有这一点，两者在配置了 proxy 的 host 上会走不同的路由。"""
+    from finharness.data.adapters import tavily_adapter
+
+    monkeypatch.setattr(
+        tavily_adapter.urllib.request,
+        "getproxies",
+        lambda: {"https": "http://127.0.0.1:7890", "http": "http://127.0.0.1:7890"},
+    )
+
+    adapter = TavilyAdapter(api_key="k")
+
+    assert adapter.proxy == "http://127.0.0.1:7890"
+
+
+def test_explicit_proxy_overrides_the_os_proxy(monkeypatch):
+    from finharness.data.adapters import tavily_adapter
+
+    monkeypatch.setattr(
+        tavily_adapter.urllib.request, "getproxies", lambda: {"https": "http://os:1"}
+    )
+
+    adapter = TavilyAdapter(api_key="k", proxy="http://explicit:2")
+
+    assert adapter.proxy == "http://explicit:2"
+
+
+def test_proxy_discovery_failure_is_tolerated(monkeypatch):
+    """没有 proxy 支持的机器不得导致搜索失败。"""
+    from finharness.data.adapters import tavily_adapter
+
+    def boom():
+        raise OSError("no proxy subsystem")
+
+    monkeypatch.setattr(tavily_adapter.urllib.request, "getproxies", boom)
+
+    assert TavilyAdapter(api_key="k").proxy is None
 
 
 @pytest.mark.parametrize(
@@ -234,7 +220,7 @@ def test_non_json_response_is_an_adapter_error():
 
 
 def test_unsupported_topic_is_refused_without_a_request():
-    """topic=finance is broken for Chinese queries, so it is rejected up front."""
+    """对于中文查询，topic=finance 是有问题的，因此会事先被拒绝。"""
     called = []
 
     def handler(request: httpx.Request) -> httpx.Response:

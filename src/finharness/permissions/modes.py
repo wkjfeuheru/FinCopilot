@@ -1,4 +1,4 @@
-"""Permission modes and verdicts (docs 03.7.1)."""
+"""权限模式与裁决（docs 03.7.1）。"""
 
 from __future__ import annotations
 

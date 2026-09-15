@@ -1,8 +1,7 @@
-"""calc_valuation: DCF and comparable-company valuation (docs 3.4.4).
+"""calc_valuation：DCF 与可比公司估值（文档 3.4.4）。
 
-The model supplies the assumptions; the tool computes and presents them. It
-never invents a growth rate or a discount rate, and it never states a buy or
-sell conclusion — those would be unsupported by the numbers alone.
+假设由模型提供；工具只负责计算与呈现。它绝不臆造增长率或折现率，
+也绝不给出买入或卖出结论——仅凭数字无法支撑这类结论。
 """
 
 from __future__ import annotations
@@ -62,6 +61,7 @@ class CalcValuationTool(BaseTool):
 
     # -- DCF -----------------------------------------------------------------
     def _dcf(self, symbol: str, assumptions: dict) -> str:
+        """校验必要假设并渲染 DCF 估值表：按各情景增长率给出每股价值，附敏感性矩阵。"""
         required = ("base_fcf", "wacc", "terminal_growth", "growth_rates", "shares")
         missing = [key for key in required if key not in assumptions]
         if missing:
@@ -79,8 +79,7 @@ class CalcValuationTool(BaseTool):
         if not isinstance(growth_rates, dict) or not growth_rates:
             raise ValueError("growth_rates 需为映射，如 {悲观:0.05, 中性:0.10, 乐观:0.15}")
 
-        # The terminal value formula diverges when g >= WACC; refuse rather than
-        # print a meaningless number.
+        # 当 g >= WACC 时终值公式发散；此时拒绝计算，而不是打印一个无意义的数字。
         if terminal_growth >= wacc:
             raise ValueError(
                 f"永续增长率（{terminal_growth:.2%}）必须小于 WACC（{wacc:.2%}），否则终值无意义"
@@ -105,11 +104,13 @@ class CalcValuationTool(BaseTool):
         rows.append(self._sensitivity(base_fcf, growth_rates, wacc, terminal_growth, years, shares))
         rows.append("")
         rows.append("说明：以上为给定假设下的计算区间，**不构成投资建议**；"
-                    "假设变动对结果影响显著，请结合 dcf-valuation 技能核对取值依据。")
+                    "假设变动对结果影响显著，请结合 equity-research 场景的估值方法论"
+                    "（references/valuation.md）核对取值依据。")
         return "\n".join(rows)
 
     @staticmethod
     def _dcf_value(base_fcf: float, growth: float, wacc: float, terminal_growth: float, years: int) -> float:
+        """按给定假设计算现金流折现总额（元）：各年现金流增长后折现，另加永续终值。"""
         cash = base_fcf
         present = 0.0
         for year in range(1, years + 1):
@@ -122,7 +123,7 @@ class CalcValuationTool(BaseTool):
         self, base_fcf: float, growth_rates: dict, wacc: float,
         terminal_growth: float, years: int, shares: float,
     ) -> str:
-        """Two-way grid over WACC and the central growth assumption."""
+        """在 WACC 与居中增长率两个维度上做双向网格，输出每股价值的敏感性矩阵。"""
         central = float(growth_rates.get("中性") or next(iter(growth_rates.values())))
         wacc_axis = [wacc - 0.01, wacc, wacc + 0.01]
         growth_axis = [central - 0.02, central, central + 0.02]
@@ -139,8 +140,9 @@ class CalcValuationTool(BaseTool):
             lines.append(f"| {rate:.1%} | " + " | ".join(cells) + " |")
         return "\n".join(lines)
 
-    # -- comps ---------------------------------------------------------------
+    # -- 可比公司 ---------------------------------------------------------------
     def _comps(self, symbol: str, metrics: dict) -> str:
+        """校验必要输入并渲染可比公司相对估值：用可比组 PE/PB 中位数乘以目标标的分母得每股价值。"""
         required = ("pe_median", "target_eps")
         missing = [key for key in required if key not in metrics]
         if missing:
@@ -157,6 +159,6 @@ class CalcValuationTool(BaseTool):
             pb_value = float(metrics["pb_median"]) * float(metrics["target_bvps"])
             lines.append(f"- 按 PB 推算每股价值：**{pb_value:,.2f} 元**")
         lines.append("")
-        lines.append("说明：中位数须来自可比组（见 valuation-comps 技能的选取标准）；"
-                    "亏损公司的 PE 不可用。以上**不构成投资建议**。")
+        lines.append("说明：中位数须来自可比组（见 equity-research 场景 references/valuation.md "
+                    "的可比选取标准）；亏损公司的 PE 不可用。以上**不构成投资建议**。")
         return "\n".join(lines)

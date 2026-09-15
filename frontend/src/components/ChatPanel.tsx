@@ -3,6 +3,7 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -18,7 +19,7 @@ import type { AgentStep, TurnTrace } from "./AgentTrace";
 type Props = {
   sessionId: string | null;
   conversationId: string | null;
-  /** History restored from the store when resuming a conversation. */
+  /** 恢复对话时从存储中还原的历史消息。 */
   initialMessages: Message[];
   onSession: (sessionId: string, conversationId: string | null) => void;
   configured: boolean;
@@ -28,18 +29,19 @@ type Props = {
   activities: Activity[];
   onActivities: (update: (current: Activity[]) => Activity[]) => void;
   /**
-   * Snapshot kept by the parent for this conversation. The server only persists
-   * readable turns, so the execution trace and produced files exist client-side
-   * and would otherwise vanish when switching away and back.
+   * 父组件为这个对话保存的快照。服务端只持久化
+   * 可读轮次，因此执行 trace 由客户端内存快照保留；
+   * 产出文件随之保存在各步的 attachments 中，刷新后
+   * 仍能从持久化的轮次事件里还原。
    */
   cachedView?: ChatView;
 };
 
-/** A file the engine produced (chart, report) that the user can download. */
+/** 引擎产出的、用户可下载的文件（图表、研报）。 */
 export type Artifact = { path: string; name: string };
 
-/** The client-only part of a conversation view: messages (with trace) + files. */
-export type ChatView = { messages: Message[]; artifacts: Artifact[] };
+/** 对话视图中仅存在于客户端的部分：消息（含 trace 与产出文件）。 */
+export type ChatView = { messages: Message[] };
 
 export type ChatPanelHandle = { snapshot: () => ChatView };
 
@@ -48,7 +50,27 @@ function fileName(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-/** Human-readable label for a tool/skill call in the activity feed. */
+/** 消息 trace 中各步产出的文件，按出现顺序去重。
+ *
+ * 文件挂在步骤上（而非仅存在客户端状态里），因此实时一轮与刷新后
+ * 从持久化轮次事件还原的历史，都会显示出同一份“产出文件”。
+ */
+function artifactsFromMessages(messages: Message[]): Artifact[] {
+  const seen = new Set<string>();
+  const items: Artifact[] = [];
+  for (const message of messages) {
+    for (const step of message.trace?.steps ?? []) {
+      for (const path of step.attachments ?? []) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        items.push({ path, name: fileName(path) });
+      }
+    }
+  }
+  return items;
+}
+
+/** 活动流中工具/Skill 调用的可读标签。 */
 function activityLabel(name: string): string {
   if (name === "load_skill") return "加载技能";
   if (name === "list_skills") return "检索技能";
@@ -94,39 +116,41 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
   },
   ref,
 ) {
-  // Seeded from the parent's snapshot first (so switching back restores the
-  // trace and produced files), falling back to restored server history.
+  // 优先用父组件的快照初始化（这样切回时能恢复 trace 与
+  // 产出文件），否则回退到还原的服务端历史。
   const [messages, setMessages] = useState<Message[]>(() =>
     cachedView && cachedView.messages.length > 0 ? cachedView.messages : initialMessages,
   );
+  // 产出文件直接从消息 trace 派生：实时一轮与刷新后还原的历史
+  // 走同一条路径，因此不再需要单独的客户端文件状态。
+  const artifacts = useMemo(() => artifactsFromMessages(messages), [messages]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [interaction, setInteraction] = useState<Interaction | null>(null);
-  const [artifacts, setArtifacts] = useState<Artifact[]>(() => cachedView?.artifacts ?? []);
   const [notice, setNotice] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const runStartedRef = useRef(0);
   const firstTokenRef = useRef<number | null>(null);
-  // The current stream's handles, updated as the session event arrives. They let
-  // each tool completion refresh the right conversation's citations.
+  // 当前流的句柄，随 session 事件到达而更新。它们让每次工具完成
+  // 都能刷新正确对话的 citations。
   const streamIdsRef = useRef<{ session: string | null; conversation: string | null }>({
     session: sessionId,
     conversation: conversationId,
   });
-  // Latest view for the parent to snapshot on switch. Kept in a ref so the
-  // parent can read it imperatively without re-rendering on every token.
-  const latestViewRef = useRef<ChatView>({ messages, artifacts });
-  // The parent remounts this panel on switch, but the stream it started keeps
-  // running; without this guard its events would leak into the next conversation.
+  // 供父组件在切换时做快照的最新视图。保存在 ref 中，以便
+  // 父组件能命令式读取，而不必在每个 token 时重新渲染。
+  const latestViewRef = useRef<ChatView>({ messages });
+  // 切换时父组件会重新挂载此面板，但它启动的流仍会继续
+  // 运行；没有这道防护，其事件会泄漏到下一个对话。
   const mountedRef = useRef(true);
 
   useEffect(() => {
-    latestViewRef.current = { messages, artifacts };
-  }, [messages, artifacts]);
+    latestViewRef.current = { messages };
+  }, [messages]);
 
   useEffect(() => {
-    // Reset on mount too: StrictMode mounts, cleans up, then mounts again.
+    // 挂载时也要重置：StrictMode 会先挂载、再清理、然后再挂载。
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
@@ -139,9 +163,9 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
     if (mountedRef.current) onActivities(update);
   }
 
-  // Restored history arrives asynchronously, after this component has already
-  // mounted with an empty list. Sync it in, but never clobber a conversation the
-  // user has already started typing into in this session.
+  // 还原的历史是异步到达的，此时本组件已经以空列表
+  // 挂载完成。把它同步进来，但绝不要覆盖用户
+  // 本次会话中已经开始输入的对话。
   useEffect(() => {
     setMessages((current) => (current.length === 0 ? initialMessages : current));
   }, [initialMessages]);
@@ -150,18 +174,6 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
     const { session, conversation } = streamIdsRef.current;
     void fetchCitations(conversation, session).then((data) => {
       if (mountedRef.current) onCitations(data);
-    });
-  }
-
-  function rememberArtifacts(raw: unknown) {
-    const paths = (raw as string[] | undefined) ?? [];
-    if (paths.length === 0) return;
-    setArtifacts((current) => {
-      const seen = new Set(current.map((item) => item.path));
-      const added = paths
-        .filter((path) => !seen.has(path))
-        .map((path) => ({ path, name: fileName(path) }));
-      return added.length ? [...current, ...added] : current;
     });
   }
 
@@ -235,7 +247,6 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
               { key: callId, label: activityLabel(name), status: "running" },
             ]);
           } else {
-            rememberArtifacts(event.data.attachments);
             const attachments = (event.data.attachments as string[] | undefined) ?? [];
             const duration = Number(event.data.duration_ms ?? 0);
             const stepStatus = event.data.ok === false ? "error" as const : "done" as const;
@@ -248,6 +259,8 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
                 status: stepStatus,
                 durationMs: duration > 0 ? duration : undefined,
                 detail: event.data.ok === false ? String(event.data.error ?? "执行失败") : undefined,
+                // 文件随步骤保存，使其与刷新后还原的历史走同一渲染路径。
+                attachments: attachments.length ? attachments : undefined,
               };
               return {
                 ...trace,
@@ -275,8 +288,8 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
             if ((event.data.citations as string[] | undefined)?.length) refreshCitations();
           }
         }
-        // Engine notices the UI should not swallow: window compaction and the
-        // loop guard both change what the user is looking at.
+        // 引擎通知，UI 不应吞掉：窗口压缩与
+        // 循环防护都会改变用户正在看的内容。
         if (event.event === "context_compacted") {
           const before = Number(event.data.before_tokens ?? 0);
           const after = Number(event.data.after_tokens ?? 0);
@@ -331,8 +344,42 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
             },
           ]);
         }
+        if (event.event === "plan_progress") {
+          const revision = Number(event.data.revision ?? 1);
+          const done = Number(event.data.done ?? 0);
+          const total = Number(event.data.total ?? 0);
+          const drift = (event.data.drift as string[] | undefined) ?? [];
+          const mismatch = (event.data.mismatch as string[] | undefined) ?? [];
+          const stalled = Number(event.data.stalled_turns ?? 0);
+          const detail = [
+            `进度 ${done}/${total}`,
+            revision > 1 ? `第 ${revision} 版` : "",
+            drift.length ? `目标外：${drift.join("、")}` : "",
+            mismatch.length ? `能力外：${mismatch.join("、")}` : "",
+            stalled ? `停滞 ${stalled} 轮` : "",
+          ].filter(Boolean).join(" · ");
+          updateTrace((trace) => ({
+            ...trace,
+            planned: true,
+            steps: trace.steps.some((step) => step.kind === "plan")
+              ? trace.steps.map((step) => step.kind === "plan" ? { ...step, detail } : step)
+              : [...trace.steps, {
+                key: "plan-progress",
+                kind: "plan" as const,
+                label: "研究计划进度",
+                status: "info" as const,
+                detail,
+              }],
+          }));
+          const offPlan = [...drift, ...mismatch];
+          if (offPlan.length || stalled) {
+            setNotice(offPlan.length
+              ? `计划偏离：本轮触及了计划未涵盖的标的或能力（${offPlan.join("、")}）`
+              : `计划已停滞 ${stalled} 轮，等待模型回写或修订`);
+          }
+        }
         if (event.event === "interactive_request") {
-          // The engine is paused awaiting an answer; surface the dialog.
+          // 引擎已暂停，等待回答；弹出该对话框。
           const prompt = String(event.data.prompt ?? "");
           setInteraction({
             requestId: String(event.data.request_id ?? ""),
@@ -361,8 +408,8 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           ]);
         }
         if (event.event === "text_reset") {
-          // The round turned out to be a tool call; drop the draft that streamed
-          // before it so only the final answer remains.
+          // 本轮结果是一次工具调用；丢弃此前流式输出的草稿，
+          // 只保留最终答案。
           updateActiveAssistant((assistant) => ({
             ...assistant,
             text: "",
@@ -397,7 +444,26 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
             status: "error",
             steps: trace.steps.map((step) => step.status === "running" ? { ...step, status: "error" as const } : step),
           }));
-          setMessages((current) => [...current, { role: "error", text: String(event.data.message ?? "Unknown error") }]);
+          // 优先使用通俗易懂的提示，而非引擎原始消息；``reason``
+          // 用于区分预算耗尽与供应商失败。
+          const reasonText: Record<string, string> = {
+            loop_detected: "检测到重复取数，已提前结束本轮",
+            max_turns_exhausted: "达到轮次上限，已提前结束本轮",
+            provider_error: "模型调用失败，本轮未能完成",
+          };
+          const reason = String(event.data.reason ?? "");
+          const message = String(event.data.message ?? "Unknown error");
+          setMessages((current) => [...current, { role: "error", text: reasonText[reason] ?? message }]);
+        }
+        if (event.event === "answer") {
+          // 以单个事件送达的终止性答案（主要是失败运行的部分
+          // 发现结果）。用赋值而非追加：成功时流式 delta 已经
+          // 包含同样的文本，所以这里是空操作；
+          // 失败时 delta 已被重置，所以这里用于还原发现结果。
+          updateActiveAssistant((assistant) => ({
+            ...assistant,
+            text: String(event.data.text ?? assistant.text),
+          }));
         }
         if (event.event === "done") {
           const usage = (event.data.usage as Record<string, unknown> | undefined) ?? {};

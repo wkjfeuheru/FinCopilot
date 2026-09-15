@@ -1,4 +1,4 @@
-"""Explicit offline provider used by tests and local UI development."""
+"""用于测试与本地 UI 开发的显式离线 provider。"""
 
 from collections.abc import AsyncIterator, Iterable
 

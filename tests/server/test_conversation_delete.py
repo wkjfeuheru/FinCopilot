@@ -1,10 +1,11 @@
-"""Deleting a conversation: removes its scoped memory, spares global state."""
+"""删除对话：移除其作用域内的记忆，保留该用户的偏好。"""
 
 from fastapi.testclient import TestClient
 
 from finharness.config.settings import Settings
 from finharness.provider.fake import FakeProvider
 from finharness.server.api import create_app
+from tests.server.conftest import authed_client
 
 
 def make_client(tmp_path) -> TestClient:
@@ -12,7 +13,9 @@ def make_client(tmp_path) -> TestClient:
         paths={"memory_db": tmp_path / "memory.db", "output_dir": tmp_path / "output"},
         data={"cache_dir": tmp_path / "cache"},
     )
-    return TestClient(create_app(provider=FakeProvider(["ok"]), settings=settings))
+    return authed_client(
+        TestClient(create_app(provider=FakeProvider(["ok"]), settings=settings))
+    )
 
 
 def conversation_id_from(text: str) -> str:
@@ -33,7 +36,7 @@ def test_delete_removes_the_conversation(tmp_path):
 
 
 def test_delete_removes_the_scoped_memory(tmp_path):
-    """Conclusions and citations go with the conversation, not just its listing."""
+    """结论与引用随对话一同删除，而不只是删除列表项。"""
     client = make_client(tmp_path)
     first = client.post("/v1/chat/stream", json={"message": "对话"})
     cid = conversation_id_from(first.text)
@@ -59,16 +62,17 @@ def test_delete_leaves_other_conversations_alone(tmp_path):
     assert remaining == [keep]
 
 
-def test_delete_spares_global_preferences(tmp_path):
-    """Preferences are shared across conversations, so deleting one keeps them."""
+def test_delete_spares_user_preferences(tmp_path):
+    """偏好由该用户的所有对话共享，因此删除其中一个对话会保留它们。"""
     client = make_client(tmp_path)
     cid = conversation_id_from(client.post("/v1/chat/stream", json={"message": "对话"}).text)
     store = client.app.state.memory_store
-    store.set_note("report_style", "简洁")
+    user_id = client.finharness_user["id"]
+    store.set_note("report_style", "简洁", user_id=user_id)
 
     client.delete(f"/v1/conversations/{cid}")
 
-    assert store.get_notes() == {"report_style": "简洁"}
+    assert store.get_notes(user_id=user_id) == {"report_style": "简洁"}
 
 
 def test_delete_unknown_conversation_is_a_404(tmp_path):
@@ -78,7 +82,7 @@ def test_delete_unknown_conversation_is_a_404(tmp_path):
 
 
 def test_delete_is_refused_while_the_conversation_is_busy(tmp_path):
-    """Deleting mid-request would leave the running loop persisting into nothing."""
+    """在请求进行中删除，会使正在运行的循环向已不存在的目标持久化数据。"""
     client = make_client(tmp_path)
     cid = conversation_id_from(client.post("/v1/chat/stream", json={"message": "对话"}).text)
     registry = client.app.state.session_registry
@@ -93,12 +97,12 @@ def test_delete_is_refused_while_the_conversation_is_busy(tmp_path):
 
 
 def test_deleted_conversation_can_be_recreated_under_the_same_id(tmp_path):
-    """Deleting frees the id; a client echoing a stale id starts fresh."""
+    """删除会释放该 id；客户端若回传过期的 id，则从头开始新对话。"""
     client = make_client(tmp_path)
     cid = conversation_id_from(client.post("/v1/chat/stream", json={"message": "第一问"}).text)
     client.delete(f"/v1/conversations/{cid}")
 
-    # Reusing the id should not resurrect the deleted history.
+    # 复用该 id 不应使已删除的历史复活。
     client.post("/v1/chat/stream", json={"conversation_id": cid, "message": "第二问"})
 
     store = client.app.state.memory_store

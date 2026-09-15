@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ConfigProvider, Tag } from "antd";
+import { Button, ConfigProvider, Tag } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import { ConversationList } from "./components/ConversationList";
 import { ChatPanel } from "./components/ChatPanel";
 import type { ChatPanelHandle, ChatView } from "./components/ChatPanel";
+import { LoginScreen } from "./components/LoginScreen";
 import { SessionBar } from "./components/SessionBar";
 import { SettingsModal } from "./components/SettingsModal";
 import { traceFromStoredTurn } from "./components/AgentTrace";
@@ -11,6 +12,9 @@ import { SourceSidebar } from "./components/SourceSidebar";
 import type { Activity } from "./components/SourceSidebar";
 import { fetchConfig } from "./api/config";
 import type { ConfigSnapshot } from "./api/config";
+import { fetchMe, logout } from "./api/auth";
+import type { AuthUser } from "./api/auth";
+import { AUTH_EXPIRED_EVENT } from "./api/http";
 import {
   deleteConversation,
   fetchCitations,
@@ -20,12 +24,17 @@ import {
 import type { Citation, ConversationSummary, HistoryMessage } from "./api/client";
 
 const EMPTY_CONFIG: ConfigSnapshot = { configured: false, active_id: null, configs: [] };
-// Remembering the conversation locally is what lets a reload resume it: the
-// server's conversation store outlives the execution session, but only the
-// client knows which conversation the user was reading.
-const STORAGE_KEY = "finharness.conversation_id";
+// 在本地记住对话，才能让页面刷新后恢复它：服务端的对话存储
+// 比执行会话存活更久，但只有客户端知道用户当时
+// 正在阅读哪个对话。按用户分键，换账号登录不会串到
+// 另一个用户上次打开的对话。
+const STORAGE_KEY_PREFIX = "finharness.conversation_id";
 
-/** Rebuild the activity feed from a saved trace, for a conversation's history. */
+function storageKeyFor(userId: string): string {
+  return `${STORAGE_KEY_PREFIX}.${userId}`;
+}
+
+/** 从已保存的 trace 重建活动流，用于某个对话的历史记录。 */
 function activitiesFromView(view: ChatView | undefined): Activity[] {
   if (!view) return [];
   const activities: Activity[] = [];
@@ -38,6 +47,7 @@ function activitiesFromView(view: ChatView | undefined): Activity[] {
         status:
           step.status === "error" ? "error" : step.status === "running" ? "running" : "done",
         detail: step.detail ?? (step.durationMs ? `耗时 ${step.durationMs} ms` : undefined),
+        attachments: step.attachments,
       });
     }
   }
@@ -45,26 +55,27 @@ function activitiesFromView(view: ChatView | undefined): Activity[] {
 }
 
 function App() {
+  // 认证门：null 表示还在探测会话，undefined 表示未登录。
+  const [user, setUser] = useState<AuthUser | null | undefined>(undefined);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [conversationId, setConversationId] = useState<string | null>(() =>
-    window.localStorage.getItem(STORAGE_KEY),
-  );
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const [sessionVersion, setSessionVersion] = useState(0);
   const [snapshot, setSnapshot] = useState<ConfigSnapshot | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [history, setHistory] = useState<HistoryMessage[]>([]);
-  // Which conversation the loaded `history` belongs to. Without this the
-  // transcript from the previously open conversation would be seeded into the
-  // newly selected one while its own history is still loading.
+  // 已加载的 `history` 属于哪个对话。没有它，之前打开的对话
+  // 的记录会在新选中的对话自身历史仍在加载时
+  // 被误填入其中。
   const [historyConversationId, setHistoryConversationId] = useState<string | null>(null);
   const [loadingConversations, setLoadingConversations] = useState(false);
   const [citations, setCitations] = useState<Citation[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
-  // Conversations this client has already rendered, keyed by conversation id.
-  // Keep the fully rendered view while navigating. Historical answers can
-  // rebuild their traces from the server; locally produced file cards still
-  // benefit from this immediate in-memory restore.
+  // 本客户端已渲染过的对话，以 conversation id 为键。
+  // 在切换时保留完整渲染的视图。历史回答可以从服务端
+  // 重建其 trace；产出文件保存在各步的 attachments 中，
+  // 因此无论是这个内存快照还是服务端还原的轮次，
+  // 都能还原“产出文件”一栏。
   const viewCacheRef = useRef(new Map<string, ChatView>());
   const chatRef = useRef<ChatPanelHandle>(null);
 
@@ -90,15 +101,43 @@ function App() {
     }
   }, []);
 
+  // 挂载时探测会话；任何 API 返回 401（会话过期/被撤销）时回到登录页。
   useEffect(() => {
+    void fetchMe().then((me) => setUser(me));
+    const onExpired = () => {
+      setUser(undefined);
+      setConversationId(null);
+      setConversations([]);
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onExpired);
+  }, []);
+
+  // 登录后恢复该用户上次打开的对话；每个用户的对话句柄分键存放。
+  useEffect(() => {
+    if (!user) return;
+    setConversationId(window.localStorage.getItem(storageKeyFor(user.id)));
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) return;
     void refreshConfig().then((data) => {
       if (!data.configured) setSettingsOpen(true);
     });
     void refreshConversations();
-  }, [refreshConfig, refreshConversations]);
+  }, [user, refreshConfig, refreshConversations]);
 
-  // Restore the stored conversation's transcript so the reader sees where they
-  // left off, and continue the same memory scope.
+  async function handleLogout() {
+    await logout();
+    setUser(undefined);
+    setConversationId(null);
+    setConversations([]);
+    setSessionId(null);
+    viewCacheRef.current.clear();
+  }
+
+  // 恢复已存储对话的记录，让读者看到上次读到的地方，
+  // 并延续同一记忆作用域。
   useEffect(() => {
     if (!conversationId) {
       setHistory([]);
@@ -106,8 +145,8 @@ function App() {
       setCitations([]);
       return;
     }
-    // Ignore a late response if the user has already switched to another
-    // conversation: only the effect for the currently selected id may apply.
+    // 如果用户已切换到另一个对话，则忽略迟到的响应：
+    // 只有当前选中 id 对应的 effect 才能生效。
     let cancelled = false;
     void loadConversationMessages(conversationId)
       .then((messages) => {
@@ -120,8 +159,8 @@ function App() {
         setHistory([]);
         setHistoryConversationId(conversationId);
       });
-    // Sources are recovered from the store too, so a resumed (or restarted)
-    // conversation still shows the data it was built on.
+    // 数据来源也一并从存储中恢复，因此恢复（或重启）的
+    // 对话仍会显示它所依据的数据。
     void fetchCitations(conversationId, null).then((data) => {
       if (!cancelled) setCitations(data);
     });
@@ -131,12 +170,15 @@ function App() {
   }, [conversationId]);
   function rememberConversation(id: string | null) {
     setConversationId(id);
-    if (id) window.localStorage.setItem(STORAGE_KEY, id);
-    else window.localStorage.removeItem(STORAGE_KEY);
+    // 已登录时才写入本地存储；键按用户区分。
+    if (!user) return;
+    const key = storageKeyFor(user.id);
+    if (id) window.localStorage.setItem(key, id);
+    else window.localStorage.removeItem(key);
   }
 
-  // Save what the panel is currently showing against the open conversation
-  // before navigating away from it.
+  // 在离开当前打开的对话之前，把面板当前展示的内容
+  // 保存到该对话下。
   function cacheCurrentView() {
     const view = chatRef.current?.snapshot();
     if (conversationId && view && view.messages.length > 0) {
@@ -145,8 +187,8 @@ function App() {
   }
 
   function startNewConversation() {
-    // Drop only the client handle: history for the old conversation stays in the
-    // store and remains reachable from the list.
+    // 只丢弃客户端的凭据：旧对话的历史仍保留在
+    // 存储中，并可从列表中访问。
     cacheCurrentView();
     rememberConversation(null);
     setSessionId(null);
@@ -160,11 +202,11 @@ function App() {
     try {
       await deleteConversation(id);
     } catch {
-      // The list refresh below is the source of truth; a failure here just
-      // leaves the row in place.
+      // 下面的列表刷新才是准绳；这里失败只会
+      // 让该行维持原样。
     }
-    // Deleting the conversation being viewed returns the UI to a fresh state,
-    // and drops whatever this client had cached for it.
+    // 删除正在查看的对话会让 UI 回到全新状态，
+    // 并丢弃本客户端为它缓存的一切。
     if (id === conversationId) startNewConversation();
     viewCacheRef.current.delete(id);
     await refreshConversations();
@@ -173,15 +215,15 @@ function App() {
   function selectConversation(id: string) {
     if (id === conversationId) return;
     cacheCurrentView();
-    // Restore the cached activity feed immediately while history is loading.
+    // 在历史加载期间立即恢复缓存的活动流。
     setActivities(activitiesFromView(viewCacheRef.current.get(id)));
     rememberConversation(id);
     setSessionId(null);
     setSessionVersion((version) => version + 1);
   }
 
-  // The server allocates the conversation id on the first turn of a new
-  // conversation; adopt it so the next turn (and the list) can reference it.
+  // 服务端会在新对话的第一轮分配 conversation id；采纳它，
+  // 以便下一轮（以及列表）可以引用它。
   function handleSession(session: string, conversation: string | null) {
     setSessionId(session);
     if (conversation && conversation !== conversationId) {
@@ -190,9 +232,9 @@ function App() {
     }
   }
 
-  // Stable identity: a fresh array every render would re-trigger the child's
-  // history-sync effect on each pass. Only surface history once it belongs to
-  // the selected conversation, so a switch never seeds the old transcript.
+  // 稳定标识：每次渲染都新建数组会在每一轮重新触发子组件的
+  // 历史同步 effect。只有在历史属于当前选中的对话时才暴露它，
+  // 这样切换时绝不会填入旧记录。
   const restoredMessages = useMemo(
     () =>
       historyConversationId === conversationId
@@ -209,6 +251,23 @@ function App() {
   );
 
   const active = snapshot?.configs.find((config) => config.is_active) ?? null;
+
+  // 认证门：未登录整页替换为登录/注册界面。
+  if (!user) {
+    return (
+      <ConfigProvider locale={zhCN} theme={{ token: { motion: false, colorPrimary: "#176b63", colorInfo: "#176b63", borderRadius: 6, fontFamily: '"Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif', fontSize: 13 } }}>
+        <LoginScreen
+          onSuccess={(u) => {
+            setUser(u);
+            setSessionId(null);
+            setHistory([]);
+            setCitations([]);
+            setActivities([]);
+          }}
+        />
+      </ConfigProvider>
+    );
+  }
 
   return (
     <ConfigProvider locale={zhCN} theme={{ token: {
@@ -232,23 +291,31 @@ function App() {
             <p className="eyebrow">FINANCIAL RESEARCH COPILOT</p>
             <h1>FinHarness</h1>
           </div>
-          <button
-            type="button"
-            className="status-pill provider-chip"
-            onClick={() => setSettingsOpen(true)}
-            title="点击配置模型供应商"
-          >
-            {active ? (
-              <>
-                <Tag color="blue" style={{ marginInlineEnd: 6 }}>
-                  {active.name}
-                </Tag>
-                {active.model}
-              </>
-            ) : (
-              "未配置供应商"
-            )}
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <button
+              type="button"
+              className="status-pill provider-chip"
+              onClick={() => setSettingsOpen(true)}
+              title="点击配置模型供应商"
+            >
+              {active ? (
+                <>
+                  <Tag color="blue" style={{ marginInlineEnd: 6 }}>
+                    {active.name}
+                  </Tag>
+                  {active.model}
+                </>
+              ) : (
+                "未配置供应商"
+              )}
+            </button>
+            <span className="status-pill" title={`当前用户：${user.username}`}>
+              {user.username}
+            </span>
+            <Button size="small" onClick={() => void handleLogout()}>
+              退出
+            </Button>
+          </div>
         </header>
         <section className="workspace">
           <div className="workspace-body">

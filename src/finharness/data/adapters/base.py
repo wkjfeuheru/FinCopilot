@@ -1,4 +1,4 @@
-"""Anti-corruption layer contract for external data sources (docs 03.5.2)."""
+"""外部数据源的防腐层（anti-corruption layer）契约（docs 03.5.2）。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pandas as pd
 
 
 class AdapterError(RuntimeError):
-    """A source failure carrying enough detail for fallback orchestration."""
+    """数据源失败，携带足够细节供回退编排使用。"""
 
     def __init__(self, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
@@ -22,18 +22,17 @@ class AdapterError(RuntimeError):
 
 @dataclass(slots=True)
 class FetchResult:
-    """A source payload plus the exact interface that served it (for citations)."""
+    """数据源载荷，以及实际提供该数据的接口（用于引用）。"""
 
     df: pd.DataFrame
     interface: str
 
 
 class DataAdapter(ABC):
-    """Each source implements the semantic fetches it can serve.
+    """每个数据源实现其能够提供的语义化抓取方法。
 
-    Unsupported methods raise ``NotImplementedError`` from the base, letting the
-    orchestrator treat "this source has no such endpoint" as an ordinary
-    fallback reason instead of a crash.
+    未实现的方法由基类抛出 ``NotImplementedError``，从而让编排器把
+    "该数据源没有此接口" 当作普通的回退原因，而不是程序崩溃。
     """
 
     name = "adapter"
@@ -60,4 +59,37 @@ class DataAdapter(ABC):
         raise NotImplementedError
 
     def fetch_announcements(self, symbol: str, since: str, top_n: int) -> FetchResult:
+        raise NotImplementedError
+
+    def fetch_research_reports(
+        self,
+        report_type: str,
+        industry: str | None,
+        institution: str | None,
+        keyword: str | None,
+        start_date: str | None,
+        end_date: str | None,
+        top_n: int,
+        with_text: bool,
+    ) -> FetchResult:
+        raise NotImplementedError
+
+    def fetch_macro(self, indicators: list[str], years: int) -> FetchResult:
+        raise NotImplementedError
+
+    def fetch_industry_perf(self, industry: str | None, years: int) -> FetchResult:
+        raise NotImplementedError
+
+    def fetch_industry_constituents(self, industry: str) -> FetchResult:
+        raise NotImplementedError
+
+    def fetch_index_constituents(self, index: str) -> FetchResult:
+        raise NotImplementedError
+
+    # 联网访问并非每个数据源都具备的能力；在此声明该方法，可以让不具备此能力
+    # 的数据源通过正常的回退通道报告 "不支持"，而不是抛出看起来像 bug 的
+    # AttributeError。
+    def fetch_web_search(
+        self, query: str, top_n: int, topic: str | None, time_range: str | None
+    ) -> FetchResult:
         raise NotImplementedError

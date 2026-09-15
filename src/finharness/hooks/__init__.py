@@ -1,1 +1,1 @@
-"""Pre-tool and post-tool hooks."""
+"""工具调用前与调用后的 hook。"""

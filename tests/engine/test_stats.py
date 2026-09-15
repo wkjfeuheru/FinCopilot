@@ -4,7 +4,7 @@ from finharness.engine.cost import SessionStats
 
 
 class StepClock:
-    """Deterministic clock advancing a fixed step per call."""
+    """确定性的时钟，每次调用推进一个固定步长。"""
 
     def __init__(self, step_s: float = 0.25):
         self._value = 0.0
@@ -73,12 +73,12 @@ def test_snapshot_is_detached_and_read_only():
 
 
 def test_sub_agent_usage_is_a_breakdown_not_a_second_total():
-    """``record_agent_usage`` labels spend; ``add_usage`` still owns the total."""
+    """``record_agent_usage`` 用于标注开销归属；``add_usage`` 仍然负责总数。"""
     stats = SessionStats()
 
-    stats.add_usage(100, 20)          # the sub-agent's tokens, counted once
+    stats.add_usage(100, 20)          # 子代理的 token，只计一次
     stats.record_agent_usage("risk", 100, 20)
-    stats.add_usage(7, 3)             # a main-loop turn afterwards
+    stats.add_usage(7, 3)             # 之后是一轮主循环
 
     snapshot = stats.snapshot()
     assert snapshot.input_tokens == 107

@@ -1,4 +1,4 @@
-"""Auto-compaction: trigger, digest, degradation, and the audit trail."""
+"""自动 compaction：触发、digest、降级与审计轨迹。"""
 
 import asyncio
 import json
@@ -15,10 +15,10 @@ from finharness.permissions.gate import PermissionGate
 from finharness.context.tokens import TokenCounter
 from finharness.types import Msg, ModelUsage, StreamChunk, StreamEvent, ToolUse
 
-# Shared vocabulary cache: fetching it is expensive and must not repeat per test.
+# 共享词表缓存：获取代价高昂，不能在每个测试中重复进行。
 COUNTER = TokenCounter()
 
-# Reuse the engine doubles; the suite has no tests package.
+# 复用 engine 的测试替身；本测试套件没有 tests 包。
 import sys
 from pathlib import Path
 
@@ -59,12 +59,12 @@ def build_loop(tmp_path, provider, *, registry=None, output=None, settings=None,
 
 
 def test_compaction_fires_when_the_window_is_exceeded(tmp_path):
-    """A long transcript should be folded before the request goes out."""
+    """较长的 transcript 应在请求发出前被折叠。"""
     provider = ScriptedProvider([text_round("ok")])
 
     async def run():
         loop = build_loop(tmp_path, provider)
-        # Preload history past the (small) window.
+        # 预加载历史，使其超出（较小的）窗口。
         for index in range(20):
             loop.memory.append_user("一段足以把窗口撑满的历史内容" * 4)
             loop.memory.append_assistant(Msg(role="assistant", content="阶段回答" * 4))
@@ -108,8 +108,8 @@ def test_summary_replaces_the_middle_and_keeps_recent_rounds(tmp_path):
 
     loop = asyncio.run(run())
 
-    # No digest message: earlier history moved to the summary layer, which is
-    # injected through the system prompt instead of masquerading as user input.
+    # 不产生 digest 消息：更早的历史被移到 summary layer，
+    # 通过 system prompt 注入，而不是伪装成 user input。
     contents = [m.content or "" for m in loop.memory.raw]
     assert not any("摘要内容" in text for text in contents)
     assert not any("历史问题0" in text for text in contents), "oldest history left the window"
@@ -118,8 +118,8 @@ def test_summary_replaces_the_middle_and_keeps_recent_rounds(tmp_path):
 
 
 def test_summary_segment_carries_a_data_ledger(tmp_path):
-    """Compaction removes the tool results, so the ledger is how the model still
-    knows a fetch already happened."""
+    """Compaction 会移除 tool result，因此 ledger 是模型仍然
+    知道某次取数已经发生过的依据。"""
     settings = make_settings(tmp_path)
     ctx = ResearchContext(cite=CitationRegistry(), settings=settings)
     memory = WorkingMemory(ctx=ctx, settings=settings, counter=COUNTER)
@@ -141,13 +141,13 @@ def test_summary_segment_carries_a_data_ledger(tmp_path):
 
 
 def test_summarizer_failure_degrades_without_blocking(tmp_path):
-    """A broken summariser must not stop the turn (docs 3.6.3)."""
+    """摘要器故障不得中断本轮对话（文档 3.6.3）。"""
     settings = make_settings(tmp_path)
     ctx = ResearchContext(cite=CitationRegistry(), settings=settings)
     memory = WorkingMemory(ctx=ctx, settings=settings, counter=COUNTER)
     for index in range(20):
         memory.append_user("撑满窗口的历史内容" * 4)
-        # A round is an exchange, so each needs its assistant frame.
+        # 一个 round 即一次交互，因此每轮都需要对应的 assistant frame。
         memory.append_assistant(Msg(role="assistant", content="阶段回答" * 4))
     compactor = AutoCompactor(
         provider=FailingProvider(), memory=memory, settings=settings
@@ -162,7 +162,7 @@ def test_summarizer_failure_degrades_without_blocking(tmp_path):
 
 
 class FailingProvider:
-    """Provider whose summarisation call always fails."""
+    """摘要调用总是失败的 Provider。"""
 
     async def stream(self, **kwargs):
         raise RuntimeError("摘要模型不可用")
@@ -224,5 +224,40 @@ def test_done_payload_reports_window_and_compaction_count(tmp_path):
     done = next(e.data for e in sink.events if e.kind == "done")
     assert "window_tokens" in done
     assert done["compactions"] >= 1
-    # The cumulative billing figure is separate and unaffected by compaction.
+    # 累计计费数值是独立的，不受 compaction 影响。
     assert "usage" in done
+
+
+def test_compaction_summary_is_observed_and_accounted(tmp_path):
+    """压缩摘要本身是一次 LLM 调用：必须带上 call_type=compaction，并回填 token。
+
+    此前这次调用的 token 完全不计入会话成本，算是成本视图里的一个真实缺口。
+    """
+    from finharness.observability.observer import Observer
+    from finharness.observability.metrics import MetricsRecorder
+
+    settings = make_settings(tmp_path)
+    ctx = ResearchContext(cite=CitationRegistry(), settings=settings)
+    memory = WorkingMemory(ctx=ctx, settings=settings, counter=COUNTER)
+    memory.append_user("问题")
+    for index in range(10):
+        memory.append_assistant(
+            Msg(role="assistant", content=None, tool_uses=[ToolUse(f"c{index}", "get_quote", {"symbol": "600519"})])
+        )
+        memory.append(Msg(role="tool_result", content=None, tool_results=[(f"c{index}", "结果" * 20)]))
+
+    metrics = MetricsRecorder()
+    observed_usages: list[tuple[int, int]] = []
+    compactor = AutoCompactor(
+        provider=ScriptedProvider([text_round("摘要内容", input_tokens=40, output_tokens=8)]),
+        memory=memory,
+        settings=settings,
+        observer=Observer(metrics=metrics),
+        on_usage=lambda i, o: observed_usages.append((i, o)),
+    )
+    asyncio.run(compactor.compact())
+
+    assert observed_usages == [(40, 8)]
+    rendered = metrics.render().decode()
+    assert 'llm_tokens_total{call_type="compaction",kind="input"' in rendered
+    assert "40.0" in rendered

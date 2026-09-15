@@ -1,8 +1,8 @@
-"""AkShare adapter: peer tables must stay attributable and un-polluted.
+"""AkShare adapter：同业对比表必须保持可归属且不被污染。
 
-The EM comparison endpoint mixes company rows with two aggregate rows and,
-when ``fields`` is used, used to drop 代码/简称 — leaving a frame the caller
-could neither identify nor average correctly (docs 03.5.2).
+EM 对比 endpoint 会把公司行与两行汇总行混在一起，并且在使用 ``fields`` 时，
+过去会丢掉 代码/简称 —— 留下的 frame 调用方既无法辨认，也无法正确求平均
+（文档 03.5.2）。
 """
 
 import time
@@ -16,7 +16,7 @@ from finharness.data.mapping import PEER_COMPANY, PEER_ROW_TYPE_COLUMN, PEER_STA
 
 
 class FakeAk:
-    """Stands in for the akshare module; returns one canned comparison table."""
+    """顶替 akshare 模块；返回一张固定的对比表。"""
 
     def __init__(self, frame: pd.DataFrame) -> None:
         self._frame = frame
@@ -26,7 +26,7 @@ class FakeAk:
 
 
 def peer_frame() -> pd.DataFrame:
-    """Two issuers plus the aggregate rows exactly as EM returns them."""
+    """两家发行人，外加 EM 原样返回的汇总行。"""
     return pd.DataFrame(
         {
             "排名": ["6.0/24", None, None, "1.0"],
@@ -48,7 +48,7 @@ def test_peer_filter_keeps_identity_columns(monkeypatch):
 
     df = adapter.fetch_peers("688169", ["市净率", "市盈率"]).df
 
-    # The rows stay attributable even after a field filter.
+    # 即使经过字段过滤，这些行仍保持可归属。
     assert {"代码", "简称"}.issubset(df.columns)
     assert {"市净率-MRQ", "市盈率-TTM"}.issubset(df.columns)
 
@@ -68,7 +68,7 @@ def test_peer_companies_sort_before_aggregates(monkeypatch):
 
     df = adapter.fetch_peers("688169", ["市净率"]).df
 
-    # Aggregates last, so a naive whole-frame mean is visibly wrong.
+    # 汇总行排在最后，这样天真的整表求平均会明显出错。
     types = list(df[PEER_ROW_TYPE_COLUMN])
     assert types == [PEER_COMPANY, PEER_COMPANY, PEER_STAT, PEER_STAT]
 
@@ -84,7 +84,7 @@ def test_peer_without_fields_keeps_every_column_and_tags_rows(monkeypatch):
 
 
 def test_peer_table_without_aggregate_rows_is_untouched(monkeypatch):
-    """No aggregates means nothing to tag; the frame must pass through intact."""
+    """没有汇总行就无需打标签；frame 必须原样透传。"""
     plain = pd.DataFrame(
         {
             "代码": ["688169", "603486"],
@@ -101,7 +101,7 @@ def test_peer_table_without_aggregate_rows_is_untouched(monkeypatch):
 
 
 class FakeValuationAk:
-    """Records the indicator it was asked for; returns a bare date/value frame."""
+    """记录被请求的 indicator；返回一个只有 date/value 两列的 frame。"""
 
     def __init__(self) -> None:
         self.indicators: list[str] = []
@@ -128,7 +128,7 @@ def test_valuation_passes_the_requested_indicator_to_the_source(monkeypatch):
 
 
 def test_valuation_column_names_the_metric_and_unit(monkeypatch):
-    """A bare ``value`` column is how a market cap got read as a PE multiple."""
+    """一个光秃秃的 ``value`` 列，正是市值被误读成市盈率倍数的原因。"""
     adapter, _ = make_valuation_adapter(monkeypatch)
 
     df = adapter.fetch_valuation("000858", 1, "总市值").df
@@ -139,7 +139,7 @@ def test_valuation_column_names_the_metric_and_unit(monkeypatch):
 
 
 class FakeIndicatorAk:
-    """Analysis-indicator source: Chinese labels, a date column, no ROE text."""
+    """财务分析指标数据源：中文标签、一个日期列、没有 ROE 字样。"""
 
     def stock_financial_analysis_indicator(self, symbol: str, start_year: str) -> pd.DataFrame:
         return pd.DataFrame(
@@ -153,7 +153,7 @@ class FakeIndicatorAk:
 
 
 def test_indicator_field_filter_resolves_english_alias(monkeypatch):
-    """``ROE`` must select ``净资产收益率(%)`` rather than silently matching none."""
+    """``ROE`` 必须能选中 ``净资产收益率(%)``，而不是悄悄匹配不到任何列。"""
     monkeypatch.setattr(akshare_adapter, "_import_akshare", lambda: FakeIndicatorAk())
     adapter = AkShareAdapter(throttle_seconds=0)
 
@@ -164,10 +164,10 @@ def test_indicator_field_filter_resolves_english_alias(monkeypatch):
     assert "销售净利率(%)" not in df.columns
 
 
-# --- quote candidate budgeting ------------------------------------------------
+# --- quote 候选源预算 ------------------------------------------------
 
 def _em_frame() -> pd.DataFrame:
-    """EM snapshot shape, before the ``quote`` normalization renames it."""
+    """EM 快照的形态，即 ``quote`` 归一化重命名之前的样子。"""
     return pd.DataFrame(
         {
             "代码": ["600519"], "名称": ["贵州茅台"], "最新价": [1275.16],
@@ -177,7 +177,7 @@ def _em_frame() -> pd.DataFrame:
 
 
 def _tx_frame() -> pd.DataFrame:
-    """Tencent daily series; the last row is the latest close."""
+    """腾讯日线序列；最后一行是最新的 close。"""
     return pd.DataFrame({"date": ["2026-09-10", "2026-09-11"], "close": [1269.0, 1275.16]})
 
 
@@ -191,10 +191,10 @@ def test_quote_prefers_the_rich_snapshot_when_available(monkeypatch):
         def stock_zh_a_spot_em(self):
             return _em_frame()
 
-        def stock_zh_a_hist_tx(self, **kwargs):  # pragma: no cover - must not run
+        def stock_zh_a_hist_tx(self, **kwargs):  # pragma: no cover - 不得运行
             raise AssertionError("the fallback must not be reached")
 
-        def stock_zh_a_spot(self):  # pragma: no cover - must not run
+        def stock_zh_a_spot(self):  # pragma: no cover - 不得运行
             raise AssertionError("the last resort must not be reached")
 
     result = make_quote_adapter(monkeypatch, Ak()).fetch_quote("600519")
@@ -204,16 +204,16 @@ def test_quote_prefers_the_rich_snapshot_when_available(monkeypatch):
 
 
 def test_quote_moves_on_when_a_candidate_exceeds_its_deadline(monkeypatch):
-    """A hanging source must not consume the caller's whole budget."""
+    """一个卡住的数据源不得耗尽调用方的全部时间预算。"""
     class Ak:
         def stock_zh_a_spot_em(self):
-            time.sleep(3.0)  # much longer than the deadline
+            time.sleep(3.0)  # 远长于截止时间
             return _em_frame()
 
         def stock_zh_a_hist_tx(self, **kwargs):
             return _tx_frame()
 
-        def stock_zh_a_spot(self):  # pragma: no cover - must not run
+        def stock_zh_a_spot(self):  # pragma: no cover - 不得运行
             raise AssertionError("the last resort must not be reached")
 
     monkeypatch.setattr(akshare_adapter, "_QUOTE_CANDIDATE_DEADLINE_S", 0.2)
@@ -221,7 +221,7 @@ def test_quote_moves_on_when_a_candidate_exceeds_its_deadline(monkeypatch):
 
     result = make_quote_adapter(monkeypatch, Ak()).fetch_quote("600519")
 
-    # It fell through to Tencent well before the slow candidate returned.
+    # 早在慢候选源返回之前，就已经回落到腾讯。
     assert result.interface == "stock_zh_a_hist_tx"
     assert time.perf_counter() - started < 1.0
 
@@ -238,7 +238,7 @@ def test_tencent_quote_receives_a_request_timeout_and_prefixed_symbol(monkeypatc
             self.kwargs = kwargs
             return _tx_frame()
 
-        def stock_zh_a_spot(self):  # pragma: no cover - must not run
+        def stock_zh_a_spot(self):  # pragma: no cover - 不得运行
             raise AssertionError("the last resort must not be reached")
 
     ak = Ak()
@@ -249,7 +249,7 @@ def test_tencent_quote_receives_a_request_timeout_and_prefixed_symbol(monkeypatc
 
 
 def test_repeatedly_failing_candidate_is_short_circuited(monkeypatch):
-    """After the failure threshold the dead source is skipped, not re-probed."""
+    """超过失败阈值后，已失效的数据源会被跳过，而不是再次探测。"""
     class Ak:
         def __init__(self):
             self.em_calls = 0
@@ -261,7 +261,7 @@ def test_repeatedly_failing_candidate_is_short_circuited(monkeypatch):
         def stock_zh_a_hist_tx(self, **kwargs):
             return _tx_frame()
 
-        def stock_zh_a_spot(self):  # pragma: no cover - must not run
+        def stock_zh_a_spot(self):  # pragma: no cover - 不得运行
             raise AssertionError("the last resort must not be reached")
 
     ak = Ak()
@@ -270,12 +270,12 @@ def test_repeatedly_failing_candidate_is_short_circuited(monkeypatch):
     for _ in range(3):
         assert adapter.fetch_quote("600519").interface == "stock_zh_a_hist_tx"
 
-    # Called on the first two queries, then skipped inside its cooldown.
+    # 前两次查询会调用，之后在其冷却期内被跳过。
     assert ak.em_calls == akshare_adapter._UNHEALTHY_AFTER_FAILURES
 
 
 def test_all_unhealthy_candidates_are_retried_rather_than_giving_up(monkeypatch):
-    """Blacklisting every source must not turn into a permanent outage."""
+    """把所有数据源都拉黑不得演变成永久性中断。"""
     class Ak:
         def __init__(self):
             self.recovered = False
@@ -301,5 +301,5 @@ def test_all_unhealthy_candidates_are_retried_rather_than_giving_up(monkeypatch)
 
     ak.recovered = True
 
-    # Every candidate is in cooldown, so the full chain is retried and EM wins.
+    # 所有候选源都处于冷却期，于是整条链路被重试，EM 胜出。
     assert adapter.fetch_quote("600519").interface == "stock_zh_a_spot_em"

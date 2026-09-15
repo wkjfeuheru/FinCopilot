@@ -1,23 +1,23 @@
-"""Context trimming: what gets trimmed before it reaches the model (docs 3.6.1).
+"""上下文裁剪：内容在到达模型之前会被裁剪的部分（docs 3.6.1）。
 
-Trimming only affects the *context copy*. Full data stays in the cache parquet,
-so nothing is lost — the model can read it back when it needs detail.
+裁剪只作用于 *上下文副本*。完整数据仍保留在缓存 parquet 中，因此不会有任何
+丢失 —— 模型需要细节时可以再读回来。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-# Fallback description budget when the caller supplies none.
+# 当调用方未提供时的默认描述长度预算。
 DEFAULT_MAX_DESC_LEN = 60
 
 
 def trim_schema(tool_schema: dict, *, max_desc_len: int = DEFAULT_MAX_DESC_LEN) -> dict:
-    """Shorten a tool schema's description in place, preserving its shape.
+    """就地缩短工具 schema 的描述，同时保持其结构不变。
 
-    Every resident tool's schema is re-sent on every request, so description
-    length is a fixed per-turn cost (docs 3.6.1). The cut is on a character
-    boundary and marked so a reader can tell it was shortened.
+    每个常驻工具的 schema 都会在每次请求中重新发送，因此描述长度是固定的
+    每轮开销（docs 3.6.1）。裁剪落在字符边界上，并加上标记，让读者能看出
+    它被缩短过。
     """
     function = tool_schema.get("function")
     if not isinstance(function, dict):
@@ -29,7 +29,7 @@ def trim_schema(tool_schema: dict, *, max_desc_len: int = DEFAULT_MAX_DESC_LEN) 
 
 
 def schema_tokens(schema: dict, *, counter: Any | None = None) -> int:
-    """Count the tokens a single schema contributes to a request."""
+    """统计单个 schema 在请求中所占的 token 数。"""
     function = schema.get("function", {})
     text = str(function.get("description", "")) + str(function.get("parameters", ""))
     if counter is None:

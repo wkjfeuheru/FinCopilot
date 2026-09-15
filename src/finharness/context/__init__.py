@@ -1,1 +1,1 @@
-"""Research context and token budgeting."""
+"""研究上下文与 token 预算管理。"""

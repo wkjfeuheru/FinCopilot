@@ -1,1 +1,1 @@
-"""Tool declarations and registry."""
+"""工具声明与注册表。"""

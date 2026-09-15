@@ -1,4 +1,4 @@
-"""Permission gate behaviour: modes, deny rules, path whitelist (docs 03.7.1)."""
+"""Permission gate 行为：模式、deny 规则、路径白名单（文档 03.7.1）。"""
 
 import asyncio
 from dataclasses import dataclass
@@ -64,7 +64,7 @@ def test_write_tool_denied_when_user_refuses(tmp_path):
 
 
 def test_write_tool_denied_without_an_interactive_channel(tmp_path):
-    """Non-interactive callers must refuse rather than silently allow."""
+    """非交互调用方必须拒绝，而不是静默放行。"""
     decision = check(FakeTool(permission=PermissionLevel.WRITE), {}, make_settings(tmp_path))
     assert decision.verdict is Verdict.DENY
     assert "无交互通道" in decision.reason
@@ -97,7 +97,7 @@ def test_path_traversal_out_of_the_whitelist_is_not_allowed(tmp_path):
 
 
 def test_deny_rule_blocks_trading_intent_in_arguments(tmp_path):
-    """A smuggled trade instruction is caught even on a read tool."""
+    """即使在 read tool 上，夹带的交易指令也会被捕获。"""
     decision = check(FakeTool(), {"keyword": "帮我下单 买入"}, make_settings(tmp_path))
     assert decision.verdict is Verdict.DENY
     assert "条规则" in decision.reason

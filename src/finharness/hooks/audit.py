@@ -1,8 +1,10 @@
-"""Audit hook: append-only JSONL record of every governed tool call (docs 4.3).
+"""审计 hook：为每一次受治理的工具调用记录仅追加的 JSONL（docs 4.3）。
 
-Always on and not removable — ``settings.audit`` chooses the path, never the
-switch. Each line is flushed immediately so a crash still leaves a complete
-record of what ran.
+始终开启且不可移除——``settings.audit`` 选择的是路径，而不是开关。每一行都会
+立即刷写，因此即使崩溃也会留下关于运行内容的完整记录。
+
+脱敏与 ``trace_id`` 都走 ``observability`` 包：审计与结构化日志必须共享同一套
+凭据遮蔽规则，也必须能被同一个 id 串联起来（docs 03.14.1）。
 """
 
 from __future__ import annotations
@@ -12,14 +14,13 @@ from datetime import datetime
 from pathlib import Path
 
 from finharness.hooks.base import BaseHook
+from finharness.observability.context import current_trace
+from finharness.observability.redact import summarize_args
 from finharness.types import ToolResult
-
-MAX_ARG_VALUE_LEN = 200
-REDACTED_KEYS = ("api_key", "token", "secret", "password", "authorization")
 
 
 class AuditLogWriter:
-    """Line-buffered JSONL writer; one line per event."""
+    """行缓冲的 JSONL 写入器；每个事件一行。"""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -30,35 +31,27 @@ class AuditLogWriter:
         self._seq += 1
         payload = {"seq": self._seq, "ts": datetime.now().astimezone().isoformat(timespec="seconds")}
         payload.update(record)
+        # 请求作用域内的审计行带上 trace_id，使其与同一次对话的日志可互相检索。
+        trace = current_trace()
+        if trace is not None and trace.trace_id and "trace_id" not in payload:
+            payload["trace_id"] = trace.trace_id
         with open(self.path, "a", encoding="utf-8", buffering=1) as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
 
 
-def summarize_args(args: dict) -> str:
-    """Render an argument snapshot, truncating long values and redacting secrets."""
-    parts: list[str] = []
-    for key, value in args.items():
-        if key.lower() in REDACTED_KEYS:
-            parts.append(f"{key}=<redacted>")
-            continue
-        text = str(value)
-        if len(text) > MAX_ARG_VALUE_LEN:
-            text = text[:MAX_ARG_VALUE_LEN] + "…"
-        parts.append(f"{key}={text}")
-    return ",".join(parts)
-
-
 class AuditHook(BaseHook):
-    """Writes session boundaries and one line per tool outcome."""
+    """写入会话边界，以及每个工具结果一行。"""
 
-    def __init__(self, writer: AuditLogWriter, *, session_id: str = "local") -> None:
+    def __init__(self, writer: AuditLogWriter, *, session_id: str = "local", user_id: str = "") -> None:
         self.writer = writer
         self.session_id = session_id
+        self.user_id = user_id
 
     def session_start(self, *, mode: str, provider: str, model: str) -> None:
         self.writer.write(
             {
                 "session_id": self.session_id,
+                "user_id": self.user_id,
                 "action": "session_start",
                 "mode": mode,
                 "provider": provider,
@@ -70,6 +63,7 @@ class AuditHook(BaseHook):
         self.writer.write(
             {
                 "session_id": self.session_id,
+                "user_id": self.user_id,
                 "action": "session_end",
                 "total_tokens": total_tokens,
                 "tool_calls": tool_calls,
@@ -107,3 +101,17 @@ class AuditHook(BaseHook):
                 "endpoint": endpoint,
             }
         )
+        # 研报的复核本身就是一次可审计事件：工具在 ``metadata`` 中声明结果
+        # （写入/声明，绝不对模型可见），而一份已交付的研报是否真的经过了复核——
+        # 还是降级为 "unreviewed"，亦或根本在没有复核者的情况下运行——必须仅凭
+        # 审计日志就能回答。工具负责声明，hook 负责记录。
+        review = getattr(result, "metadata", {}).get("review")
+        if isinstance(review, dict):
+            row = {
+                "session_id": self.session_id,
+                "action": "review",
+                "turn": turn,
+                "tool": getattr(tool, "name", "unknown"),
+            }
+            row.update({k: review[k] for k in ("status", "topic", "review_path", "error") if k in review})
+            self.writer.write(row)

@@ -1,10 +1,10 @@
-"""Citation registry: every rendered datum is traceable to its source."""
+"""引用登记表：每个被渲染的数据点都可追溯到其来源。"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -33,30 +33,30 @@ class Citation:
 
 
 def _cid_ordinal(cid: str) -> int:
-    """Numeric part of a ``cit_%06d`` id; 0 when the shape is unexpected."""
+    """``cit_%06d`` 编号中的数字部分；形状不符合预期时返回 0。"""
     _, _, suffix = cid.partition("_")
     return int(suffix) if suffix.isdigit() else 0
 
 
 def fingerprint_series(records: Any) -> str:
-    """Stable digest of tabular content, independent of column order noise."""
+    """表格内容的稳定摘要，不受列顺序噪声影响。"""
     payload = json.dumps(records, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def fingerprint_frame(df: Any) -> str:
-    """Digest a DataFrame (or None) for citation provenance."""
+    """为引用溯源计算 DataFrame（或 None）的摘要。"""
     if df is None or not len(df):
         return fingerprint_series([])
     return fingerprint_series(df.head(50).to_dict("records"))
 
 
 def fingerprint_text(text: str | None) -> str:
-    """Digest a text payload (a page body, a file read) for provenance.
+    """为溯源计算文本载荷（页面正文、文件读取内容）的摘要。
 
-    Without this, every text-only citation shared one constant fingerprint —
-    the digest of an empty frame — so two different documents were
-    indistinguishable in the appendix.
+    若没有它，每个纯文本引用都会共享同一个常量指纹 ——
+    即空数据框的摘要 —— 因此两个不同的文档
+    在附录中将无法区分。
     """
     if not text:
         return fingerprint_series([])
@@ -64,7 +64,7 @@ def fingerprint_text(text: str | None) -> str:
 
 
 class CitationRegistry:
-    """Session-scoped citation store; bounded to avoid unbounded growth."""
+    """会话级引用存储；设有上限以避免无界增长。"""
 
     def __init__(self, *, max_entries: int = 500) -> None:
         self._max_entries = max_entries
@@ -73,11 +73,11 @@ class CitationRegistry:
         self._counter = 0
 
     def restore(self, citations: list[Citation]) -> None:
-        """Reinstate previously issued citations, keeping their original ids.
+        """恢复此前已发出的引用，并保留其原始编号。
 
-        Id stability matters once conversations persist: a stored summary or
-        conclusion names ``cit_000005``, so renumbering on reload would silently
-        point those references at different data.
+        一旦对话需要持久化，编号稳定性就很重要：已存储的摘要或
+        结论会以 ``cit_000005`` 指代某条数据，若在重新加载时重新编号，
+        就会在不知不觉中把这些引用指向不同的数据。
         """
         for citation in citations:
             if citation.cid in self._by_id:
@@ -99,6 +99,10 @@ class CitationRegistry:
         from_cache: bool = False,
         parquet_path: str | None = None,
     ) -> Citation:
+        """登记一条新引用并分配递增的 ``cit_%06d`` 编号。
+
+        超过容量上限时丢弃最旧的条目。返回新建的 ``Citation``。
+        """
         self._counter += 1
         citation = Citation(
             cid=f"cit_{self._counter:06d}",
@@ -146,3 +150,36 @@ class CitationRegistry:
             return "（本次会话暂无数据引用）"
         lines = ["【数据来源】", *(item.to_markdown() for item in self._items)]
         return "\n".join(lines)
+
+
+class ScopedCitationRegistry:
+    """共享登记表之上的一个视图，只记录*它自己*签发的编号。
+
+    子代理共享会话登记表，以使 cid 保持连续，但每个子代理仍需
+    准确报告它新增了哪些引用。通过在前后对共享登记表做差异
+    来归属是不对的：只要两个子代理同时运行就会出错 ——
+    每个都会把对方签发的 cid 算作自己的。在 ``register`` 处
+    记录则无论并发如何都是精确的。
+
+    写入直接透传；读取与 ``restore`` 委托出去，因此它对每个使用者
+    （``AgentLoop``、``ResearchContext``）都具备 ``CitationRegistry`` 的鸭子类型。
+    """
+
+    def __init__(self, shared: CitationRegistry) -> None:
+        self._shared = shared
+        self._created: list[str] = []
+
+    @property
+    def created(self) -> list[str]:
+        """本作用域签发的 cid，按创建顺序排列。"""
+        return list(self._created)
+
+    def register(self, **kwargs: Any) -> Citation:
+        citation = self._shared.register(**kwargs)
+        self._created.append(citation.cid)
+        return citation
+
+    def __getattr__(self, name: str) -> Any:
+        # all/get/query/resolve_symbols/to_appendix_md/restore 都读取
+        # 共享登记表，因此委托能让它们天然保持一致。
+        return getattr(self._shared, name)

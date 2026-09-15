@@ -1,4 +1,4 @@
-"""Hook chain: pre/post interception around tool execution (docs 03.7.3)."""
+"""Hook 链：围绕工具执行的调用前/调用后拦截（docs 03.7.3）。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from finharness.types import ToolResult
 
 
 class BaseHook(ABC):
-    """A pre/post interceptor. ``pre`` may block; ``post`` only observes."""
+    """一个调用前/调用后拦截器。``pre`` 可以阻断；``post`` 只做观察。"""
 
     async def pre(self, tool, args: dict, *, turn: int = 0) -> bool:
-        """Return False to block execution."""
+        """返回 False 以阻断执行。"""
         return True
 
     async def post(
@@ -30,12 +30,12 @@ class BaseHook(ABC):
         rows: int = 0,
         cols: int = 0,
     ) -> None:
-        """Observe an outcome. Must never raise into the loop."""
+        """观察一次结果。绝不能向循环抛出异常。"""
         return None
 
 
 class HookChain:
-    """Runs hooks in order; a blocking ``pre`` short-circuits the chain."""
+    """按顺序运行 hook；某个阻断性的 ``pre`` 会使链条短路。"""
 
     def __init__(self, hooks: list[BaseHook] | None = None) -> None:
         self.hooks: list[BaseHook] = list(hooks or [])
@@ -53,5 +53,5 @@ class HookChain:
         for hook in self.hooks:
             try:
                 await hook.post(tool, args, result, **kwargs)
-            except Exception:  # noqa: BLE001 - audit must never break a turn
+            except Exception:  # noqa: BLE001 - 审计绝不能破坏一次回合
                 continue

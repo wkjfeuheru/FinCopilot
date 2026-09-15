@@ -1,22 +1,25 @@
-"""Resuming a conversation over HTTP: list, replay, and continue.
+"""通过 HTTP 恢复对话：列出、回放并继续。
 
-A session is an execution window that expires; a conversation is the memory
-scope and outlives it. These tests cover the client-visible consequences: the
-list endpoint, transcript replay, and that continuing by conversation id reuses
-the same memory rather than starting over.
+session 是执行窗口，会过期；conversation 是记忆作用域，其生命周期更长。
+这些测试覆盖客户端可见的结果：列出 endpoint、对话记录回放，以及按
+conversation id 继续时会复用同一份记忆，而不是从头开始。
 """
 
+from pathlib import Path
+
+import pandas as pd
 from fastapi.testclient import TestClient
 
 from finharness.config.settings import Settings
 from finharness.data.access import DataAccess
+from finharness.data.adapters.base import DataAdapter, FetchResult
 from finharness.provider.fake import FakeProvider
 from finharness.server.api import create_app
 from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUse
 
 
 class EchoProvider(FakeProvider):
-    """Echoes the number of prior user turns, to expose restored history."""
+    """回显此前的用户轮次数量，以暴露被恢复的历史。"""
 
     def __init__(self):
         super().__init__([])
@@ -33,7 +36,7 @@ class EchoProvider(FakeProvider):
 
 
 class PlannedProvider(EchoProvider):
-    """Runs one planning tool before returning the final answer."""
+    """在返回最终答案之前运行一个规划工具。"""
 
     async def stream(self, *, system, messages, tools, usage: ModelUsage):
         if not any(message.role == "tool_result" for message in messages):
@@ -69,15 +72,62 @@ class PlannedProvider(EchoProvider):
         )
 
 
+class ChartProvider(EchoProvider):
+    """先画一张图，再给出最终答案，用于验证产出文件能否被回放。"""
+
+    async def stream(self, *, system, messages, tools, usage: ModelUsage):
+        if not any(message.role == "tool_result" for message in messages):
+            yield StreamChunk(
+                StreamEvent.MESSAGE_END,
+                ModelUsage(
+                    input_tokens=1,
+                    output_tokens=1,
+                    tool_uses=[
+                        ToolUse(
+                            "chart-1",
+                            "make_chart",
+                            {"symbol": "600519", "title": "回放测试走势", "type": "line"},
+                        )
+                    ],
+                ),
+            )
+            return
+        yield StreamChunk(StreamEvent.TEXT_DELTA, "图表已生成")
+        yield StreamChunk(
+            StreamEvent.MESSAGE_END, ModelUsage(input_tokens=1, output_tokens=1)
+        )
+
+
+class OfflineKlineAdapter(DataAdapter):
+    """离线 K 线来源，使 make_chart 无需网络即可产出 PNG。"""
+
+    name = "offline"
+
+    def fetch_kline(self, symbol, period, adjust, years):
+        dates = pd.date_range("2025-01-01", periods=40, freq="D")
+        return FetchResult(
+            df=pd.DataFrame({"date": dates, "close": [100.0 + i for i in range(40)]}),
+            interface="offline_kline",
+        )
+
+
 def make_client(
-    tmp_path, provider: EchoProvider | None = None
+    tmp_path, provider: EchoProvider | None = None, *, adapters: list | None = None
 ) -> tuple[TestClient, EchoProvider]:
     provider = provider or EchoProvider()
     settings = Settings(
         paths={"memory_db": tmp_path / "memory.db", "output_dir": tmp_path / "output"},
         data={"cache_dir": tmp_path / "cache"},
     )
-    return TestClient(create_app(provider=provider, settings=settings)), provider
+    data_access = DataAccess(adapters or [], settings=settings) if adapters else None
+    from tests.server.conftest import authed_client
+
+    client = authed_client(
+        TestClient(
+            create_app(provider=provider, data_access=data_access, settings=settings)
+        )
+    )
+    return (client, provider)
 
 
 def conversation_id_from(text: str) -> str:
@@ -116,7 +166,7 @@ def test_transcript_can_be_replayed(tmp_path):
 
 
 def test_replay_keeps_the_turn_trace_and_metrics_after_refresh(tmp_path):
-    """Reloading a stored answer must not discard its observable run metadata."""
+    """重新加载已存储的答案时，不得丢弃其可观察的运行元数据。"""
     client, _ = make_client(tmp_path)
     first = client.post("/v1/chat/stream", json={"message": "第一问"})
     cid = conversation_id_from(first.text)
@@ -152,12 +202,41 @@ def test_replay_keeps_planning_tool_events_after_refresh(tmp_path):
     ]
 
 
+def test_replay_keeps_produced_files_after_refresh(tmp_path):
+    """刷新后“产出文件”一栏不得消失。
+
+    客户端只在内存里保存本轮的产出文件，页面刷新会丢掉它们；
+    因此这些路径必须随轮次事件持久化，并在回放时原样返回，
+    前端才能据此重建下载链接。
+    """
+    client, _ = make_client(
+        tmp_path, ChartProvider(), adapters=[OfflineKlineAdapter()]
+    )
+    first = client.post("/v1/chat/stream", json={"message": "画一张走势图"})
+    cid = conversation_id_from(first.text)
+
+    messages = client.get(f"/v1/conversations/{cid}/messages").json()["messages"]
+    answer = next(message for message in messages if message["role"] == "assistant")
+    completed = [
+        event["data"]
+        for event in answer["turn"]["events"]
+        if event["event"] == "tool_status" and event["data"]["status"] == "completed"
+    ]
+
+    attachments = [path for data in completed for path in data.get("attachments", [])]
+    assert attachments, "the produced file must survive into the replayed turn"
+    assert any(path.endswith(".png") for path in attachments)
+    assert all(
+        Path(path).is_file() for path in attachments
+    ), "replayed paths must still be downloadable"
+
+
 def test_replay_omits_tool_frames(tmp_path):
-    """Only readable turns come back; working state is not shown to the reader."""
+    """只返回可读的回合；工作状态不展示给阅读者。"""
     client, _ = make_client(tmp_path)
-    # Seed a conversation containing a tool round directly in the store.
+    # 直接在 store 中种入一个包含工具轮次的对话（归属当前测试用户）。
     store = client.app.state.memory_store
-    store.ensure_conversation("c_tools")
+    store.ensure_conversation("c_tools", user_id=client.finharness_user["id"])
     store.append_messages(
         "c_tools",
         [
@@ -187,14 +266,14 @@ def test_replay_404s_for_an_unknown_conversation(tmp_path):
 
 
 def test_continuing_by_conversation_id_restores_history(tmp_path):
-    """The core acceptance: resuming must make the model see the earlier turns."""
+    """核心验收点：恢复对话必须让模型看到更早的轮次。"""
     client, provider = make_client(tmp_path)
     first = client.post("/v1/chat/stream", json={"message": "第一问"})
     cid = conversation_id_from(first.text)
 
     client.post("/v1/chat/stream", json={"conversation_id": cid, "message": "第二问"})
 
-    # The second request should carry both user turns, not just the new one.
+    # 第二个请求应携带两个用户轮次，而不只是新的那一轮。
     assert provider.seen_user_turns[-1] == 2
 
 
@@ -203,7 +282,7 @@ def test_a_new_conversation_starts_with_no_history(tmp_path):
     first = client.post("/v1/chat/stream", json={"message": "甲对话的问题"})
     assert first.status_code == 200
 
-    # A request without a conversation id is a fresh conversation.
+    # 不带 conversation id 的请求是一个全新对话。
     client.post("/v1/chat/stream", json={"message": "乙对话的问题"})
 
     assert provider.seen_user_turns[-1] == 1
@@ -212,12 +291,12 @@ def test_a_new_conversation_starts_with_no_history(tmp_path):
 
 
 def test_resuming_after_the_session_expired_still_restores_history(tmp_path):
-    """Conversation ids survive the execution window; that is why they exist."""
+    """conversation id 的生命周期长于执行窗口；这正是它们存在的意义。"""
     client, provider = make_client(tmp_path)
     first = client.post("/v1/chat/stream", json={"message": "第一问"})
     cid = conversation_id_from(first.text)
 
-    # Expire the live session without touching the stored conversation.
+    # 让活动 session 过期，同时不触碰已存储的 conversation。
     registry = client.app.state.session_registry
     for session in registry.sessions.values():
         session.last_active -= 10_000
@@ -235,7 +314,7 @@ def test_citations_can_be_read_by_conversation(tmp_path):
     response = client.get("/v1/citations", params={"conversation_id": cid})
 
     assert response.status_code == 200
-    assert response.json()["count"] == 0  # no tool ran, but the scope resolves
+    assert response.json()["count"] == 0  # 没有工具运行，但作用域可以解析
 
 
 def test_citations_404_for_an_unknown_conversation(tmp_path):
@@ -248,12 +327,12 @@ def test_citations_404_for_an_unknown_conversation(tmp_path):
 
 
 def test_persisted_citations_are_readable_after_the_session_is_gone(tmp_path):
-    """A conversation outlives the process; its sources must remain addressable."""
+    """conversation 的生命周期长于进程；其来源必须保持可寻址。"""
     from finharness.data.citation import Citation
 
     client, _ = make_client(tmp_path)
     store = client.app.state.memory_store
-    store.ensure_conversation("c_sources")
+    store.ensure_conversation("c_sources", user_id=client.finharness_user["id"])
     store.save_citations(
         "c_sources",
         [
@@ -272,8 +351,8 @@ def test_persisted_citations_are_readable_after_the_session_is_gone(tmp_path):
         ],
     )
 
-    # No live registry exists for this conversation, so the endpoint must fall
-    # back to the persisted store rather than reporting an empty scope.
+    # 该 conversation 没有活动的注册表，因此 endpoint 必须回退
+    # 到持久化的 store，而不是报告一个空作用域。
     body = client.get("/v1/citations", params={"conversation_id": "c_sources"}).json()
 
     assert body["count"] == 1

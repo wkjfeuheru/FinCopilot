@@ -1,4 +1,4 @@
-"""ask_user: pause the turn and ask the user a question (docs 03.7.1)."""
+"""ask_user：暂停当前轮次并向用户提问（docs 03.7.1）。"""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ class AskUserTool(BaseTool):
     needs_interactive = True
 
     async def _dispatch(self, *, question: str, options: list[str] | None = None) -> RawData:
+        """经由注入的交互回调向用户提问；超时未答时返回提示模型继续的文本。"""
         if self.interactive is None:
             raise ValueError("当前环境不支持交互提问")
         answer = await self.interactive("question", question, list(options or []))

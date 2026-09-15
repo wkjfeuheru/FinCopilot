@@ -25,6 +25,7 @@ class ToolUseAccumulator:
         self._buffers: dict[int, _ToolUseBuffer] = {}
 
     def add(self, delta: ToolUseDelta) -> None:
+        """累积一个工具调用增量，按 index 归入对应缓冲区。"""
         buffer = self._buffers.setdefault(delta.index, _ToolUseBuffer())
         if delta.call_id:
             buffer.call_id += delta.call_id
@@ -34,10 +35,12 @@ class ToolUseAccumulator:
             buffer.arguments += delta.arguments_delta
 
     def replace_arguments(self, index: int, arguments: str = "") -> None:
+        """重置指定 index 已累积的参数（在 JSON 片段开始前调用）。"""
         buffer = self._buffers.setdefault(index, _ToolUseBuffer())
         buffer.arguments = arguments
 
     def build(self) -> list[ToolUse]:
+        """将所有缓冲区构建为校验后的 ToolUse 列表；字段缺失或 JSON 非法时抛出。"""
         tool_uses: list[ToolUse] = []
         for _, buffer in sorted(self._buffers.items()):
             if not buffer.call_id or not buffer.name:

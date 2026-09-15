@@ -1,14 +1,14 @@
-"""Latest quote for one A-share symbol."""
+"""单只 A 股代码的最新行情。"""
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool, DataInput, PermissionLevel, ToolGroup
 
 
-class QuoteInput(BaseModel):
+class QuoteInput(DataInput):
     symbol: str = Field(description="6位A股代码，如 600519")
 
 

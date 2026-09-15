@@ -1,4 +1,4 @@
-"""Provider error taxonomy and retry metadata."""
+"""Provider 错误分类与重试元数据。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from math import isfinite
 
 
 class ProviderError(RuntimeError):
-    """A provider failure with retry information for the engine."""
+    """provider 失败，并携带供 engine 使用的重试信息。"""
 
     default_retryable = False
 
@@ -40,8 +40,38 @@ class NetworkError(ProviderError):
     default_retryable = False
 
 
+class TokenLimitError(ProviderError):
+    """输入超出模型上下文窗口；重试同样的请求只会再次失败。
+
+    单列出来是为了让可观测性能够把它与一般的 provider 失败区分开
+    （docs 03.14.2：``agent_request_errors_total`` 按错误类型分别统计）。
+    """
+
+    default_retryable = False
+
+
+# 各 provider 对"上下文超限"的措辞不同，因此按特征片段匹配。
+_TOKEN_LIMIT_MARKERS = (
+    "context length",
+    "context_length",
+    "maximum context",
+    "context window",
+    "prompt is too long",
+    "too many tokens",
+    "reduce the length",
+    "exceeds the maximum",
+    "max_tokens is too large",
+)
+
+
+def is_token_limit_error(text: str) -> bool:
+    """判断错误文本是否表示输入超出上下文窗口。"""
+    lowered = text.lower()
+    return any(marker in lowered for marker in _TOKEN_LIMIT_MARKERS)
+
+
 def parse_retry_after(value: str | None) -> float | None:
-    """Parse HTTP ``Retry-After`` seconds or date without raising on bad input."""
+    """解析 HTTP ``Retry-After`` 的秒数或日期，输入异常时不抛错。"""
     if value is None:
         return None
     try:

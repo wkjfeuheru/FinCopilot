@@ -7,8 +7,6 @@ from finharness.config.settings import ContextSettings, Settings, ToolSettings
 from finharness.engine.cost import SessionStats
 from finharness.engine.loop import AgentLoop
 from finharness.engine.retry import RetryPolicy
-from finharness.permissions.modes import PermissionMode, Verdict
-from finharness.permissions.gate import PermissionGate, ReadOnlyGate
 from finharness.tools.base import PermissionLevel
 from finharness.provider.base import Provider
 from finharness.provider.errors import RateLimitError
@@ -26,7 +24,7 @@ from finharness.types import (
 
 
 class StepClock:
-    """Deterministic clock advancing a fixed step per call."""
+    """确定性时钟，每次调用前进固定步长。"""
 
     def __init__(self, step_s: float = 0.25):
         self._value = 0.0
@@ -47,7 +45,7 @@ class Sink:
 
 
 class StubRegistry:
-    """Tool catalog double: the loop only needs names/resolve/schemas/read-only."""
+    """工具目录替身：loop 只需要 names/resolve/schemas/read-only。"""
 
     def __init__(
         self,
@@ -79,7 +77,7 @@ class StubRegistry:
 
 
 class ScriptedProvider(Provider):
-    """Replays canned rounds and records every request the loop makes."""
+    """重放预置的 round，并记录 loop 发出的每一个请求。"""
 
     def __init__(
         self,
@@ -112,7 +110,7 @@ class ScriptedProvider(Provider):
 
 
 class ChunkThenErrorProvider(Provider):
-    """Yields one delta, then fails mid-stream so retry must not trigger."""
+    """先产出一个 delta，然后在流中途失败，因此不应触发重试。"""
 
     def __init__(self, error: Exception):
         self.error = error
@@ -127,10 +125,10 @@ class ChunkThenErrorProvider(Provider):
 
 
 class RecordingTool:
-    """Read-only tool double that records arguments and can fail, stall or raise."""
+    """只读工具替身，记录参数，并可以失败、停滞或抛出异常。"""
 
     permission = PermissionLevel.READ
-    timeout = None  # inherit settings.tools.timeout_default_s
+    timeout = None  # 继承 settings.tools.timeout_default_s
 
     def __init__(
         self,
@@ -162,7 +160,7 @@ class RecordingTool:
 
 
 class ParallelGate:
-    """Releases only once every participant arrives, so serial execution times out."""
+    """只有在所有参与者都到达后才放行，因此串行执行会超时。"""
 
     def __init__(self, participants: int, *, timeout_s: float = 1.0):
         self.remaining = participants
@@ -177,7 +175,7 @@ class ParallelGate:
 
 
 class GatedTool(RecordingTool):
-    """Records when it starts and finishes so call order can be observed."""
+    """记录开始与结束的时刻，以便观察调用顺序。"""
 
     def __init__(
         self, name: str, gate: ParallelGate, *, content: str, finish_delay: float = 0.0
@@ -197,7 +195,7 @@ class GatedTool(RecordingTool):
 
 
 class CancellableTool:
-    """Signals when it starts and records whether it observed cancellation."""
+    """在开始时发出信号，并记录它是否观察到了取消。"""
 
     permission = PermissionLevel.READ
     timeout = None
@@ -277,6 +275,7 @@ def make_loop(
     retry_policy: RetryPolicy | None = None,
     stats: SessionStats | None = None,
     coordinator=None,
+    observer=None,
 ) -> AgentLoop:
     return AgentLoop(
         provider=provider,
@@ -287,6 +286,7 @@ def make_loop(
         retry_policy=retry_policy,
         stats=stats,
         coordinator=coordinator,
+        observer=observer,
     )
 
 
@@ -343,7 +343,7 @@ def test_final_turn_emits_deltas_then_answer_then_done():
     assert done["reason"] is None
     assert done["usage"]["input_tokens"] == 1
     assert done["usage"]["output_tokens"] == 2
-    # The cache split is always present; zero means the provider reported none.
+    # cache 拆分项始终存在；为 0 表示 provider 未上报。
     assert done["usage"]["cache_hit_tokens"] == 0
     assert done["usage"]["cache_miss_tokens"] == 0
     assert done["tool_calls"] == 0
@@ -409,9 +409,9 @@ def test_tool_round_streams_draft_then_resets_it_before_the_final_answer():
 
     outcome, events, messages, provider, tool = asyncio.run(run())
 
-    # Text streams as it is generated, so the draft is visible until the round
-    # turns out to be a tool call; text_reset then clears it and only the final
-    # answer streams on the next round.
+    # 文本在生成时即流式输出，因此草稿会一直可见，直到该 round
+    # 被判定为 tool call；此时 text_reset 会清除它，只有最终
+    # 答案会在下一个 round 流式输出。
     streamed_text = [
         event.data["text"] for event in events if event.kind == "text_delta"
     ]
@@ -443,8 +443,8 @@ def test_tool_round_streams_draft_then_resets_it_before_the_final_answer():
     ]
     assert [event.data["status"] for event in events[3:5]] == ["started", "completed"]
     assert events[4].data["call_id"] == "call_1"
-    # The transcript prefix is the real history; the trailing 'user' is the
-    # research-state view appended for this request only (docs 3.3).
+    # transcript 前缀是真实历史；末尾的 'user' 是仅为本次请求追加的
+    # 研究状态视图 (docs 3.3)。
     roles = provider.requests[1]["roles"]
     assert roles[:3] == ["user", "assistant", "tool_result"]
     assert all(role == "user" for role in roles[3:])
@@ -587,7 +587,7 @@ def test_tool_exception_and_timeout_backfill_failures_and_model_recovers():
 
 
 def test_tool_result_content_is_truncated_to_the_configured_token_limit():
-    """max_result_tokens is a token budget, so Chinese is cut at a real count."""
+    """max_result_tokens 是 token 预算，因此中文会按真实数量被截断。"""
 
     async def run():
         tool = RecordingTool("get_kline", content="茅" * 400)
@@ -604,11 +604,11 @@ def test_tool_result_content_is_truncated_to_the_configured_token_limit():
     messages, provider, loop = asyncio.run(run())
 
     content = json.loads(messages[2].tool_results[0][1])["content"]
-    # The truncation marker is appended after the budgeted prefix.
+    # 截断标记会追加在预算内的前缀之后。
     assert content.endswith(loop.TRUNCATION_MARKER)
     body = content[: -len(loop.TRUNCATION_MARKER)]
     assert loop.memory.counter.count(body).tokens <= 40
-    # The untruncated payload must not have been forwarded.
+    # 未被截断的 payload 绝不能已被转发。
     assert "茅" * 400 not in json.dumps(
         provider.requests[1]["messages"][2].tool_results
     )
@@ -630,8 +630,8 @@ def test_tiny_token_budget_truncates_without_room_for_the_marker():
     messages, loop = asyncio.run(run())
 
     content = json.loads(messages[2].tool_results[0][1])["content"]
-    # With a 4-token budget there is no room for the marker, so the prefix is cut
-    # to fit instead of overshooting the budget.
+    # 在 4-token 预算下没有空间容纳标记，因此改为裁剪前缀
+    # 以适配预算，而不是超出预算。
     assert loop.TRUNCATION_MARKER not in content
     assert loop.memory.counter.count(content).tokens <= 4
 
@@ -678,25 +678,33 @@ def test_exhausted_tool_turns_report_reason_and_emit_one_error_and_one_done():
 
     assert outcome.succeeded is False
     assert outcome.reason == "max_turns_exhausted"
-    assert outcome.answer == ""
+    # 预算耗尽并非空跑：部分答案会说明
+    # 原因，以及没有任何结论成立。
+    assert "提前结束" in outcome.answer
+    assert "轮次上限" in outcome.answer
     assert outcome.tool_calls == 2
     assert outcome.usage.input_tokens == 2
     assert kinds(events).count("error") == 1
     assert kinds(events).count("done") == 1
-    assert kinds(events)[-2:] == ["error", "done"]
-    assert events[-2].data["reason"] == "max_turns_exhausted"
+    # 部分答案会作为 ``answer`` 事件在 ``done`` 之前呈现。
+    assert kinds(events)[-3:] == ["error", "answer", "done"]
+    assert events[-3].data["reason"] == "max_turns_exhausted"
+    assert events[-2].data["text"] == outcome.answer
     assert events[-1].data["succeeded"] is False
     assert events[-1].data["reason"] == "max_turns_exhausted"
     assert events[-1].data["tool_calls"] == 2
-    assert "answer" not in kinds(events)
     assert len(provider.requests) == 2
+    # 部分答案会写入该轮次的 assistant 消息，因此
+    # 重新加载的会话仍能显示本次运行得出的结论。
     assert [message.role for message in messages] == [
         "user",
         "assistant",
         "tool_result",
         "assistant",
         "tool_result",
+        "assistant",
     ]
+    assert messages[-1].content == outcome.answer
 
 
 def test_provider_error_reports_reason_and_emits_one_error_and_one_done():
@@ -946,8 +954,8 @@ def test_tool_timing_and_accumulated_stats_reach_the_done_event():
 def test_unknown_and_denied_tools_count_as_requests_without_duration():
     async def run():
         sink = Sink()
-        # A write-permission tool is denied by the default ReadOnlyGate; the
-        # point is that the request still counts with no execution time.
+    # 写权限工具会被默认的 ReadOnlyGate 拒绝；重点在于
+    # 该请求仍会被计数，且没有执行时间。
         registry = StubRegistry(
             {"get_quote": RecordingTool("get_quote", permission=PermissionLevel.WRITE)}
         )
@@ -1015,10 +1023,10 @@ def test_failed_tool_result_reports_failed_status_with_duration():
     assert outcome.tool_duration_ms == 250
 
 
-# -- sub-agent coordinator injection (docs 03.10) -----------------------------
+# -- 子 agent coordinator 注入 (docs 03.10) ------------------------------------
 
 class NeedsCoordinatorTool:
-    """Tool double that declares it needs a coordinator, like write_report."""
+    """工具替身，声明自己需要 coordinator，类似 write_report。"""
 
     name = "review_report"
     permission = PermissionLevel.READ
@@ -1092,6 +1100,54 @@ def test_done_event_reports_per_agent_usage():
     assert done["per_agent"]["risk"]["runs"] == 1
 
 
+class RecordingSpawnTool:
+    """spawn_agent 的工具替身：记录交给它的每一批任务。"""
+
+    name = "spawn_agent"
+    permission = PermissionLevel.READ
+    timeout = None
+    needs_coordinator = True
+    coordinator = None
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def run(self, **kwargs) -> ToolResult:
+        self.calls.append(kwargs)
+        return ToolResult(content="ok")
+
+
+def test_loop_guard_does_not_block_fan_out_with_different_tasks():
+    """spawn_agent 每批以不同的参数被调用一次 (docs 03.10)。
+
+    重复调用防护以 (tool, args) 为键，因此不同的任务列表是不同的调用。
+    这里把它固定下来：若防护仅以工具名为键，第二批就会被
+    当成循环而被拒绝。
+    """
+    async def run():
+        tool = RecordingSpawnTool()
+        registry = StubRegistry({"spawn_agent": tool})
+        provider = ScriptedProvider(
+            [
+                tool_round(ToolUse("c1", "spawn_agent", {"tasks": ["甲", "乙"]})),
+                tool_round(ToolUse("c2", "spawn_agent", {"tasks": ["丙", "丁"]})),
+                tool_round(ToolUse("c3", "spawn_agent", {"tasks": ["戊"]})),
+                text_round("全部完成"),
+            ]
+        )
+        loop = make_loop(provider, registry=registry)
+        outcome = await loop.run("分批摘要")
+        return outcome, tool.calls
+
+    outcome, calls = asyncio.run(run())
+
+    # 三批任务全部运行；没有任何一批被防护拒绝。
+    assert len(calls) == 3
+    assert calls[0]["tasks"] == ["甲", "乙"]
+    assert calls[2]["tasks"] == ["戊"]
+    assert outcome.succeeded is True
+
+
 def test_done_event_per_agent_defaults_to_empty():
     async def run():
         sink = Sink()
@@ -1103,3 +1159,91 @@ def test_done_event_per_agent_defaults_to_empty():
 
     done = [event.data for event in events if event.kind == "done"][0]
     assert done["per_agent"] == {}
+
+
+class LazyRegistry:
+    """最小 registry 替身，建模 resident/lazy 的划分。
+
+    loop 的 lazy 门控在存在时读取 ``lazy_names`` 与 ``is_active``，
+    因此无需构建完整的工具目录即可验证真实 registry 的两阶段规则。
+    """
+
+    def __init__(self, tools, *, lazy: set[str] | None = None):
+        self.tools = dict(tools)
+        self._lazy = set(lazy or ())
+        self._active = {name for name in self.tools if name not in self._lazy}
+
+    def names(self):
+        return list(self.tools)
+
+    def resolve(self, name):
+        return self.tools.get(name)
+
+    def schemas(self, names: set[str] | None = None):
+        selected = self._active if names is None else names
+        return [
+            {"type": "function", "function": {"name": n, "description": "", "parameters": {}}}
+            for n in self.tools
+            if n in selected
+        ]
+
+    def is_read_only(self, name):
+        return True
+
+    def lazy_names(self):
+        return [n for n in self.tools if n in self._lazy]
+
+    def is_active(self, name):
+        return name in self._active
+
+    def activate(self, name):
+        if name not in self.tools or name in self._active:
+            return False
+        self._active.add(name)
+        return True
+
+
+def test_unactivated_lazy_tool_is_refused_with_a_load_tool_hint():
+    """lazy 工具的 schema 从未被注入，因此调用它必须被
+    结构性地拒绝——而且拒绝信息必须指出修复方式 (load_tool)。"""
+    async def run():
+        sink = Sink()
+        tool = RecordingTool("calc_valuation", content="估值")
+        registry = LazyRegistry({"calc_valuation": tool}, lazy={"calc_valuation"})
+        provider = ScriptedProvider(
+            [
+                tool_round(ToolUse("c1", "calc_valuation", {"symbol": "600519"})),
+                text_round("改用其他方式"),
+            ]
+        )
+        loop = make_loop(provider, registry=registry, output=sink)
+        await loop.run("估值")
+        return tool, sink.events
+
+    tool, events = asyncio.run(run())
+
+    # 从未执行，并且模型被告知如何继续。
+    assert tool.calls == []
+    errors = [str(e.data.get("error", "")) for e in events if e.kind == "tool_status"]
+    assert any("load_tool" in err for err in errors), errors
+
+
+def test_activated_lazy_tool_runs_normally():
+    async def run():
+        sink = Sink()
+        tool = RecordingTool("calc_valuation", content="估值")
+        registry = LazyRegistry({"calc_valuation": tool}, lazy={"calc_valuation"})
+        registry.activate("calc_valuation")
+        provider = ScriptedProvider(
+            [
+                tool_round(ToolUse("c1", "calc_valuation", {"symbol": "600519"})),
+                text_round("完成"),
+            ]
+        )
+        loop = make_loop(provider, registry=registry, output=sink)
+        await loop.run("估值")
+        return tool
+
+    tool = asyncio.run(run())
+
+    assert len(tool.calls) == 1

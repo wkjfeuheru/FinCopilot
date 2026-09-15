@@ -1,9 +1,8 @@
-"""Integration: a real AgentLoop writes a report and the reviewer is triggered.
+"""集成测试：真实的 AgentLoop 写出报告并触发 reviewer。
 
-The unit tests cover each piece; this one proves they are wired together — the
-loop injects the coordinator, ``write_report`` calls it, and the verdict reaches
-the main transcript. The provider branches on the system prompt, so one scripted
-object plays both the author and the reviewer.
+单元测试覆盖了各个部分；本测试证明它们已串联在一起——loop 注入 coordinator，
+``write_report`` 调用它，最终结论传入主 transcript。provider 依据 system prompt
+分支，因此同一个脚本化对象可以同时扮演作者与 reviewer。
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
 
 
 class RoleBranchingProvider(Provider):
-    """Author rounds for the main loop; a review answer for the sub-agent."""
+    """对主循环返回作者轮次；对 sub-agent 返回 review 答复。"""
 
     def __init__(self, author_rounds, review_text="### [中] 风险章节缺触发条件"):
         self.author_rounds = list(author_rounds)
@@ -33,10 +32,10 @@ class RoleBranchingProvider(Provider):
 
     async def stream(self, *, system: str, messages: list, tools: list[dict], usage: ModelUsage):
         self.systems.append(system)
-        # The checklist heading is unique to the reviewer's system prompt; the
-        # main prompt also mentions "风险终审", so that would be ambiguous.
+        # checklist 标题是 reviewer system prompt 独有的；
+        # 主 prompt 也提到 "风险终审"，仅凭它会有歧义。
         if "风险核查清单" in system:
-            # The reviewer is a pure-reading agent here: answer immediately.
+            # 这里 reviewer 是纯读取 agent：立即作答。
             yield StreamChunk(StreamEvent.TEXT_DELTA, self.review_text)
             yield StreamChunk(
                 StreamEvent.MESSAGE_END, ModelUsage(input_tokens=9, output_tokens=5)
@@ -59,8 +58,8 @@ def text_round(*parts: str) -> list[StreamChunk]:
 
 def make_settings(tmp_path) -> Settings:
     return Settings(
-        # write_report is a WRITE tool with no whitelisted path, so it needs a
-        # confirmation channel; auto mode is the non-interactive equivalent.
+        # write_report 是没有白名单路径的 WRITE tool，因此需要
+        # 确认通道；auto 模式是非交互场景下的等价物。
         permission=PermissionSettings(default_mode="auto"),
         data={"cache_dir": tmp_path / "cache"},
         paths={"output_dir": tmp_path / "output"},
@@ -96,8 +95,8 @@ def test_a_real_loop_reviews_the_report_it_wrote(tmp_path):
     )
     data = DataAccess([], settings=settings)
     cite = CitationRegistry()
-    # The report body cites this id, so the appendix and unsourced-number checks
-    # have real provenance to work with — as they would in a live run.
+    # 报告正文引用了该 id，因此附录与无来源数字检查
+    # 有真实的 provenance 可用——与实盘运行一致。
     cite.register(
         tool="get_quote", endpoint="fake", symbol="600519", params={},
         rows=1, cols=1, fingerprint="fp",
@@ -119,10 +118,10 @@ def test_a_real_loop_reviews_the_report_it_wrote(tmp_path):
     outcome = asyncio.run(run())
 
     assert outcome.succeeded is True, outcome.error
-    # The reviewer actually ran — one of the provider's calls carried its role.
+    # reviewer 确实运行了——provider 的某次调用携带了它的角色。
     assert any("风险核查清单" in system for system in provider.systems)
 
-    # Its comments reached the main transcript as a tool result.
+    # 它的意见作为 tool result 到达主 transcript。
     tool_contents = [
         json_content
         for message in loop.messages
@@ -131,11 +130,11 @@ def test_a_real_loop_reviews_the_report_it_wrote(tmp_path):
     assert any("风险终审意见" in content for content in tool_contents)
     assert any("缺触发条件" in content for content in tool_contents)
 
-    # The sidecar review file exists next to the report.
+    # 报告旁边存在 sidecar review 文件。
     reviews = list(Path(settings.paths.output_dir).glob("*.review.md"))
     assert reviews, "the review verdict must be written to disk"
 
-    # And the spend is attributed to the sub-agent.
+    # 且开销被归因到 sub-agent。
     snapshot = loop.stats.snapshot()
     assert snapshot.per_agent["risk"]["input_tokens"] == 9
     assert snapshot.per_agent["risk"]["output_tokens"] == 5

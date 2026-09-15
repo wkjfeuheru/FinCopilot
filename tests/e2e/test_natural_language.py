@@ -1,8 +1,8 @@
-"""End-to-end acceptance: natural language -> agent picks a tool -> grounded reply.
+"""端到端验收：自然语言 -> agent 选择工具 -> 有依据的回复。
 
-These tests hit a real LLM provider and real market-data sources, so they are
-marked ``smoke`` and skipped unless credentials and network are available.
-Run with: ``uv run pytest -m smoke``; the default suite excludes them.
+这些测试会访问真实的 LLM provider 和真实的市场数据源，因此被标记为
+``smoke``，并且在缺少凭证和网络时会被跳过。
+运行方式：``uv run pytest -m smoke``；默认测试集不包含它们。
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ pytestmark = pytest.mark.smoke
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-chat"
-# Exercise the shipped prompt so the asset itself is under test.
+# 使用随包发布的 prompt，以便该资产本身也处于测试之下。
 SYSTEM_PROMPT = system_prompt()
 
 
@@ -61,7 +61,7 @@ def _build_loop(tmp_path) -> AgentLoop:
 
 
 def test_natural_language_question_routes_to_a_tool_and_returns_grounded_data(tmp_path):
-    """A price question must reach a market-data tool and yield a real number."""
+    """一个价格问题必须触达市场数据工具，并返回一个真实数字。"""
     loop = _build_loop(tmp_path)
 
     async def run():
@@ -71,9 +71,9 @@ def test_natural_language_question_routes_to_a_tool_and_returns_grounded_data(tm
 
     assert outcome.succeeded is True, outcome.error
     assert outcome.tool_calls >= 1, "the model should have called a data tool"
-    # A grounded answer contains digits from the fetched frame.
+    # 有依据的回答包含从获取的数据帧中得到的数字。
     assert any(ch.isdigit() for ch in outcome.answer)
-    # Provenance was recorded for the data actually used.
+    # 已为实际使用的数据记录来源信息。
     assert outcome.citations, "a data-backed answer must register citations"
 
 

@@ -1,4 +1,4 @@
-"""Two-tier registry: resident/lazy split, search and activation (docs 03.4.3)."""
+"""两级 registry：resident/lazy 拆分、搜索与激活（docs 03.4.3）。"""
 
 from finharness.config.settings import Settings, ToolSettings
 from finharness.data.access import DataAccess
@@ -21,8 +21,8 @@ def test_lazy_tools_are_not_injected_until_activated(tmp_path):
     assert "get_announcements" not in schema_names(registry)
 
     assert registry.activate("get_announcements") is True
-    # The schema appears only after activation, matching "the model may only
-    # call tools it has been given".
+    # schema 只有在激活之后才出现，这与"模型只能调用
+    # 已授予它的 tool"一致。
     assert "get_announcements" in schema_names(registry)
 
 
@@ -57,8 +57,8 @@ def test_search_matches_name_and_description(tmp_path):
 def test_search_ranks_a_name_match_above_a_description_match(tmp_path):
     registry = make_registry(tmp_path)
 
-    # A name hit is worth more than a description hit, so a tool whose *name*
-    # carries the keyword scores at least the name-match weight.
+    # 命中名称比命中 description 更有价值，因此 *name* 中带有该关键字的 tool
+    # 至少获得名称匹配的权重。
     briefs = {brief.name: brief.score for brief in registry.search("quote", limit=10)}
     assert briefs.get("get_quote", 0) >= 3
 
@@ -66,8 +66,8 @@ def test_search_ranks_a_name_match_above_a_description_match(tmp_path):
 def test_search_matches_chinese_keywords_in_descriptions(tmp_path):
     registry = make_registry(tmp_path)
 
-    # Chinese keywords live in the descriptions; both valuation-related tools
-    # should surface for a 估值 query.
+    # 中文关键字存在于 description 中；两个与 valuation 相关的 tool
+    # 都应在 估值 查询中出现。
     scores = {brief.name: brief.score for brief in registry.search("估值", limit=10)}
     assert scores.get("get_valuation", 0) >= 1
     assert scores.get("get_peers", 0) >= 1
@@ -89,17 +89,42 @@ def test_registry_covers_the_documented_catalogue(tmp_path):
     expected = {
         "get_quote", "get_kline", "get_indicators", "get_financials",
         "get_valuation", "get_peers", "get_market_news", "get_announcements",
-        "calc_metrics", "calc_valuation", "make_chart", "write_report",
-        "read_file", "write_file", "web_search", "fetch_url", "research_plan",
-        "search_tools", "list_skills", "load_skill", "load_tool", "ask_user",
-        "remember_preference",
+        "get_research_reports",
+        "get_macro_indicators", "get_industry_perf", "get_industry_constituents",
+        "calc_metrics", "calc_valuation", "run_backtest", "make_chart", "write_report",
+        "read_file", "write_file", "web_search", "research_plan",
+        "update_plan_step", "record_conclusion",
+        "search_tools", "list_skills", "load_skill", "load_tool", "spawn_agent",
+        "ask_user", "remember_preference",
     }
     assert set(registry.names()) == expected
     assert set(registry.names()) == {cls.name for cls in ALL_TOOL_CLASSES}
 
 
+def test_the_general_sub_agent_gets_local_material_tools_only(tmp_path):
+    """worker 消费素材；它不得携带数据获取层。
+
+    reviewer 合理地拥有数据 tool（它要复核数字）；普通 worker 则不然，
+    因为任务语句不指定任何 symbol 或 period，若赋予它数据 tool，
+    会招致猜测而非隔离。
+    """
+    from finharness.tools.registry import review_tool_names, worker_tool_names
+
+    worker = set(worker_tool_names())
+    reviewer = set(review_tool_names())
+
+    assert worker == {"read_file"}
+    assert "get_quote" not in worker and "get_research_reports" not in worker
+    # reviewer 保留其数据 tool——这正是它的全部价值所在。
+    assert "get_quote" in reviewer
+    # 且两个子 agent 都不得再 spawn 或触达 META/写 tool。
+    for name in ("spawn_agent", "write_report", "write_file", "load_tool", "ask_user"):
+        assert name not in worker
+        assert name not in reviewer
+
+
 def test_meta_tools_can_reach_the_catalogue(tmp_path):
-    """search_tools and load_tool operate on the registry they live in."""
+    """search_tools 与 load_tool 操作它们自身所在的 registry。"""
     registry = make_registry(tmp_path)
     tool = registry.resolve("search_tools")
 

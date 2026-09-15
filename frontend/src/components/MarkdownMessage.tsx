@@ -3,15 +3,15 @@ import remarkGfm from "remark-gfm";
 import { artifactUrl } from "../api/client";
 import { renderCitations } from "../lib/citations";
 
-/** Sources a chart/report path produced on the server, not a remote URL. */
+/** 图表/研报路径由服务端产出，并非远程 URL。 */
 function isLocalFile(src: string): boolean {
   return !/^(https?:|data:|blob:|javascript:|#)/i.test(src);
 }
 
-// react-markdown percent-encodes URLs before they reach here (normalizeUri:
-// `F:\a b.png` arrives as `F%3A%5Ca%20b.png`). The server needs the raw path to
-// resolve the artefact, so decode it back; a literal `%` that is not a valid
-// escape leaves decodeURIComponent undefined-behaviour-safe via the fallback.
+// react-markdown 在 URL 到达这里之前会做百分号编码（normalizeUri：
+// `F:\a b.png` 会以 `F%3A%5Ca%20b.png` 到达）。服务端需要原始路径才能
+// 解析产出物，因此这里解码回去；对于并非合法转义的字面 `%`，
+// 通过兜底分支避免 decodeURIComponent 出现未定义行为。
 function decodeLocalPath(src: string): string {
   try {
     return decodeURIComponent(src);
@@ -20,10 +20,10 @@ function decodeLocalPath(src: string): string {
   }
 }
 
-// A link destination may not contain an unescaped space, so a path like
-// `F:\python project\...png` makes the whole `![alt](path)` render as literal
-// text instead of an image. Angle brackets are the spec's escape hatch for such
-// destinations; wrap the local file paths so charts show up as images.
+// 链接目标不能包含未转义的空格，因此像
+// `F:\python project\...png` 这样的路径会让整个 `![alt](path)` 渲染为
+// 字面文本而非图片。尖括号是规范为此类目标提供的转义方式；
+// 将本地文件路径包裹起来，图表才能显示为图片。
 const LOCAL_DESTINATION_RE = /(!?\[[^\]]*\]\()([^()<>\n]+)(\))/g;
 
 function wrapLocalDestinations(text: string): string {
@@ -33,7 +33,7 @@ function wrapLocalDestinations(text: string): string {
       const dest = rawDest.trim();
       if (!dest || !/\s/.test(dest)) return match;
       if (/^(https?:|data:|blob:|mailto:|tel:|#)/i.test(dest)) return match;
-      // Only paths are ours to reinterpret; prose links stay untouched.
+      // 只有路径才由我们重新解释；普通链接保持不动。
       if (!dest.includes("\\") && !dest.includes("/")) return match;
       return `${head}<${dest}>${tail}`;
     },
@@ -44,7 +44,7 @@ function scrollToSource(cid: string) {
   document.getElementById(`cite-${cid}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
-/** Renders an assistant message as markdown, with citations linked to sources. */
+/** 将助手消息渲染为 markdown，并把 citations 链接到数据来源。 */
 export function MarkdownMessage({
   text,
   citationOrder,
@@ -56,9 +56,9 @@ export function MarkdownMessage({
     <div className="markdown-body">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        // React-markdown sanitises unknown URL schemes by default, which would
-        // strip Windows paths like C:\...; trust is restored here and the raw
-        // link/image components below decide what is actually emitted.
+        // react-markdown 默认会净化未知的 URL scheme，这会
+        // 剥离像 C:\... 这样的 Windows 路径；这里恢复信任，由下方的
+        // 原生链接/图片组件决定实际输出什么。
         urlTransform={(url) => url}
         components={{
           img({ src, alt }) {

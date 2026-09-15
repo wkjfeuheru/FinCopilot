@@ -11,6 +11,8 @@ export type AgentStep = {
   detail?: string;
   durationMs?: number;
   tokens?: number;
+  /** 该步产出的文件（图表、研报）。持久化在轮次事件中，使刷新后仍可还原。 */
+  attachments?: string[];
 };
 
 export type TurnMetrics = {
@@ -59,7 +61,7 @@ function storedAgentLabel(name: string): string {
   return name === "risk" ? "风险审阅子代理" : `${name} 子代理`;
 }
 
-/** Rebuild the visible ledger from events persisted with a historical answer. */
+/** 从随历史回答持久化的事件中重建可见的执行记录。 */
 export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
   let planned = false;
   let status: TurnTrace["status"] = "done";
@@ -88,6 +90,12 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
         status: started ? "running" : data.ok === false ? "error" : "done",
         durationMs: started ? undefined : Number(data.duration_ms ?? 0) || undefined,
         detail: data.ok === false ? String(data.error ?? "执行失败") : undefined,
+        // 工具产出的文件随事件持久化，重建 trace 时一并还原，
+        // 否则刷新后产出文件一栏会消失。只在完成事件上写入，
+        // 避免覆盖已记录的文件。
+        ...(started
+          ? {}
+          : { attachments: (data.attachments as string[] | undefined) ?? [] }),
       });
     }
     if (event.event === "context_compacted") {
@@ -109,6 +117,29 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
         label: aborted ? "终止重复调用" : "跳过重复调用",
         status: aborted ? "error" : "info",
         detail: String(data.name ?? ""),
+      });
+    }
+    if (event.event === "plan_progress") {
+      planned = true;
+      const revision = Number(data.revision ?? 1);
+      const done = Number(data.done ?? 0);
+      const total = Number(data.total ?? 0);
+      const drift = (data.drift as string[] | undefined) ?? [];
+      const mismatch = (data.mismatch as string[] | undefined) ?? [];
+      const stalled = Number(data.stalled_turns ?? 0);
+      const detail = [
+        `进度 ${done}/${total}`,
+        revision > 1 ? `第 ${revision} 版` : "",
+        drift.length ? `目标外：${drift.join("、")}` : "",
+        mismatch.length ? `能力外：${mismatch.join("、")}` : "",
+        stalled ? `停滞 ${stalled} 轮` : "",
+      ].filter(Boolean).join(" · ");
+      upsert({
+        key: "plan-progress",
+        kind: "plan",
+        label: "研究计划进度",
+        status: "info",
+        detail,
       });
     }
     if (event.event === "interactive_request") {
@@ -239,7 +270,10 @@ export function TurnMetricsBar({ metrics }: { metrics: TurnMetrics }) {
 }
 
 export function AgentTrace({ trace }: { trace: TurnTrace }) {
-  const [expanded, setExpanded] = useState(true);
+  // 实时一轮默认展开，让用户看到 Agent 正在做什么；从历史还原的轮次
+  // （状态已是 done/error）默认收起，切换对话时不会立刻铺满整页步骤。
+  // 之后由用户自己的开合决定，不再随状态变化。
+  const [expanded, setExpanded] = useState(() => trace.status === "running");
   const completed = trace.steps.filter((step) => step.status === "done").length;
   return (
     <details

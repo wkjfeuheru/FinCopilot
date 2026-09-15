@@ -1,4 +1,4 @@
-"""OpenAI-compatible streaming provider."""
+"""OpenAI 兼容的流式 provider。"""
 from __future__ import annotations
 
 import json
@@ -13,6 +13,8 @@ from finharness.provider.errors import (
     NetworkError,
     RateLimitError,
     ServerError,
+    TokenLimitError,
+    is_token_limit_error,
     parse_retry_after,
 )
 from finharness.provider.event_stream import ToolUseAccumulator, iter_sse_data
@@ -20,7 +22,10 @@ from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUseD
 
 
 def _raise_provider_error(error: Any) -> None:
+    """根据 provider 返回的错误内容映射为对应的 provider 异常。"""
     text = str(error).lower() if not isinstance(error, dict) else " ".join(str(error.get(k, "")) for k in ("code", "type", "message", "error")).lower()
+    if is_token_limit_error(text):
+        raise TokenLimitError("Provider context window exceeded")
     if any(x in text for x in ("rate_limit", "rate limit", "ratelimit")):
         raise RateLimitError("Provider rate limit exceeded")
     if any(x in text for x in ("authentication", "permission", "api_key", "api key", "unauthorized")):
@@ -30,10 +35,27 @@ def _raise_provider_error(error: Any) -> None:
     raise NetworkError("Provider returned an error")
 
 
+async def _raise_http_error(response: Any) -> None:
+    """把 4xx 响应细分为上下文超限或一般请求失败。
+
+    超限时读取响应体并与 ``_raise_provider_error`` 用同一套特征匹配，使
+    "Token 超限"能作为独立错误类型被观测到，而不是混进通用网络错误。
+    """
+    body = ""
+    try:
+        body = (await response.aread()).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - 读不到正文时按一般失败处理
+        body = ""
+    if is_token_limit_error(body):
+        raise TokenLimitError("Provider context window exceeded")
+    raise NetworkError(f"Provider request failed ({response.status_code})")
+
+
 def _update_usage(final: ModelUsage, raw_usage: Any) -> None:
+    """用 provider 返回的原始 usage 更新最终 ModelUsage（含前缀缓存计量）。"""
     if raw_usage is None:
-        # Many OpenAI-compatible gateways send "usage": null on every delta and
-        # only fill it on the final chunk; absent usage is not an error.
+        # 许多 OpenAI 兼容网关在每个增量上都发送 "usage": null，
+        # 仅在最后一个分块才填充；usage 缺失并非错误。
         return
     if not isinstance(raw_usage, dict):
         raise NetworkError("Provider returned invalid usage")
@@ -50,9 +72,9 @@ def _update_usage(final: ModelUsage, raw_usage: Any) -> None:
             raise NetworkError("Provider returned invalid usage token count")
     final.input_tokens = values["prompt_tokens"]
     final.output_tokens = values["completion_tokens"]
-    # Prefix-cache split, reported by providers that support it (DeepSeek sends
-    # prompt_cache_hit_tokens / prompt_cache_miss_tokens). Absent means the
-    # provider does not cache, so the split stays zero without being an error.
+    # 前缀缓存拆分，由支持该特性的 provider 报告（DeepSeek 会发送
+    # prompt_cache_hit_tokens / prompt_cache_miss_tokens）。缺失表示该 provider
+    # 未启用缓存，此时拆分保持为零，并非错误。
     for source, target in (
         ("prompt_cache_hit_tokens", "cache_hit_tokens"),
         ("prompt_cache_miss_tokens", "cache_miss_tokens"),
@@ -80,6 +102,11 @@ class OpenAICompatProvider(Provider):
         self.first_byte_timeout_s, self.idle_timeout_s = first_byte_timeout_s, idle_timeout_s
 
     async def stream(self, *, system: str, messages: list[Msg], tools: list[dict], usage: ModelUsage) -> AsyncIterator[StreamChunk]:
+        """以流式方式请求 OpenAI 兼容的 chat completions 接口并产出规范化事件。
+
+        负责组装请求消息（含工具调用与工具结果）、解析 SSE 增量，
+        并累积工具调用片段直至流结束。
+        """
         request_messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         for message in messages:
             if message.role == "tool_result":
@@ -95,7 +122,8 @@ class OpenAICompatProvider(Provider):
                 if response.status_code in (401, 403): raise AuthError(f"Provider authentication failed ({response.status_code})")
                 if response.status_code == 429: raise RateLimitError("Provider rate limit exceeded", retry_after_s=parse_retry_after(response.headers.get("Retry-After")))
                 if response.status_code >= 500: raise ServerError(f"Provider server error ({response.status_code})")
-                if response.status_code >= 400: raise NetworkError(f"Provider request failed ({response.status_code})")
+                if response.status_code >= 400:
+                    await _raise_http_error(response)
                 async for data in iter_sse_data(response.aiter_lines(), first_byte_timeout_s=self.first_byte_timeout_s, idle_timeout_s=self.idle_timeout_s):
                     if data.strip() == "[DONE]": break
                     try: event = json.loads(data)

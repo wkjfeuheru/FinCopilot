@@ -1,4 +1,4 @@
-"""Provider construction from validated settings."""
+"""根据校验后的配置构建 provider。"""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def build_provider_from_fields(
     idle_timeout_s: float = 60.0,
     client: httpx.AsyncClient | None = None,
 ):
-    """Assemble a provider from explicit fields, bypassing preset lookup."""
+    """根据显式字段组装 provider，绕过预设查找。"""
     if kind == "fake":
         return FakeProvider(["FakeProvider is enabled explicitly."])
     if kind not in {"openai_compat", "anthropic_compat"}:
@@ -72,6 +72,7 @@ def build_provider(
     client: httpx.AsyncClient | None = None,
     settings: Settings | None = None,
 ):
+    """从 settings 文件（或给定 Settings）构建当前激活的 provider。"""
     settings = settings or Settings.from_file(path)
     settings.validate(require_api_key=True)
     config = settings.providers[settings.model.provider]

@@ -1,8 +1,7 @@
-"""Loop guard: repeated identical tool calls are nudged, then aborted.
+"""Loop guard：重复的相同 tool call 会先被提醒，随后被中止。
 
-A repeated identical call cannot add information — its result is already in the
-transcript and in the cache — so the guard refuses it and, if the model repeats
-the same mistake, ends the run with whatever was already established.
+重复的相同调用无法带来新信息——其结果已经在 transcript 和缓存中——因此
+guard 会拒绝它，并且如果模型重犯同样的错误，就以已经确立的内容结束本次运行。
 """
 
 import asyncio
@@ -20,7 +19,7 @@ from finharness.hooks.base import HookChain
 from finharness.permissions.gate import PermissionGate
 from finharness.types import ToolUse
 
-# Shared vocabulary cache: fetching it is expensive and must not repeat per test.
+# 共享的词汇表缓存：抓取它代价高昂，绝不能在每个测试中重复进行。
 COUNTER = TokenCounter()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
@@ -54,7 +53,7 @@ def build_loop(tmp_path, provider, *, registry=None, output=None, settings=None,
 
 
 def repeated_rounds(times: int, args: dict | None = None) -> list[list]:
-    """The same tool call, issued `times` times, then a final answer."""
+    """同一个 tool call，重复发起 `times` 次，然后给出最终回答。"""
     call_args = args or {"symbol": "600519"}
     rounds = [
         tool_round(ToolUse(f"call_{index}", "get_quote", dict(call_args)))
@@ -71,9 +70,9 @@ def test_first_repeat_is_refused_with_a_nudge_not_executed(tmp_path):
 
     outcome = asyncio.run(loop.run("查报价"))
 
-    # The third identical call is refused, so the tool ran only twice.
+    # 第三次相同调用被拒绝，因此工具只运行了两次。
     assert len(tool.calls) == 2
-    assert outcome.succeeded is True  # the model recovered and answered
+    assert outcome.succeeded is True  # 模型恢复正常并作出了回答
 
 
 def test_nudge_message_tells_the_model_to_reuse(tmp_path):
@@ -90,7 +89,7 @@ def test_nudge_message_tells_the_model_to_reuse(tmp_path):
 
 
 def test_guard_events_and_results_are_well_formed(tmp_path):
-    """The refused call still gets a paired tool_result so the transcript stays valid."""
+    """被拒绝的调用仍会获得配对的 tool_result，以保持 transcript 合法。"""
     tool = RecordingTool("get_quote", content="报价")
     provider = ScriptedProvider(repeated_rounds(3))
     loop = build_loop(tmp_path, provider, registry=StubRegistry({"get_quote": tool}))
@@ -98,14 +97,14 @@ def test_guard_events_and_results_are_well_formed(tmp_path):
     asyncio.run(loop.run("查报价"))
     results = [m for m in loop.messages if m.role == "tool_result"]
 
-    # Every assistant tool call has a matching result id.
+    # 每个 assistant tool call 都有匹配的 result id。
     requested = {t.call_id for m in loop.messages for t in m.tool_uses}
     answered = {cid for m in results for cid, _ in m.tool_results}
     assert requested == answered == {"call_0", "call_1", "call_2"}
 
 
 def test_distinct_arguments_are_not_treated_as_repeats(tmp_path):
-    """Comparing two symbols with the same tool is legitimate, not a loop."""
+    """用同一个工具比较两个标的属于正常行为，并非循环。"""
     tool = RecordingTool("get_quote", content="报价")
     provider = ScriptedProvider(
         [
@@ -125,7 +124,7 @@ def test_distinct_arguments_are_not_treated_as_repeats(tmp_path):
 
 
 def test_alternating_loop_is_caught_by_cumulative_counting(tmp_path):
-    """A/B/A/B is a loop too, so counting must be cumulative, not consecutive."""
+    """A/B/A/B 同样是循环，因此计数必须是累计的，而非连续计数。"""
     tool = RecordingTool("get_quote", content="报价")
     other = RecordingTool("get_kline", content="K线")
     provider = ScriptedProvider(
@@ -145,7 +144,7 @@ def test_alternating_loop_is_caught_by_cumulative_counting(tmp_path):
     outcome = asyncio.run(loop.run("交替调用"))
 
     assert outcome.succeeded is True
-    # Each shape was refused on its third attempt.
+    # 每种调用形态都在其第三次尝试时被拒绝。
     assert len(tool.calls) == 2
     assert len(other.calls) == 2
 
@@ -160,11 +159,11 @@ def test_second_offence_aborts_the_run_with_partial_findings(tmp_path):
 
     assert outcome.succeeded is False
     assert outcome.reason == "loop_detected"
-    # The run ends with what it established rather than an empty answer.
+    # 运行以已确立的结论结束，而非给出空答案。
     assert outcome.answer, "a detected loop must still report partial findings"
     assert "提前结束" in outcome.answer
     kinds = [e.kind for e in sink.events]
-    assert "loop_detected" not in kinds  # surfaced as error/done, not a new kind
+    assert "loop_detected" not in kinds  # 以 error/done 呈现，而不是新的事件类型
     assert kinds.count("done") == 1
     assert any(e.kind == "error" and e.data.get("reason") == "loop_detected" for e in sink.events)
 
@@ -182,7 +181,7 @@ def test_partial_findings_include_conclusions_and_citation_count(tmp_path):
 
 
 def test_complex_task_nudge_mentions_replanning(tmp_path):
-    """With a plan in place the nudge should point at research_plan, not just reuse."""
+    """在已有 plan 的情况下，提醒应指向 research_plan，而不仅仅是复用。"""
     tool = RecordingTool("get_quote", content="报价")
     provider = ScriptedProvider(repeated_rounds(3))
     loop = build_loop(tmp_path, provider, registry=StubRegistry({"get_quote": tool}), plan=True)
@@ -190,7 +189,7 @@ def test_complex_task_nudge_mentions_replanning(tmp_path):
     asyncio.run(loop.run("复杂任务"))
     refused = loop.messages[-1] if loop.messages else None
 
-    # Find the refusal payload among the tool results.
+    # 在各 tool result 中找出拒绝 payload。
     payloads = [
         json.loads(raw)
         for m in loop.messages
@@ -222,12 +221,12 @@ def test_simple_task_nudge_does_not_mention_replanning(tmp_path):
 
 
 def test_counts_reset_between_runs(tmp_path):
-    """The guard is scoped to one request, so a later question starts clean."""
+    """guard 的作用域限于单次请求，因此后续提问会从零开始。"""
     tool = RecordingTool("get_quote", content="报价")
 
     async def run():
-        # Each run issues the same identical call twice; with a threshold of 3
-        # neither run reaches the nudge, proving counts restarted.
+        # 每次运行都将同一相同调用发起两次；在阈值为 3 的情况下，
+        # 两次运行都达不到提醒阈值，从而证明计数已重置。
         provider = ScriptedProvider(
             [tool_round(ToolUse("a1", "get_quote", {"symbol": "600519"})), text_round("第一次答")]
             + [tool_round(ToolUse("a2", "get_quote", {"symbol": "600519"})), text_round("第二次答")]
@@ -241,8 +240,8 @@ def test_counts_reset_between_runs(tmp_path):
 
     assert first.succeeded is True
     assert second.succeeded is True
-    # Both identical calls executed: if counts carried over, the second would
-    # have been refused.
+    # 两次相同调用都执行了：如果计数被延续，那么第二次
+    # 本应被拒绝。
     assert len(tool.calls) == 2
 
 
@@ -250,7 +249,7 @@ def test_turn_counter_resets_per_run(tmp_path):
     tool = RecordingTool("get_quote", content="报价")
 
     async def run():
-        # Each run is one tool round plus a final answer = 2 turns.
+        # 每次运行是一轮 tool round 加一个最终回答 = 2 turns。
         rounds = [
             tool_round(ToolUse("a1", "get_quote", {"symbol": "600519"})),
             text_round("第一答"),
@@ -266,7 +265,7 @@ def test_turn_counter_resets_per_run(tmp_path):
 
     first_turn, second_turn = asyncio.run(run())
 
-    # Both runs take 2 turns; without a per-run reset the second would read 4.
+    # 两次运行都耗时 2 turns；若无每次运行的重置，第二次会读到 4。
     assert first_turn == 2
     assert second_turn == 2
 
@@ -299,6 +298,6 @@ def test_threshold_is_configurable(tmp_path):
 
     outcome = asyncio.run(loop.run("查报价"))
 
-    # Threshold 2: the second identical call is the first offence.
+    # 阈值为 2：第二次相同调用即为第一次违规。
     assert len(tool.calls) == 1
     assert outcome.succeeded is False

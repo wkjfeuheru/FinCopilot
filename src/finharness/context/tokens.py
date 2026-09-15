@@ -1,13 +1,11 @@
-"""Token counting for context-budget decisions.
+"""用于上下文预算决策的 token 计数。
 
-Compaction triggers on "how much will the next request cost", so a count is
-needed before the request is sent. tiktoken gives a real count; where it is
-unavailable (or its vocabulary cannot be fetched) the documented character
-approximation is used instead, and the caller is told which path ran.
+压缩以“下一次请求将花费多少”为触发条件，因此需要在请求发出之前完成计数。
+tiktoken 给出真实计数；当它不可用（或无法获取其词表）时，改用文档约定的
+字符数近似值，并告知调用方实际走了哪条路径。
 
-The vocabulary is cached inside the project rather than the system temp
-directory: a cold cache costs roughly two minutes of downloading, and temp
-directories get cleaned, which would turn that into an intermittent stall.
+词表缓存在项目内部，而不是系统临时目录：一次冷缓存大约要下载两分钟，而临时
+目录会被清理，从而把这件事变成间歇性的卡顿。
 """
 
 from __future__ import annotations
@@ -16,15 +14,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-# cl100k_base is the closest widely-available vocabulary for the mixed
-# Chinese/English traffic this system sees.
+# cl100k_base 是系统所处理的中英混合文本最接近且广泛可用的词表。
 ENCODING_NAME = "cl100k_base"
-# A single project-local cache for the vocabulary, independent of the data cache
-# layout so test temp directories do not each fetch their own copy.
+# 词表统一缓存在项目本地，独立于数据缓存的布局，这样测试用的临时目录
+# 就不会各自再下载一份副本。
 # parents: [0]=context, [1]=finharness, [2]=src, [3]=repo root
 VOCAB_CACHE_DIR = Path(__file__).resolve().parents[3] / "data_cache" / "tiktoken"
-# Documented fallback (docs 03.6.3): Chinese-heavy text runs about 1.7 chars
-# per token.
+# 文档约定的回退方案（docs 03.6.3）：中文为主文本约每 token 1.7 个字符。
 CHARS_PER_TOKEN = 1.7
 
 
@@ -35,13 +31,12 @@ class TokenCount:
 
 
 class TokenCounter:
-    """Counts tokens, preferring tiktoken and degrading to an estimate."""
+    """统计 token 数，优先使用 tiktoken，不可用时降级为估算。"""
 
     def __init__(self, *, cache_dir: str | Path | None = None) -> None:
-        # The vocabulary is shared across every counter: it is large, slow to
-        # fetch, and identical regardless of which cache directory a caller
-        # happens to use. Pointing per-instance directories at it would make each
-        # new directory re-download the file (observed as ~100s on first use).
+        # 词表在所有计数器之间共享：它体积大、获取慢，且无论调用方使用哪个
+        # 缓存目录，内容都完全相同。让每个实例指向各自的目录会导致每出现一个
+        # 新目录都重新下载该文件（首次使用时实测约 100 秒）。
         directory = Path(cache_dir) if cache_dir is not None else _default_cache_dir()
         directory.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(directory))
@@ -49,22 +44,24 @@ class TokenCounter:
         self._failed = False
 
     def _load(self):
+        """惰性加载并缓存编码器；失败时记录标记并返回 None。"""
         if self._encoder is not None or self._failed:
             return self._encoder
         try:
             import tiktoken
 
             self._encoder = tiktoken.get_encoding(ENCODING_NAME)
-        except Exception:  # noqa: BLE001 - any failure means "fall back"
+        except Exception:  # noqa: BLE001 - 任何失败都意味着“回退”
             self._failed = True
             self._encoder = None
         return self._encoder
 
     def warmup(self) -> bool:
-        """Fetch the vocabulary once at startup; returns whether it is usable."""
+        """在启动时获取一次词表；返回它是否可用。"""
         return self._load() is not None
 
     def count(self, text: str | None) -> TokenCount:
+        """统计一段文本的 token 数；编码器不可用时退化为字符近似。"""
         if not text:
             return TokenCount(tokens=0, exact=True)
         encoder = self._load()
@@ -72,31 +69,30 @@ class TokenCounter:
             return TokenCount(tokens=int(len(text) / CHARS_PER_TOKEN), exact=False)
         try:
             return TokenCount(tokens=len(encoder.encode(text)), exact=True)
-        except Exception:  # noqa: BLE001 - treat unusable encoder as absent
+        except Exception:  # noqa: BLE001 - 将不可用的编码器视为不存在
             self._failed = True
             return TokenCount(tokens=int(len(text) / CHARS_PER_TOKEN), exact=False)
 
     def count_many(self, texts) -> int:
+        """统计多段文本的 token 总数。"""
         return sum(self.count(text).tokens for text in texts)
 
 
 def truncate_to_tokens(
     text: str, counter: "TokenCounter", limit: int, *, marker: str = "…"
 ) -> str:
-    """Cut text to a token budget, landing on a character boundary.
+    """把文本裁剪到指定 token 预算，并落在字符边界上。
 
-    Used wherever a memory layer must fit an injection budget (summary segments,
-    recall, long-term recall). The marker is charged *against* the budget, so the
-    result never exceeds the limit — otherwise a caller sizing content exactly to
-    the budget would overflow by the marker's length and trigger another round.
+    凡是记忆层需要适配注入预算的地方都会用到（摘要分段、召回、长期召回）。
+    标记字符也计入预算，因此结果绝不会超过上限 —— 否则把内容恰好按预算大小
+    设定的调用方，会因标记字符的长度而溢出并触发又一轮处理。
     """
     if limit <= 0 or counter.count(text).tokens <= limit:
         return text
     marker_tokens = counter.count(marker).tokens
     body_budget = max(limit - marker_tokens, 0)
     low, high = 0, len(text)
-    # Counting is monotone in prefix length, so the longest fitting prefix is
-    # found by bisection.
+    # 计数对前缀长度单调不减，因此用二分法找到能放下的最长前缀。
     while low < high:
         middle = (low + high + 1) // 2
         if counter.count(text[:middle]).tokens <= body_budget:
@@ -110,6 +106,6 @@ def truncate_to_tokens(
 
 
 def _default_cache_dir() -> Path:
-    """Project-local vocabulary cache; overridable by the environment."""
+    """项目本地的词表缓存；可由环境变量覆盖。"""
     override = os.environ.get("TIKTOKEN_CACHE_DIR")
     return Path(override) if override else VOCAB_CACHE_DIR

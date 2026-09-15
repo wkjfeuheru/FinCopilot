@@ -1,40 +1,28 @@
-"""write_report: turn a structured outline into a report artefact (docs 3.9).
+"""write_report：把结构化大纲转成报告产物（文档 3.9）。
 
-Deliberately takes no ``path`` argument. The output location is derived from the
-topic, which has two consequences: the naming convention cannot be bypassed, and
-— because the permission gate only skips confirmation for writes carrying a
-path inside the artefact directories — producing a report always asks the user
-first.
+刻意不接收 ``path`` 参数。输出位置由主题推导，这带来两点后果：
+命名约定无法被绕过；并且——由于权限闸门只对携带产物目录内
+路径的写入跳过确认——生成报告时总会先征求用户同意。
 
-Writing a report also runs the risk-review sub-agent (docs 03.10). That is the
-only trigger for review: putting it here, rather than in a tool the model may
-choose, makes "every report gets reviewed" a property of the system instead of a
-hope about model behaviour.
+撰写报告还会运行风险审查子代理（文档 03.10）。这是审查的唯一触发点：
+把它放在这里，而不是放在一个模型可以自行选择的工具里，能让"每份报告
+都经过审查"成为系统的一种属性，而非对模型行为的期望。编排逻辑本身位于
+``report/review.py``；本工具只负责渲染，然后调用它一次。
 """
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-
 from pydantic import BaseModel, Field
 
 from finharness.data.raw import RawData
-from finharness.report.pipeline import (
+from finharness.coordinator.review import format_review_lines, review_report
+from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.fin.report_pipeline import (
     ReportOutline,
     ReportPipeline,
     ReportSection,
     ReportValidationError,
 )
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
-
-# The appendix is a citation table, not prose: the reviewer judges the body and
-# the risk section, so sending the table would cost tokens without changing a
-# single comment.
-APPENDIX_MARKER = "\n## 附录"
-# A review records the digest of the body it judged, so an unchanged rewrite
-# reuses the verdict instead of paying for the same review twice.
-REVIEW_DIGEST_PREFIX = "<!-- reviewed-body:"
 
 
 class SectionInput(BaseModel):
@@ -64,8 +52,8 @@ class WriteReportTool(BaseTool):
     input_model = ReportInput
     permission = PermissionLevel.WRITE
     group = ToolGroup.FIN_OUTPUT
-    # Report rendering plus one review turn against a real provider. The default
-    # 30s budget cannot cover the provider round trip a review needs.
+    # 报告渲染，外加一轮针对真实服务提供方的审查调用。默认的
+    # 30s 预算无法覆盖一次审查所需的提供方往返耗时。
     timeout = 300
     output_schema_note = "产出 output/<topic>_<YYYYMMDD>.md 与 .docx，并附风险终审意见。"
     needs_coordinator = True
@@ -79,6 +67,7 @@ class WriteReportTool(BaseTool):
         risks: list[str],
         formats: list[str] | None = None,
     ) -> RawData:
+        """按结构化大纲渲染报告，运行风险审查，并返回带附件的文本结果。"""
         outline = ReportOutline(
             topic=topic,
             core_view=list(core_view),
@@ -96,15 +85,15 @@ class WriteReportTool(BaseTool):
         pipeline = ReportPipeline(
             cite=self.ctx.cite,
             settings=self.data.settings,
-            # The catalogue doubles as the detection dictionary: a body that
-            # names any internal tool — called this session or not — is
-            # exposing system plumbing instead of speaking to the reader.
+            # 工具目录同时充当检测字典：正文只要点名了任何内部工具——
+            # 无论本次会话是否调用过——就是在暴露系统内部管线，
+            # 而不是在面向读者行文。
             tool_names=set(self.registry.names()) if self.registry is not None else set(),
         )
         try:
             artifact = pipeline.export(outline, formats=tuple(formats or ("md", "docx")))
         except ReportValidationError as exc:
-            # Precise, actionable feedback so the model can fix the outline.
+            # 精确、可操作的反馈，便于模型修正大纲。
             raise ValueError("报告校验未通过：" + "；".join(exc.problems)) from exc
 
         attachments = [artifact.markdown_path]
@@ -123,9 +112,12 @@ class WriteReportTool(BaseTool):
             lines.append("- 提示：")
             lines.extend(f"  - {w}" for w in artifact.warnings)
 
-        review_path = await self._review_risk(artifact, lines)
-        if review_path:
-            attachments.append(review_path)
+        outcome = await review_report(
+            self.coordinator, topic=artifact.topic, markdown_path=artifact.markdown_path
+        )
+        lines.extend(format_review_lines(outcome))
+        if outcome.review_path:
+            attachments.append(outcome.review_path)
 
         return RawData(
             kind="text",
@@ -133,94 +125,11 @@ class WriteReportTool(BaseTool):
             paths=attachments,
             endpoint="report:pipeline",
             params={"topic": artifact.topic, "citations": len(artifact.citations)},
+            # 审计钩子读取此项来写入审查自身的审计记录；
+            # 该字段绝不会发送给模型服务提供方。
+            metadata={"review": outcome.audit_metadata()},
         )
-
-    async def _review_risk(self, artifact, lines: list[str]) -> str | None:
-        """Run the risk reviewer and fold its verdict into the result text.
-
-        Returns the review file path when one was written. The report itself must
-        survive any review failure: ``BaseTool.run`` turns an exception here into
-        a blanket ``ok=False``, which would discard a report that was rendered
-        perfectly well. So every failure degrades to a warning line.
-        """
-        if self.coordinator is None:
-            return None
-        markdown_path = Path(artifact.markdown_path)
-        review_path = markdown_path.with_suffix(".review.md")
-
-        body = self._report_body(markdown_path)
-        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-        # Latch on content, not on time. Rewriting the same topic overwrites the
-        # report, so an mtime comparison would call every review stale; comparing
-        # the reviewed body's digest reuses the verdict when nothing changed and
-        # re-reviews only when the report was actually revised.
-        if self._reviewed_digest(review_path) == digest:
-            lines.append(f"- 风险终审：已完成（复用 {review_path}）")
-            return str(review_path)
-
-        try:
-            result = await self.coordinator.review_risk(topic=artifact.topic, markdown=body)
-        except Exception as exc:  # noqa: BLE001 - never fail a rendered report
-            lines.append(self._unreviewed_warning(f"{type(exc).__name__}: {exc}"))
-            return None
-
-        if not result.ok:
-            lines.append(self._unreviewed_warning(result.error))
-            return None
-
-        comments = (result.summary or "").strip()
-        lines.append("- 风险终审意见（独立复核，供你决定是否修订）：")
-        lines.extend(f"  {line}" for line in (comments or "未发现实质性问题").splitlines())
-        lines.append(f"- 完整意见：{review_path}")
-        try:
-            review_path.write_text(
-                f"{REVIEW_DIGEST_PREFIX}{digest} -->\n\n"
-                f"# 风险终审意见：{artifact.topic}\n\n{comments}\n",
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            # Losing the sidecar file is not worth failing the report over; the
-            # comments are already in the result text.
-            lines.append(f"- 终审意见落盘失败：{exc}")
-            return None
-        return str(review_path)
-
-    @staticmethod
-    def _unreviewed_warning(error: str | None) -> str:
-        """A failure to review must read as "unreviewed", not as a neutral note.
-
-        The report body is deliberately left untouched (docs 03.10.5), so the tool
-        result is the only place a caller learns the review did not happen. A bland
-        "未完成" line is easy to skim past; this states the missing assurance.
-        """
-        detail = f"（{error}）" if error else ""
-        return (
-            f"- ⚠ 风险终审未完成{detail}：**本报告未经独立复核**，"
-            "不得视为已复核交付；如需复核请重新成稿触发，或人工核对关键数字。"
-        )
-
-    @staticmethod
-    def _report_body(markdown_path: Path) -> str:
-        """The report without its citation appendix, for the reviewer to read."""
-        text = markdown_path.read_text(encoding="utf-8")
-        marker = text.find(APPENDIX_MARKER)
-        return text if marker == -1 else text[:marker]
-
-    @staticmethod
-    def _reviewed_digest(review_path: Path) -> str | None:
-        """The body digest a previous review was based on, if any is recorded."""
-        try:
-            head = review_path.read_text(encoding="utf-8")[:200]
-        except OSError:
-            return None
-        marker = REVIEW_DIGEST_PREFIX
-        start = head.find(marker)
-        if start == -1:
-            return None
-        remainder = head[start + len(marker):]
-        return remainder.split(" ", 1)[0].strip() or None
 
     def render(self, raw: RawData) -> tuple[str, list[RawData]]:
-        """Report results carry file attachments for the transport layer."""
+        """报告结果会携带文件附件，供传输层使用。"""
         return (raw.text or "（报告生成失败）"), [raw]

@@ -1,6 +1,8 @@
-"""research_plan: install or revise the session plan (docs 03.6.2)."""
+"""research_plan：安装或修订会话计划（docs 03.6.2）。"""
 
 from __future__ import annotations
+
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -34,6 +36,7 @@ class ResearchPlanTool(BaseTool):
     timeout = 30
 
     async def _dispatch(self, *, goal: str, steps: list[dict]) -> RawData:
+        """解析步骤并在研究上下文中落计划，返回计划摘要。"""
         if self.ctx is None:
             raise ValueError("当前会话未启用研究上下文，无法落计划")
         parsed = [PlanStep(**step) for step in steps]
@@ -44,3 +47,79 @@ class ResearchPlanTool(BaseTool):
             endpoint="meta:research_plan",
             params={"plan_id": plan.plan_id, "revision": plan.revision, "steps": len(parsed)},
         )
+
+
+class UpdatePlanStepInput(BaseModel):
+    seq: int = Field(description="要更新的步骤序号（research_plan 中声明的 seq）")
+    status: Literal["pending", "done", "fail", "skipped"] = Field(
+        description="该步骤的新状态：done 完成、fail 失败、skipped 跳过、pending 重置"
+    )
+
+
+class UpdatePlanStepTool(BaseTool):
+    """记录某一步的结果，使计划反映实际发生的情况。
+
+    没有它，计划就是一份永不推进的文档：摘要会一直把每一步渲染为 pending。把状态
+    回写，才使它成为模型（与用户）可以信赖的进度台账。
+    """
+
+    name = "update_plan_step"
+    description = (
+        "回写研究计划中某一步的执行状态（完成/失败/跳过）；"
+        "每完成或放弃一个步骤后调用，使计划进度如实反映进展。"
+    )
+    input_model = UpdatePlanStepInput
+    permission = PermissionLevel.READ
+    group = ToolGroup.META
+    timeout = 30
+
+    async def _dispatch(self, *, seq: int, status: str) -> RawData:
+        """回写指定步骤的状态，并返回更新后的计划摘要。"""
+        if self.ctx is None:
+            raise ValueError("当前会话未启用研究上下文，无法更新计划")
+        if not self.ctx.mark_plan_step(seq, status):
+            raise ValueError(f"计划中没有步骤 {seq}；请核对序号或先用 research_plan 修订计划")
+        return RawData(
+            kind="text",
+            text=self.ctx.plan_digest(),
+            endpoint="meta:update_plan_step",
+            params={"seq": seq, "status": status},
+        )
+
+
+class RecordConclusionInput(BaseModel):
+    text: str = Field(description="一句话结论，须是可复述的事实性判断")
+    cids: list[str] = Field(
+        default_factory=list, description="支撑该结论的 citation id 列表，如 cit_000001"
+    )
+
+
+class RecordConclusionTool(BaseTool):
+    """持久化已形成的结论，使其在压缩与重载后仍然保留。
+
+    在此记录的结论会被渲染进会话状态块并写入会话存储，因此即便先前的工具结果被压缩
+    掉，长任务仍能保留已确立的事实。
+    """
+
+    name = "record_conclusion"
+    description = (
+        "记录一条已形成的结论及其依据（citations）；"
+        "会在研究状态中回显、并随会话持久化，供后续轮次与重开对话复用。"
+    )
+    input_model = RecordConclusionInput
+    permission = PermissionLevel.READ
+    group = ToolGroup.META
+    timeout = 30
+
+    async def _dispatch(self, *, text: str, cids: list[str]) -> RawData:
+        """将结论及其引用 id 写入研究上下文，并返回回显文本。"""
+        if self.ctx is None:
+            raise ValueError("当前会话未启用研究上下文，无法记录结论")
+        conclusion = self.ctx.add_conclusion(text.strip(), list(cids))
+        return RawData(
+            kind="text",
+            text=f"已记录结论：{conclusion.text}（依据 {'、'.join(conclusion.cids) or '无'}）",
+            endpoint="meta:record_conclusion",
+            params={"cids": len(cids)},
+        )
+

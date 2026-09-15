@@ -1,8 +1,7 @@
-"""Tool and skill discovery: search_tools, load_tool (docs 03.4.3).
+"""工具与技能发现：search_tools、load_tool（docs 03.4.3）。
 
-From the model's point of view "what should I use for this" is one question, so
-search covers both tools and skills in a single result set. They stay separate
-registries underneath.
+从模型的视角看，“这件事该用什么”是同一个问题，因此检索在同一个结果集中同时覆盖工具
+与技能。底层它们仍是各自独立的注册表。
 """
 
 from __future__ import annotations
@@ -27,6 +26,7 @@ class SearchToolsTool(BaseTool):
     timeout = 10
 
     async def _dispatch(self, *, query: str) -> RawData:
+        """按关键词同时检索工具与技能，合并为带激活状态的文本列表。"""
         if self.registry is None:
             raise ValueError("当前会话未提供工具注册表")
 
@@ -58,6 +58,7 @@ class LoadToolTool(BaseTool):
     timeout = 10
 
     async def _dispatch(self, *, name: str) -> RawData:
+        """在注册表与上下文中激活指定懒加载工具，使其下一轮可被调用。"""
         if self.registry is None:
             raise ValueError("当前会话未提供工具注册表")
         if self.registry.resolve(name) is None:
@@ -67,8 +68,7 @@ class LoadToolTool(BaseTool):
             self.registry.activate(name)
         if self.ctx is not None:
             self.ctx.activate_tool(name)
-        # The schema appears in the *next* request, matching "the model may only
-        # call tools whose schema it has been given".
+        # schema 会在*下一次*请求中出现，符合“模型只能调用已获得其 schema 的工具”。
         text = (
             f"工具 {name} 已在可用列表中。"
             if already

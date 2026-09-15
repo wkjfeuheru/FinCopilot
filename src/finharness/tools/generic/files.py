@@ -1,8 +1,10 @@
-"""Filesystem tools restricted to the artefact and cache directories.
+"""限制在产物目录与缓存目录内的文件系统工具。
 
-``read_file`` is what the data tools point at when they say "full data lives in
-the parquet". ``write_file`` only passes the gate without confirmation inside
-``output/``; anywhere else it needs approval.
+``read_file`` 读取会话已经指向的文件——``output/`` 下产出的产物，或复核子代理为核验
+某个数字而重读的缓存载荷。它**不是**主 Agent 用来更完整查看刚取数据的方式：那是数据
+工具的 ``detail="full"``（同一次调用，更宽的渲染），因为读取 parquet 会走同一套裁剪
+预算，返回的内容不会比取数时更多。``write_file`` 只有在允许的根目录内才无需确认即可
+通过权限门禁。
 """
 
 from __future__ import annotations
@@ -20,14 +22,13 @@ MAX_READ_BYTES = 200_000
 class ReadFileInput(BaseModel):
     path: str = Field(description="待读取的文件路径（限 output/ 与 data_cache/ 目录内）")
 
-
 class WriteFileInput(BaseModel):
     path: str = Field(description="写入路径；output/ 内免确认，其余目录需用户确认")
     content: str = Field(description="写入内容")
 
 
 def _resolve_within(raw: str, roots: list[Path]) -> Path:
-    """Resolve a path and require it to stay inside one of the allowed roots."""
+    """解析路径并要求其保持在某个允许的根目录之内。"""
     target = Path(raw).resolve()
     for root in roots:
         try:
@@ -41,15 +42,20 @@ def _resolve_within(raw: str, roots: list[Path]) -> Path:
 
 class ReadFileTool(BaseTool):
     name = "read_file"
-    description = "读取 output/ 或 data_cache/ 目录内的文件（如缓存 parquet 的完整数据）。"
+    description = (
+        "读取会话已指向的文件（output/ 下的产物，或复核用的缓存 parquet）。"
+        "若要更完整地查看刚取的数据，请用相应数据工具的 detail=\"full\"，"
+        "而不是读缓存文件。"
+    )
     input_model = ReadFileInput
     permission = PermissionLevel.READ
     group = ToolGroup.GENERIC
     timeout = 30
 
     async def _dispatch(self, *, path: str) -> RawData:
+        """读取允许目录内的文件；parquet 读为数据框，其余按文本读取（截断到 MAX_READ_BYTES）。"""
         settings = self.data.settings
-        roots = [Path(settings.paths.output_dir).resolve(), Path(settings.data.cache_dir).resolve()]
+        roots = [Path(settings.paths.output_dir).resolve(), (Path(settings.data.cache_dir) / "parquet").resolve()]
         target = _resolve_within(path, roots)
         if not target.is_file():
             raise ValueError(f"文件不存在：{path}")
@@ -74,8 +80,9 @@ class WriteFileTool(BaseTool):
     timeout = 30
 
     async def _dispatch(self, *, path: str, content: str) -> RawData:
+        """将内容写入允许目录内的文件（自动创建父目录），返回写入路径与字符数。"""
         settings = self.data.settings
-        roots = [Path(settings.paths.output_dir).resolve(), Path(settings.data.cache_dir).resolve()]
+        roots = [Path(settings.paths.output_dir).resolve(), (Path(settings.data.cache_dir) / "parquet").resolve()]
         target = _resolve_within(path, roots)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")

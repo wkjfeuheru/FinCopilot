@@ -1,1 +1,1 @@
-"""Composition-root dependency container reserved for implementation."""
+"""为后续实现预留的组合根依赖容器。"""

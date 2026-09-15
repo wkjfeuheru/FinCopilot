@@ -1,24 +1,24 @@
-"""Single source of truth for source-interface names, column mappings and
-exchange prefixes.
+"""数据源接口名、列映射与交易所前缀的唯一事实来源。
 
-Adding a data interface should only extend the tables here, never scatter
-source-specific knowledge across adapters or tools.
+新增一个数据接口时，只应扩展此处的映射表，绝不能把
+来源特有的知识散落到各个适配器或工具中。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Final
 
-# --- Endpoint names -------------------------------------------------------
-# Maps (adapter, semantic method) -> ordered candidate interface names. The
-# first candidate that succeeds is recorded on RawData.endpoint, so citations
-# and cache keys always name the interface that actually served the data.
+# --- 接口名 -------------------------------------------------------
+# 映射 (adapter, 语义方法) -> 有序的候选接口名。第一个成功的候选接口
+# 会被记录到 RawData.endpoint，因此引用与缓存键始终指向
+# 实际提供数据的那个接口。
 AKSHARE_ENDPOINTS: Final[dict[str, tuple[str, ...]]] = {
-    # Quote prefers the EM snapshot (richest: name, pct_change, turnover), then
-    # the Tencent daily series whose last row is the latest close. The Sina
-    # snapshot is last resort: it paginates the whole market with un-timed
-    # requests and its own docs warn it IP-bans repeated callers, so it is only
-    # reached when both richer sources are unavailable.
+    # quote 优先使用 EM 快照（字段最丰富：name、pct_change、turnover），
+    # 其次是腾讯日线序列（其最后一行即最新收盘价）。新浪
+    # 快照是最后手段：它以无时间戳的请求分页抓取整个市场，
+    # 且其官方文档警告会对频繁调用者封禁 IP，因此仅在
+    # 更丰富的两个来源都不可用时才会用到。
     "quote": ("stock_zh_a_spot_em", "stock_zh_a_hist_tx", "stock_zh_a_spot"),
     "kline": ("stock_zh_a_hist", "stock_zh_a_daily", "stock_zh_a_hist_tx"),
     "indicators": ("stock_financial_analysis_indicator",),
@@ -27,6 +27,11 @@ AKSHARE_ENDPOINTS: Final[dict[str, tuple[str, ...]]] = {
     "peers": ("stock_zh_valuation_comparison_em",),
     "news": ("stock_news_em",),
     "announcements": ("stock_individual_notice_report",),
+    # 宏观/行业不是回退链：akshare 通过一个专用接口暴露每个经济
+    # 序列，而行业/指数路由则从下方的申万/中证映射表
+    # 解析得到。
+    "macro": ("macro_china",),
+    "industry": ("sw_index",),
 }
 
 TUSHARE_ENDPOINTS: Final[dict[str, tuple[str, ...]]] = {
@@ -36,15 +41,15 @@ TUSHARE_ENDPOINTS: Final[dict[str, tuple[str, ...]]] = {
     "financials": ("income",),
 }
 
-# --- Valuation indicators -------------------------------------------------
-# ``stock_zh_valuation_baidu`` serves several metrics through one endpoint and
-# returns a bare ``date``/``value`` frame with no metric name. The request must
-# therefore carry the indicator, and its unit must be attached at render time —
-# otherwise a market-cap figure reads as a PE multiple.
+# --- 估值指标 -------------------------------------------------
+# ``stock_zh_valuation_baidu`` 通过一个接口提供多个指标，并返回
+# 一个仅含 ``date``/``value`` 的数据框，不带指标名。因此请求必须
+# 携带指标，且其单位必须在渲染时附加 ——
+# 否则市值数字会被读成市盈率倍数。
 VALUATION_INDICATORS: Final[tuple[str, ...]] = (
     "总市值", "市盈率(TTM)", "市盈率(静)", "市净率", "市现率",
 )
-# Accepted spellings for each canonical indicator (lower-cased for lookup).
+# 每个规范指标可接受的拼写（查找时会转为小写）。
 VALUATION_INDICATOR_ALIASES: Final[dict[str, str]] = {
     "总市值": "总市值", "市值": "总市值", "total_mv": "总市值", "market_cap": "总市值",
     "市盈率(ttm)": "市盈率(TTM)", "市盈率": "市盈率(TTM)", "pe": "市盈率(TTM)",
@@ -54,7 +59,7 @@ VALUATION_INDICATOR_ALIASES: Final[dict[str, str]] = {
     "市净率": "市净率", "pb": "市净率",
     "市现率": "市现率", "pcf": "市现率",
 }
-# Baidu reports 总市值 in 亿元; the ratio indicators are multiples (倍).
+# 百度以亿元为单位报告总市值；比率类指标则以倍数（倍）计。
 VALUATION_INDICATOR_UNITS: Final[dict[str, str]] = {
     "总市值": "亿元", "市盈率(TTM)": "倍", "市盈率(静)": "倍",
     "市净率": "倍", "市现率": "倍",
@@ -63,10 +68,10 @@ DEFAULT_VALUATION_INDICATOR: Final[str] = "市盈率(TTM)"
 
 
 def normalize_valuation_indicator(indicator: str | None) -> str:
-    """Map an alias/blank to a canonical indicator, rejecting unknown ones.
+    """将别名/空值映射为规范指标，并拒绝未知指标。
 
-    Fails loudly: an unrecognised indicator forwarded blindly to the source
-    would return the wrong metric's series under an unlabelled ``value`` column.
+    显式报错：把无法识别的指标盲目转发给数据源，会在一个没有标签的
+    ``value`` 列下返回错误指标的序列。
     """
     key = str(indicator or "").strip()
     if not key:
@@ -81,11 +86,11 @@ def normalize_valuation_indicator(indicator: str | None) -> str:
     )
 
 
-# --- Indicator field filters ----------------------------------------------
-# ``get_indicators(fields=[...])`` filters columns by keyword. Callers (and the
-# model) name metrics in English shorthand while sources use Chinese labels, so
-# a bare substring test silently matched nothing: asking for ``ROE`` dropped the
-# very column that held it (``净资产收益率(%)``) with no signal to the caller.
+# --- 指标字段过滤 ----------------------------------------------
+# ``get_indicators(fields=[...])`` 按关键字过滤列。调用方（以及模型）
+# 用英文简写命名指标，而数据源使用中文标签，因此单纯的子串匹配
+# 会静默地一无所获：请求 ``ROE`` 会丢掉恰好承载它的那一列
+# （``净资产收益率(%)``），且不会给调用方任何信号。
 INDICATOR_FIELD_ALIASES: Final[dict[str, tuple[str, ...]]] = {
     "roe": ("净资产收益率",),
     "roa": ("总资产报酬率", "总资产净利率"),
@@ -100,7 +105,7 @@ INDICATOR_FIELD_ALIASES: Final[dict[str, tuple[str, ...]]] = {
 
 
 def indicator_field_matches(column: str, field: str) -> bool:
-    """Whether ``field`` (itself or an alias) names ``column``."""
+    """判断 ``field``（本身或其别名）是否指向 ``column``。"""
     label = str(column).lower()
     key = str(field).strip().lower()
     if not key:
@@ -113,11 +118,11 @@ def indicator_field_matches(column: str, field: str) -> bool:
 def select_indicator_columns(
     columns: tuple[str, ...] | list[str], fields: list[str]
 ) -> tuple[list[str], list[str]]:
-    """Return ``(kept columns, requested fields that matched nothing)``.
+    """返回 ``(保留的列, 未匹配到任何列的请求字段)``。
 
-    ``date`` is always kept. When no field matches, ``kept`` is every column so
-    the caller still gets a usable frame, and every field is reported as
-    unmatched rather than being silently swallowed.
+    ``date`` 始终保留。当没有任何字段匹配时，``kept`` 为全部列，
+    以便调用方仍能得到可用的数据框，并且每个字段都会作为未匹配
+    上报，而不会被静默吞掉。
     """
     matched: set[str] = set()
     unmatched: list[str] = []
@@ -132,13 +137,13 @@ def select_indicator_columns(
     kept = [c for c in columns if str(c) == "date" or c in matched]
     return kept, unmatched
 
-# --- Normalized market columns -------------------------------------------
-# Internal contract for quote/kline frames (docs 03.5.2).
+# --- 规范化行情列 -------------------------------------------
+# quote/kline 数据框的内部契约（docs 03.5.2）。
 MARKET_COLUMNS: Final[tuple[str, ...]] = (
     "date", "open", "high", "low", "close", "volume", "amount",
 )
 
-# akshare Chinese column name -> internal snake_case name.
+# akshare 中文列名 -> 内部 snake_case 名称。
 AKSHARE_COLUMN_MAP: Final[dict[str, str]] = {
     "日期": "date",
     "开盘": "open",
@@ -156,8 +161,8 @@ AKSHARE_COLUMN_MAP: Final[dict[str, str]] = {
     "股票代码": "symbol",
 }
 
-# Column aliases per semantic interface, applied on top of AKSHARE_COLUMN_MAP.
-# Only listed interfaces are normalized; others keep their source semantics.
+# 每个语义接口的列别名，叠加在 AKSHARE_COLUMN_MAP 之上应用。
+# 仅列出的接口会被规范化；其他接口保留其来源语义。
 AKSHARE_INTERFACE_COLUMNS: Final[dict[str, dict[str, str]]] = {
     "quote": {
         "代码": "symbol",
@@ -179,22 +184,22 @@ AKSHARE_INTERFACE_COLUMNS: Final[dict[str, dict[str, str]]] = {
     },
 }
 
-# --- Peer comparison -------------------------------------------------------
-# Identity columns that must survive a `fields` filter: with 代码/简称 dropped
-# the caller cannot tell which row is the target and which rows are aggregates,
-# which is how a peer table gets read as if every row were a company.
+# --- 同行对比 -------------------------------------------------------
+# 必须能在 `fields` 过滤后保留的身份列：若丢掉 代码/简称，
+# 调用方就无法分辨哪一行是目标公司、哪些行是汇总值，
+# 从而把同行表误读为每一行都是一家公司。
 PEER_IDENTITY_COLUMNS: Final[tuple[str, ...]] = ("排名", "代码", "简称")
-# The EM comparison table mixes two aggregate rows into the company list,
-# labelled in the 代码/简称 columns. They are tagged with PEER_ROW_TYPE_COLUMN
-# so a whole-frame mean is visibly wrong instead of silently polluted.
+# EM 对比表把两个汇总行混入公司列表中，
+# 在 代码/简称 列中标示出来。它们会打上 PEER_ROW_TYPE_COLUMN 标签，
+# 使整表的平均值明显出错，而不是被静默污染。
 PEER_STAT_LABELS: Final[tuple[str, ...]] = ("行业中值", "行业平均")
 PEER_ROW_TYPE_COLUMN: Final[str] = "行类型"
 PEER_COMPANY: Final[str] = "公司"
 PEER_STAT: Final[str] = "行业统计"
 
-# --- Exchange prefixes ----------------------------------------------------
-# Segment-based (not first-digit) so ChiNext, STAR, B-shares and Beijing are
-# all classified correctly. Longest prefix wins.
+# --- 交易所前缀 ----------------------------------------------------
+# 基于号段（而非首位数字），以便创业板、科创板、B 股和北交所
+# 都能被正确分类。最长前缀优先。
 EXCHANGE_PREFIXES: Final[dict[str, str]] = {
     "600": "SH", "601": "SH", "603": "SH", "605": "SH", "688": "SH", "689": "SH",
     "900": "SH",
@@ -209,15 +214,14 @@ EXCHANGE_PREFIXES: Final[dict[str, str]] = {
 
 
 class UnknownExchangePrefix(ValueError):
-    """Raised when a 6-digit code matches no known exchange segment."""
+    """当 6 位代码不匹配任何已知交易所号段时抛出。"""
 
 
 def exchange_prefix(symbol: str) -> str:
-    """Return ``SH``/``SZ``/``BJ`` for a 6-digit A-share code.
+    """为一支 6 位 A 股代码返回 ``SH``/``SZ``/``BJ``。
 
-    Fails loudly instead of guessing: a wrong prefix makes some upstream
-    interfaces return an empty frame, which would otherwise be cached as
-    "no data".
+    显式报错而非猜测：错误的前缀会使某些上游接口返回空数据框，
+    而该空结果又会被缓存为“无数据”。
     """
     for length in (3, 2):
         prefix = EXCHANGE_PREFIXES.get(symbol[:length])
@@ -227,6 +231,106 @@ def exchange_prefix(symbol: str) -> str:
 
 
 def prefixed_symbol(symbol: str, *, lower: bool = False) -> str:
-    """Return an exchange-prefixed code such as ``SH600519`` or ``sh600519``."""
+    """返回带交易所前缀的代码，如 ``SH600519`` 或 ``sh600519``。"""
     result = f"{exchange_prefix(symbol)}{symbol}"
     return result.lower() if lower else result
+
+
+# --- 宏观经济指标 -------------------------------------------
+# 规范英文 slug -> 提供该指标的 akshare 接口，以及需要提取的
+# 周期/数值列。一个接口常常承载多个序列
+# （制造业 + 非制造业 PMI；M0/M1/M2），因此适配器按 ``source``
+# 对请求的指标分组，并让每个接口只抓取一次。
+@dataclass(frozen=True, slots=True)
+class MacroSpec:
+    label: str
+    source: str
+    period_col: str
+    value_col: tuple[str, ...]
+    unit: str
+    frequency: str
+
+
+MACRO_INDICATORS: Final[dict[str, MacroSpec]] = {
+    "pmi_manufacturing": MacroSpec(
+        "制造业PMI", "pmi", "月份", ("制造业-指数",), "指数", "monthly"
+    ),
+    "pmi_non_manufacturing": MacroSpec(
+        "非制造业PMI", "pmi", "月份", ("非制造业-指数",), "指数", "monthly"
+    ),
+    "cpi_yoy": MacroSpec(
+        "CPI同比", "cpi", "月份", ("全国-同比增长",), "%", "monthly"
+    ),
+    "ppi_yoy": MacroSpec(
+        "PPI同比", "ppi", "月份", ("当月同比增长",), "%", "monthly"
+    ),
+    "m2_yoy": MacroSpec(
+        "M2同比", "money_supply", "月份", ("货币和准货币(M2)-同比增长",), "%", "monthly"
+    ),
+    "m1_yoy": MacroSpec(
+        "M1同比", "money_supply", "月份", ("货币(M1)-同比增长",), "%", "monthly"
+    ),
+    "social_financing": MacroSpec(
+        "社融增量", "shrzgm", "月份", ("社会融资规模增量",), "亿元", "monthly"
+    ),
+    "lpr_1y": MacroSpec("1年期LPR", "lpr", "TRADE_DATE", ("LPR1Y",), "%", "monthly"),
+    "lpr_5y": MacroSpec("5年期LPR", "lpr", "TRADE_DATE", ("LPR5Y",), "%", "monthly"),
+    "shibor_on": MacroSpec(
+        "隔夜SHIBOR", "shibor", "日期", ("O/N-定价",), "%", "daily"
+    ),
+    "bond_10y": MacroSpec(
+        "10年期国债收益率", "bond", "日期", ("中国国债收益率10年",), "%", "daily"
+    ),
+    "usdcny": MacroSpec(
+        "美元兑人民币", "currency", "日期", ("央行中间价", "中行折算价"), "元/美元", "daily"
+    ),
+    "gdp_yoy": MacroSpec(
+        "GDP同比", "gdp", "季度", ("国内生产总值-同比增长",), "%", "quarterly"
+    ),
+}
+MACRO_INDICATOR_LABELS: Final[dict[str, str]] = {
+    slug: spec.label for slug, spec in MACRO_INDICATORS.items()
+}
+
+
+def normalize_macro_indicator(name: str) -> str:
+    """将输入的 slug 或中文标签映射为规范的宏观指标 slug。"""
+    key = str(name or "").strip()
+    if not key:
+        raise ValueError("宏观指标名不能为空")
+    if key in MACRO_INDICATORS:
+        return key
+    lowered = key.lower()
+    for slug in MACRO_INDICATORS:
+        if slug == lowered:
+            return slug
+    for slug, spec in MACRO_INDICATORS.items():
+        if spec.label == key:
+            return slug
+    raise ValueError(
+        f"不支持的宏观指标：{name}；可选 {', '.join(MACRO_INDICATORS)}"
+    )
+
+
+# --- 指数 / 行业选股池 ----------------------------------------------
+# 场景选股池对应的中证指数代码。名称与代码均可接受，
+# 便于模型既可说“沪深300”也可说“000300”。
+INDEX_ALIASES: Final[dict[str, str]] = {
+    "沪深300": "000300", "hs300": "000300", "csi300": "000300", "000300": "000300",
+    "中证500": "000905", "zz500": "000905", "csi500": "000905", "000905": "000905",
+    "中证1000": "000852", "zz1000": "000852", "csi1000": "000852", "000852": "000852",
+    "上证50": "000016", "sz50": "000016", "000016": "000016",
+    "科创50": "000688", "kc50": "000688", "000688": "000688",
+    "上证指数": "000001", "000001": "000001",
+}
+
+
+def normalize_index(index: str) -> str:
+    """将指数名称/代码解析为其中证代码，并拒绝未知者。"""
+    key = str(index or "").strip()
+    if not key:
+        raise ValueError("指数名不能为空")
+    resolved = INDEX_ALIASES.get(key) or INDEX_ALIASES.get(key.lower())
+    if resolved is None:
+        raise ValueError(f"不支持的指数：{index}；可选 {', '.join(sorted(set(INDEX_ALIASES)))}")
+    return resolved

@@ -1,7 +1,7 @@
-"""calc_metrics: DuPont decomposition over already-fetched data (docs 3.4.4).
+"""calc_metrics：对已获取的数据做杜邦分解（文档 3.4.4）。
 
-Accepts either a ``symbol`` (fetches what it needs) or ``cids`` referencing data
-already in the session, so a follow-up question costs zero extra fetches.
+既接受 ``symbol``（自行获取所需数据），也接受引用会话中已有数据的 ``cids``，
+因此追问的成本为零次额外取数。
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from finharness.data.raw import RawData
 from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
 
-# Column keywords differ across report formats, so match on substrings.
+# 不同报表格式的列关键词不同，故按子串匹配。
 _NET_MARGIN_KEYS = ("销售净利率", "net_margin", "net profit margin")
 _ASSET_TURNOVER_KEYS = ("总资产周转率", "asset_turnover")
 _EQUITY_MULTIPLIER_KEYS = ("权益乘数", "equity_multiplier")
@@ -20,6 +20,7 @@ _ROE_KEYS = ("净资产收益率", "roe")
 
 
 def _find_column(df: pd.DataFrame, keys: tuple[str, ...]) -> str | None:
+    """按关键词子串匹配数据框列名，返回首个匹配的列；无匹配返回 None。"""
     for column in df.columns:
         label = str(column)
         if any(key.lower() in label.lower() for key in keys):
@@ -46,6 +47,11 @@ class CalcMetricsTool(BaseTool):
     async def _dispatch(
         self, *, method: str = "dupont", symbol: str | None = None, cids: list[str] | None = None
     ) -> RawData:
+        """执行杜邦三因素分解，并按净利率、周转率、权益乘数组装结果文本。
+
+        优先复用 `cids` 引用的已有数据，否则按 `symbol` 获取指标；返回内含
+        计算文本与底层数据框的 `RawData`。支持的 `method` 目前仅 `dupont`。
+        """
         if method != "dupont":
             raise ValueError(f"暂不支持的分析方法：{method}")
         if not symbol and not cids:
@@ -79,9 +85,9 @@ class CalcMetricsTool(BaseTool):
             df=df,
         )
 
-    # -- helpers --------------------------------------------------------------
+    # -- 辅助方法 --------------------------------------------------------------
     async def _resolve_frame(self, symbol: str | None, cids: list[str]) -> tuple[pd.DataFrame, str]:
-        """Prefer reused citations (zero fetches); else fetch indicators once."""
+        """优先复用引用数据（零额外取数）；否则获取一次指标数据。"""
         if cids:
             frame = self._frame_from_citations(cids)
             if frame is not None:
@@ -93,7 +99,7 @@ class CalcMetricsTool(BaseTool):
         return raw.df, ""
 
     def _frame_from_citations(self, cids: list[str]) -> pd.DataFrame | None:
-        """Load the parquet a citation points at, avoiding a refetch."""
+        """读取引用所指向的 parquet 文件，避免重新取数。"""
         cite = getattr(self.ctx, "cite", None)
         if cite is None:
             return None

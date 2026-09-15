@@ -1,4 +1,4 @@
-"""Server-sent event framing."""
+"""Server-sent event（SSE）分帧。"""
 
 import json
 

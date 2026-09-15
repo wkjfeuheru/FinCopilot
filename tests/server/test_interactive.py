@@ -1,8 +1,8 @@
-"""The interactive channel: engine announces, client answers, turn resumes.
+"""交互式通道：引擎发出通知，客户端作答，回合继续。
 
-Exercised at the engine edge (a real ConfirmBus plus AskUserTool) and at the HTTP
-edge (``POST /v1/chat/respond`` resolving a pending request). The browser dialog
-itself is covered by manual acceptance, not by these tests.
+在引擎边界（真实的 ConfirmBus 加 AskUserTool）和 HTTP 边界
+（``POST /v1/chat/respond`` 解决挂起的请求）进行验证。浏览器对话框
+本身由人工验收覆盖，不在这批测试范围内。
 """
 
 import asyncio
@@ -14,10 +14,22 @@ from finharness.data.access import DataAccess
 from finharness.server.api import create_app
 from finharness.server.confirm import ConfirmBus
 from finharness.tools.meta.ask import AskUserTool
+from tests.server.conftest import authed_client
+
+
+def _settings(tmp_path) -> Settings:
+    return Settings(
+        data={"cache_dir": tmp_path / "cache"},
+        paths={
+            "output_dir": tmp_path / "output",
+            "memory_db": tmp_path / "cache" / "memory.db",
+            "auth_db": tmp_path / "cache" / "users.db",
+        },
+    )
 
 
 async def _answer_latest(bus: ConfirmBus, value: str) -> None:
-    """Answer the just-registered request on the next tick, as a client would."""
+    """像客户端那样，在下一个 tick 回答刚刚注册的请求。"""
     await asyncio.sleep(0)
     pending = bus.pending_ids()
     if pending:
@@ -47,7 +59,7 @@ def test_ask_user_reports_the_answer_it_receives():
 
 
 def test_ask_user_announces_the_request_before_waiting():
-    """The client must be told about the request, not just the answer."""
+    """必须把该请求告知客户端，而不只是告知答案。"""
     bus = ConfirmBus(ttl_s=2.0)
     announced: list[dict] = []
 
@@ -84,7 +96,7 @@ def test_ask_user_reports_a_timeout_when_unanswered():
     result = asyncio.run(run())
 
     assert result.ok is True
-    # The model must learn the user never replied, not receive a fabricated answer.
+    # 必须让模型知道用户从未作答，而不是收到一个编造的答案。
     assert "未在时限内回答" in result.content
 
 
@@ -97,18 +109,18 @@ def test_ask_user_without_a_channel_fails_cleanly():
     assert "不支持交互提问" in result.error
 
 
-def test_respond_endpoint_rejects_an_unknown_request():
-    client = TestClient(create_app(provider=None, settings=Settings()))
+def test_respond_endpoint_rejects_an_unknown_request(tmp_path):
+    client = authed_client(TestClient(create_app(provider=None, settings=_settings(tmp_path))))
 
     response = client.post("/v1/chat/respond", json={"request_id": "req_nope", "response": "y"})
 
     assert response.status_code == 404
 
 
-def test_respond_endpoint_resolves_the_apps_pending_request():
-    """Answer a request registered on the app's own bus, over real HTTP."""
-    app = create_app(provider=None, settings=Settings())
-    client = TestClient(app)
+def test_respond_endpoint_resolves_the_apps_pending_request(tmp_path):
+    """通过真实的 HTTP 回答注册在应用自身总线上的请求。"""
+    app = create_app(provider=None, settings=_settings(tmp_path))
+    client = authed_client(TestClient(app))
     bus = app.state.confirm_bus
 
     async def scenario():

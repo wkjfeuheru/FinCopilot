@@ -1,8 +1,8 @@
-"""Conversation memory across a loop: isolation, reload, and follow-up reuse.
+"""跨 loop 的 conversation memory：隔离、reload 与 follow-up 复用。
 
-The M4 acceptance criterion "a follow-up only fetches incrementally" is asserted
-here directly: the second question about the same symbol must not trigger another
-adapter fetch, because the data is already in the conversation's memory.
+这里直接断言 M4 验收标准“follow-up 仅做增量取数”：针对同一 symbol 的
+第二个问题不得再次触发 adapter 取数，因为数据已经在该 conversation 的
+memory 中。
 """
 
 import asyncio
@@ -25,7 +25,7 @@ from finharness.types import ToolUse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 from test_loop import RecordingTool, ScriptedProvider, StubRegistry, text_round, tool_round  # noqa: E402
 
-# Shared vocabulary cache across tests.
+# 跨测试共享的词表缓存。
 COUNTER = TokenCounter()
 
 
@@ -61,7 +61,7 @@ def build_loop(
     )
 
 
-# --- isolation ---------------------------------------------------------------
+# --- 隔离 --------------------------------------------------------------------
 
 def test_conversations_do_not_see_each_others_transcript(tmp_path):
     store = MemoryStore(tmp_path / "memory.db")
@@ -108,8 +108,8 @@ def test_conclusions_are_scoped_to_their_conversation(tmp_path):
     other = asyncio.run(run())
 
     assert other.ctx.prior_conclusions == []
-    # The state rides the request as a trailing message rather than the system
-    # prompt, so isolation is asserted against that surface now.
+    # 状态作为尾部消息随请求发送，而不是放在 system prompt 中，
+    # 因此现在针对该呈现面来断言隔离性。
     assert "甲的结论" not in other._state_text()
 
 
@@ -130,24 +130,24 @@ def test_preferences_are_shared_by_every_conversation(tmp_path):
     assert "简洁" in loop._state_text()
 
 
-# --- reload ------------------------------------------------------------------
+# --- 重载 --------------------------------------------------------------------
 
 def test_reload_restores_transcript_and_keeps_citation_ids(tmp_path):
-    """A restart must resume the thread, and stored cids must stay valid.
+    """重启必须能恢复对话线索，且已存储的 cid 必须保持有效。
 
-    A citation is produced by a tool call carrying data sources, which is the
-    path that persists it alongside the transcript.
+    citation 由携带数据源的 tool call 产生，这条路径会把它与
+    transcript 一并持久化。
     """
     store = MemoryStore(tmp_path / "memory.db")
     settings = make_settings(tmp_path)
     data = DataAccess([CountingAdapter()], cache=LocalCache(tmp_path / "cache"), settings=settings)
 
     async def first_run():
-        # A real tool over the stub adapter, so a citation is registered for real.
+        # 在 stub adapter 之上使用真实工具，因此 citation 会被真实注册。
         from finharness.tools.fin.indicators import GetIndicatorsTool
 
         class OneTool:
-            """Registry double exposing exactly one real tool."""
+            """仅暴露一个真实工具的 Registry 替身。"""
 
             def __init__(self, tool):
                 self.tools = {tool.name: tool}
@@ -193,13 +193,13 @@ def test_reload_restores_transcript_and_keeps_citation_ids(tmp_path):
     contents = [m.content for m in fresh.memory.raw if m.role == "user"]
     assert "第一问" in contents, "the earlier turn must resume"
     assert "第二问" in contents
-    # The citation kept its original id, so stored references still resolve.
+    # citation 保留了其原始 id，因此已存储的引用仍能解析。
     restored = fresh.cite.get(original_cid)
     assert restored is not None
     assert restored.symbol == "600519"
 
 
-# --- follow-up reuse (the M4 acceptance point) --------------------------------
+# --- follow-up 复用（M4 验收点）------------------------------------------------
 
 @dataclass
 class CountingAdapter(DataAdapter):
@@ -217,14 +217,14 @@ class CountingAdapter(DataAdapter):
 
 
 def test_follow_up_on_the_same_symbol_reuses_recalled_data(tmp_path):
-    """The second question about a symbol already fetched must not refetch."""
+    """针对已取过的 symbol 的第二个问题不得重新取数。"""
     adapter = CountingAdapter()
     store = MemoryStore(tmp_path / "memory.db")
     settings = make_settings(tmp_path)
     data = DataAccess([adapter], cache=LocalCache(tmp_path / "cache"), settings=settings)
 
     tool = RecordingTool("get_indicators", content="ROE 数据")
-    # The tool double must expose the same name the adapter serves.
+    # 工具替身必须暴露与 adapter 服务相同的名称。
     registry = StubRegistry({"get_indicators": tool})
 
     async def run():
@@ -232,7 +232,7 @@ def test_follow_up_on_the_same_symbol_reuses_recalled_data(tmp_path):
             [
                 tool_round(ToolUse("c1", "get_indicators", {"symbol": "600519"})),
                 text_round("第一次回答"),
-                # Follow-up: the model should be told the data is already there.
+                # Follow-up：应告知模型数据已经存在。
                 text_round("第二次回答（复用）"),
             ]
         )
@@ -246,17 +246,17 @@ def test_follow_up_on_the_same_symbol_reuses_recalled_data(tmp_path):
 
     loop, _ = asyncio.run(run())
 
-    # The recall surface names the symbol, so a follow-up has something to reuse.
+    # recall 面标明了 symbol，因此 follow-up 有可复用的东西。
     subjects = {episode.subject for episode in loop.short_term.episodes()}
     assert "600519" in subjects
     rendered = loop._state_text()
     assert "600519" in rendered
-    # And the second turn did not add a second fetch.
+    # 且第二轮没有新增第二次取数。
     assert len(tool.calls) == 1, "the follow-up must reuse the fetched data"
 
 
 def test_episode_records_a_pointer_to_the_data(tmp_path):
-    """L2 keeps a pointer, not a copy: the transcript would double otherwise."""
+    """L2 保存的是指针而非副本：否则 transcript 会翻倍。"""
     store = MemoryStore(tmp_path / "memory.db")
     settings = make_settings(tmp_path)
 
@@ -275,7 +275,7 @@ def test_episode_records_a_pointer_to_the_data(tmp_path):
             registry=StubRegistry({"get_quote": RecordingTool("get_quote", content="报价")}),
             settings=settings,
         )
-        # Provide a citation so the episode has something to point at.
+        # 提供一个 citation，使 episode 有可指向的对象。
         loop.cite.register(
             tool="get_quote", endpoint="akshare:x", symbol="600519", params={},
             rows=1, cols=2, fingerprint="fp",
@@ -287,7 +287,7 @@ def test_episode_records_a_pointer_to_the_data(tmp_path):
     episodes = loop.short_term.episodes()
 
     assert episodes, "a fetch should be recorded as an L2 episode"
-    # The summary is short; the data itself lives in the cache, not the episode.
+    # summary 很短；数据本身存放在 cache 中，而不是 episode 中。
     assert all(len(episode.summary) <= 200 for episode in episodes)
 
 

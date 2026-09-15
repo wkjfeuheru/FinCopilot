@@ -1,1 +1,1 @@
-"""Configuration package."""
+"""配置包。"""
