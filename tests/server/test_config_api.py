@@ -19,8 +19,8 @@ def _settings(tmp_path) -> Settings:
         data={"cache_dir": tmp_path / "cache"},
         paths={
             "output_dir": tmp_path / "output",
-            "memory_db": tmp_path / "cache" / "memory.db",
-            "auth_db": tmp_path / "cache" / "users.db",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
         },
     )
 

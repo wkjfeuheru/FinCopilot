@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +22,7 @@ from finharness.engine.retry import RetryPolicy, stream_with_retry
 from finharness.hooks.base import HookChain
 from finharness.observability import NullObserver
 from finharness.observability.context import update_turn
+from finharness.observability.logs import get_logger
 from finharness.permissions.gate import ReadOnlyGate
 from finharness.permissions.modes import Verdict
 from finharness.provider.base import Provider
@@ -32,8 +34,11 @@ from finharness.tools.capabilities import (
     capability_of,
     is_research_capability,
 )
+from finharness.tools.budget import resolve_result_budget
+from finharness.tools.meta.skills import SkillError, SkillRegistry, report_requested, route
 from finharness.tools.registry import ToolRegistry
 from finharness.types import (
+    STATE_VIEW_META,
     AgentTurnOutcome,
     EngineEvent,
     ModelUsage,
@@ -41,6 +46,7 @@ from finharness.types import (
     ObservedCall,
     OutputSink,
     RoundTrace,
+    StopSignal,
     StreamEvent,
     ToolResult,
     ToolUse,
@@ -51,6 +57,9 @@ class _CompactionMarker:
     """用于描述一次 compaction 的审计记录的替身工具。"""
 
     name = "context_compaction"
+
+
+log = get_logger("finharness.engine.loop")
 
 
 @dataclass(slots=True)
@@ -74,6 +83,8 @@ class AgentLoop:
     """持有一个会话的对话、usage 与工具预算。"""
 
     TRUNCATION_MARKER = "\n[truncated]"
+    # 压缩记录只留最近若干条；该列表按会话存活，逐轮追加会无界增长。
+    COMPACTION_HISTORY = 20
 
     def __init__(
         self,
@@ -97,7 +108,9 @@ class AgentLoop:
         user_id: str = "",
         coordinator: Any | None = None,
         observer: Any | None = None,
+        semantic_index: Any | None = None,
         call_type: str = "main",
+        route_skills: bool = True,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -113,6 +126,10 @@ class AgentLoop:
         # 主循环是 "main"，子代理是 "subagent"。它决定 LLM 指标的 call_type，
         # 以及 ``run()`` 是否算作一次用户请求（子代理不算）。
         self.call_type = call_type
+        # 场景路由（docs 03.8）是主循环的职责：它读用户问题与计划意图，据此注入方法论。
+        # 子代理拿到的是一个孤立片段——它的输入是任务文本，没有用户的原始问题，也没有
+        # 计划——在那里推断意图只会给一个只读核查者塞进与任务无关的方法论。
+        self.route_skills = route_skills
         self.ctx = (
             ctx
             if ctx is not None
@@ -122,6 +139,10 @@ class AgentLoop:
         self.gate = gate if gate is not None else ReadOnlyGate()
         self.hooks = hooks if hooks is not None else HookChain()
         self.interactive = interactive
+        # 记忆作用域的用户归属（docs 03.13）：对话落库与偏好笔记都按它隔离。
+        # 默认空串保持 CLI/eval 直连（无 HTTP 层）时的既有行为。先于协调器
+        # 赋值：子代理的审计归属取自这里。
+        self.user_id = user_id
         # sub-agent 协调器（docs 03.10）。按需从 registry 的 DataAccess 构建，
         # 因此不注入任何内容的调用方也能获得风险评审。
         # 记账在下方绑定，此时本循环自身的计数器已存在。
@@ -137,9 +158,6 @@ class AgentLoop:
         # 因此重启后无需重新摘要即可恢复。若没有 store，循环便和以前一样无记忆。
         self.conversation_id = conversation_id or session_id or "local"
         self.store = store
-        # 记忆作用域的用户归属（docs 03.13）：对话落库与偏好笔记都按它隔离。
-        # 默认空串保持 CLI/eval 直连（无 HTTP 层）时的既有行为。
-        self.user_id = user_id
         self.short_term = ShortTermMemory(cap=settings.context.short_mem_cap)
         self.summary = SummaryLayer.load(
             conversation_id=self.conversation_id,
@@ -154,6 +172,11 @@ class AgentLoop:
         self.ctx.summary = self.summary
         self.ctx.store = store
         self.ctx.user_id = self.user_id
+        # 语义记忆的向量索引（docs 03.6.4 LTM）：由调用方注入（服务端按配置
+        # 构建 Qdrant/BLOB 后端）；未注入或未配 embedding 时语义召回关闭，
+        # 记忆本体与键匹配检索仍然完全可用。
+        self.semantic_index = semantic_index
+        self.ctx.semantic_index = semantic_index
         self._memory_loaded = False
         self.usage = ModelUsage()
         # 评审 token 必须出现在会话总量中，因此既然计数器都已存在，就把协调器
@@ -162,7 +185,12 @@ class AgentLoop:
         if binding is not None:
             binding(usage=self.usage, stats=self.stats, observer=self.observer)
         self.turn = 0
-        self.compactions: list[CompactionResult] = []
+        # 只保留最近若干次压缩记录：该列表按会话存活，逐轮追加会无界增长。
+        # 累计次数单独计数，``done`` 载荷上报的是它。
+        self.compactions: deque[CompactionResult] = deque(
+            maxlen=self.COMPACTION_HISTORY
+        )
+        self.compaction_count = 0
         # 循环防护状态，每次运行重置：完全相同的 (tool, args) 调用重复超过阈值后
         # 不再提供新信息，因此会被拒绝。
         self._call_counts: dict[str, int] = {}
@@ -187,7 +215,13 @@ class AgentLoop:
         self.trace: list[RoundTrace] = []
         self.rounds = 0
         self._call_meta: dict[str, ObservedCall] = {}
+        # 协作式停止信号（docs 03.3）。默认 None，使 eval、脚本与子代理等
+        # 不经过服务层的调用方行为完全不变：没有信号就永远不检查。
+        self.stop_signal: StopSignal | None = None
 
+    def _stopped(self) -> bool:
+        """是否已收到停止请求；无信号时恒为 False。"""
+        return self.stop_signal is not None and self.stop_signal.requested
     @property
     def messages(self) -> list[Msg]:
         """对话记录的只读视图（保留给调用方与测试）。"""
@@ -214,17 +248,59 @@ class AgentLoop:
             from finharness.coordinator import Coordinator
         except Exception:  # noqa: BLE001 - 缺少协调器并不致命
             return None
+        # 子代理的审计与主循环同一写入器、同一用户：audit.jsonl 里每个
+        # run/denied 行因此都能独立回答"是谁"（session_id 带 focus 前缀，
+        # 可与主会话区分）。写入器取自主循环的审计 hook；没有审计 hook 的
+        # 调用方（测试替身）子代理照常运行，只是不留痕。
+        audit_writer = None
+        for hook in getattr(self.hooks, "hooks", []) or []:
+            audit_writer = getattr(hook, "writer", None)
+            if audit_writer is not None:
+                break
+
+        def audit_hook_factory(session_id: str):
+            from finharness.hooks.audit import AuditHook
+
+            return AuditHook(audit_writer, session_id=session_id, user_id=self.user_id)
+
         return Coordinator(
             provider=self.provider,
             data=data,
             settings=self.settings,
             cite=self.cite,
             counter=counter,
+            # 停止信号在 loop 构造之后才由服务层装上，因此这里传一个取值回调
+            # 而非当时的快照：子代理据此在每次运行前拿到最新信号，用户在长时间
+            # 的子代理扇出期间按停止也能及时生效。
+            stop_signal_provider=lambda: self.stop_signal,
+            audit_hook_factory=audit_hook_factory if audit_writer is not None else None,
+            user_id=self.user_id,
         )
 
     async def _emit(self, kind: str, data: dict[str, Any]) -> None:
         if self.output is not None:
             await self.output.emit(EngineEvent(kind, data))
+
+    def _progress_emitter(self, tool_use: ToolUse):
+        """构造工具的进展回调：补齐调用标识后转发为 ``tool_progress`` 事件。
+
+        回调刻意"尽力而为"：上报失败只记一条日志，绝不上抛——进展通道断掉不该
+        连累正在进行的计算。取消仍照常传播，否则超时取消会被吞掉。
+        """
+
+        async def report(payload: dict[str, Any]) -> None:
+            data = {"call_id": tool_use.call_id, "name": tool_use.name, **payload}
+            try:
+                await self._emit("tool_progress", data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 进展上报失败不中断工具执行
+                log.warning(
+                    "tool_progress_failed",
+                    extra={"tool": tool_use.name, "turn": self.turn},
+                )
+
+        return report
 
     def _on_retry(self, error: BaseException, index: int, delay: float) -> None:
         """provider 重试回调：计入会话统计，并留下一条可排查的日志。"""
@@ -266,7 +342,13 @@ class AgentLoop:
 
         偏离/停滞提示追加在这里，而非存储在 ``ctx`` 上：它和其余状态一样是
         本请求的一个视图，并且在一轮中三次测量 prompt 时必须保持一致。
+
+        子代理不接收研究状态：它的输入只有任务文本，一个孤立的跑批不该因为共享了
+        ``state_block`` 的渲染路径而多出主会话的上下文。当前日期随状态块注入主循环
+        （它是判断数据时效的锚点），子代理则维持"只拿到任务"的既有边界。
         """
+        if self.call_type != "main":
+            return ""
         state = self.ctx.state_block()
         if self._plan_hint:
             state = f"{state}\n\n{self._plan_hint}" if state else self._plan_hint
@@ -278,11 +360,14 @@ class AgentLoop:
         状态放在最后而非最前，有两个原因：它让历史记录成为缓存可复用的稳定
         前缀，同时把最新的状态放在模型注意力最强之处。它从不追加到 ``raw``
         ——它是本请求的一个视图，而不是会持久化或被摘要的对话记录条目。
+
+        该视图以 user 角色发送，因此带上 :data:`STATE_VIEW_META` 标记：否则
+        「最后一条用户消息」的读法会把状态块当成用户的提问。
         """
         messages = self.memory.snapshot()
         state = self._state_text()
         if state:
-            messages.append(Msg(role="user", content=state))
+            messages.append(Msg(role="user", content=state, metadata={STATE_VIEW_META: True}))
         return messages
 
     # -- 对话记忆（docs 03.6.4） ----------------------------------------------
@@ -301,12 +386,24 @@ class AgentLoop:
         )
         # 对话记录，让模型从会话中途续接，而不是从头开始。
         # track=False：重放的历史已经存储过；再缓冲它会以重复的序号再次写入。
-        for message in self.store.load_messages(self.conversation_id):
+        #
+        # 长对话不把整份历史读进内存：只回放最近若干轮，更早的由摘要分段承载。
+        # 但仅当被跳过的前缀确实已被摘要覆盖时才这么做——否则宁可全量加载，
+        # 也不能静默丢掉没人记得的历史（此类对话 token 很小，或下一轮压缩即
+        # 折叠前缀，之后重载自然有界）。
+        messages = self._load_recent_history()
+        for message in messages:
             self.memory.append(message, track=False)
         # Citation 必须保留其 id：已存储的摘要会引用它们。
         self.cite.restore(self.store.load_citations(self.conversation_id))
         self.ctx.prior_conclusions = self.store.load_conclusions(self.conversation_id)
         self.ctx.notes = self.store.get_notes(user_id=self.user_id)
+        # 跨对话长期记忆（docs 03.6.4 LTM）：最近情节被动注入（首轮一次），
+        # 之后由标的池驱动刷新（refresh_ltm_recall，与 L2 recall 同模式）。
+        self.ctx.ltm_recent = self.store.list_ltm_episodes(
+            user_id=self.user_id,
+            limit=int(self.settings.ltm.recent_episodes),
+        )
         for symbol in self.store.load_symbols(self.conversation_id):
             self.ctx.remember_symbol(symbol)
         self.summary = SummaryLayer.load(
@@ -320,6 +417,76 @@ class AgentLoop:
         )
         self.ctx.summary = self.summary
         self.ctx.refresh_recall()
+        self.ctx.refresh_ltm_recall()
+
+    def _restore_checkpoint(self) -> None:
+        """从上次中断的断点恢复研究计划（docs 03.3）。
+
+        这是"恢复"的全部内容：消息与引用已由常规回放载入，唯一无法从消息
+        重建的执行态就是计划。把原计划装回 ``ctx`` 后，模型看到完整历史 + 原有
+        计划与各步状态，于是能接着做而不是从头重来——它也因此不会重复调用那些
+        已标记为 done 的步骤。
+
+        只在断点确实处于"可继续"（用户停止）时恢复：``completed`` 表示上轮已
+        交付完毕，其计划只是上一轮的遗物，重新装上会让新一轮无端继承旧目标。
+
+        由 ``_run_once`` 在**每次** ``run()`` 时调用，而不是只在会话首轮：断点
+        属于"一轮"，而一个会话可以承载多轮。会话复用时记忆已经加载过，若把它
+        挂在首轮加载里，"同一窗口内继续"就会既读不到断点、也消费不掉它。
+        """
+        if self.store is None:
+            return
+        try:
+            checkpoint = self.store.load_latest_checkpoint(self.conversation_id)
+        except Exception:  # noqa: BLE001 - 断点读失败按"没有断点"处理
+            log.exception("checkpoint_load_failed")
+            return
+        if checkpoint is None:
+            return
+        # 已消费：新一轮一旦开始，旧的"可继续"就不再成立，界面不该在运行途中
+        # 仍显示续做入口。本轮收尾时会写入属于它自己的新断点。
+        try:
+            self.store.clear_checkpoint(self.conversation_id)
+        except Exception:  # noqa: BLE001 - 清理失败不影响恢复本身
+            log.exception("checkpoint_clear_failed")
+        if not checkpoint.recoverable or not checkpoint.plan:
+            return
+        restored = Plan.from_dict(checkpoint.plan)
+        if restored is None:
+            return
+        self.ctx.plan = restored
+        log.info(
+            "checkpoint_plan_restored",
+            extra={
+                "conversation_id": self.conversation_id,
+                "plan_id": restored.plan_id,
+                "revision": restored.revision,
+                "rounds": checkpoint.rounds,
+            },
+        )
+
+    def _load_recent_history(self) -> list[Msg]:
+        """回放对话记录；长对话只取最近若干轮，并让序号计数与存储对齐。
+
+        只有被跳过的前缀确实已被摘要分段覆盖时才截断加载——摘要才是那部分
+        历史的载体，没有它就是不声不响地遗忘。覆盖不足时回退全量加载。
+        """
+        limit = int(self.settings.context.max_loaded_rounds)
+        total = self.store.count_messages(self.conversation_id)
+        if limit <= 0 or total == 0:
+            return self.store.load_messages(self.conversation_id)
+        bounded = self.store.load_messages(self.conversation_id, recent_rounds=limit)
+        # seq 在单个对话内从 1 连续递增，因此被跳过的条数就等于切点前一位。
+        skipped = total - len(bounded)
+        if skipped <= 0:
+            return bounded
+        if self.store.count_covered_prefix(self.conversation_id) < skipped:
+            # 前缀还没被摘要收下，不能丢；全量加载，交由压缩去折叠它。
+            return self.store.load_messages(self.conversation_id)
+        # 让后续压缩的 seq_from/seq_to 与真实消息序号对齐，而不是从 1 重数——
+        # 否则会把已覆盖的区间再摘要一遍。
+        self.memory.discarded = skipped
+        return bounded
 
     def _persist_turn(self) -> None:
         """在一个事务中写入本轮的消息与记忆。
@@ -335,14 +502,43 @@ class AgentLoop:
         self.store.save_citations(self.conversation_id, self.cite.all())
         for symbol in self.ctx.symbols:
             self.store.upsert_symbol(self.conversation_id, symbol)
-        for conclusion in self.ctx.conclusions:
+        # 跨对话情节记忆（docs 03.6.4 LTM）：本轮结论同时以 task_result 情节
+        # 落库（无 LLM、与消息同批），使下一个对话首轮即可被动召回。
+        # add_ltm_episode 按 (kind, subject, summary) 幂等，与 save_conclusion
+        # 的对话内去重互不干扰。标题只查一次（每条情节都要冗余它）。
+        title = self._conversation_title()
+        for conclusion in self.ctx.pending_conclusions:
+            subject = self._conclusion_subject(conclusion.cids)
             self.store.save_conclusion(
                 self.conversation_id,
-                subject=self._conclusion_subject(conclusion.cids),
+                subject=subject,
                 text=conclusion.text,
                 cids=conclusion.cids,
             )
+            try:
+                self.store.add_ltm_episode(
+                    kind="task_result",
+                    summary=conclusion.text,
+                    user_id=self.user_id,
+                    subject=subject,
+                    cids=conclusion.cids,
+                    source_conversation_id=self.conversation_id,
+                    source_title=title,
+                    source_ts=conclusion.ts,
+                )
+            except Exception:  # noqa: BLE001 - 情节落库失败不影响对话持久化
+                pass
+        self.ctx.pending_conclusions = []
         self.store.touch_conversation(self.conversation_id)
+
+    def _conversation_title(self) -> str:
+        """当前对话的标题（情节溯源用）；未持久化时为空。"""
+        record = (
+            self.store.get_conversation(self.conversation_id)
+            if self.store is not None
+            else None
+        )
+        return (record.title if record is not None else "") or ""
 
     def _conclusion_subject(self, cids: list[str]) -> str:
         """从被引用数据的 symbol 生成回想的 key，使同一事实的 key 保持稳定。"""
@@ -366,6 +562,29 @@ class AgentLoop:
         if kind == "data":
             self.ctx.remember_symbol(subject)
         self.ctx.refresh_recall()
+        # 新 symbol 进入对话：历史上关于该标的的跨对话情节随之带出
+        # （docs 03.6.4 LTM 标的驱动召回，与 L2 recall 同一触发点）。
+        self.ctx.refresh_ltm_recall()
+
+    def _note_review_outcome(self, result: ToolResult) -> None:
+        """把工具声明的风险终审结局记入会话状态（docs 03.10.7）。
+
+        终审的编排在工具内部完成，但"这份报告还留着未处理的严重问题"必须在**后续
+        轮次**依然可见，否则模型可以在拿到意见后的任意一轮里把它忘掉并照常交付。
+        ``metadata["review"]`` 是工具声明的载荷（审计钩子读同一份），这里只把其中
+        的未结事项搬进 ``ctx``；消解（``unresolved_note`` 为 None）会清除旧条目。
+
+        写入时机在本轮所有 prompt 度量之后（工具只在请求返回后执行），因此一轮内
+        三次度量仍看到相同的状态文本。
+        """
+        review = result.metadata.get("review")
+        if not isinstance(review, dict):
+            return
+        topic = str(review.get("topic") or "")
+        if not topic:
+            return
+        note = review.get("unresolved_note")
+        self.ctx.note_review_finding(topic, str(note) if note else None)
 
     async def _maybe_compact(self) -> None:
         """当下一次请求将超出窗口预算时，对历史进行折叠压缩。"""
@@ -387,6 +606,7 @@ class AgentLoop:
         if not result.compacted and result.warning is None:
             return
         self.compactions.append(result)
+        self.compaction_count += 1
         await self._emit(
             "context_compacted",
             {
@@ -410,8 +630,18 @@ class AgentLoop:
                     duration_ms=result.duration_ms,
                     turn=self.turn,
                 )
-            except Exception:  # noqa: BLE001 - 审计是尽力而为
-                pass
+            except Exception:  # noqa: BLE001 - 审计失败绝不能中断一轮
+                self._log_audit_failure("compact")
+
+    def _log_audit_failure(self, action: str, tool_name: str = "?") -> None:
+        """审计写入失败时必须留下痕迹。
+
+        审计是治理链路里唯一的记录，因此"这一轮没被记下来"本身是一个必须可见的
+        事件。写失败仍然不致命（照旧不中断一轮），但不能再是 ``pass``。
+        """
+        log.warning(
+            "审计写入失败：tool=%s action=%s", tool_name, action, exc_info=True
+        )
 
     async def _audit_detection(self, detected: LoopDetected) -> None:
         """在审计轨迹中记录该中止（尽力而为，绝不致命）。"""
@@ -426,8 +656,8 @@ class AgentLoop:
                 verdict="abort",
                 turn=self.turn,
             )
-        except Exception:  # noqa: BLE001 - 审计是尽力而为
-            pass
+        except Exception:  # noqa: BLE001 - 审计失败绝不能中断一轮
+            self._log_audit_failure("loop_detected")
 
     def _window_tokens(self) -> int:
         return self.memory.request_tokens(
@@ -488,6 +718,7 @@ class AgentLoop:
         "loop_detected": "检测到重复调用",
         "max_turns_exhausted": "达到轮次上限",
         "provider_error": "模型调用失败",
+        "user_stopped": "已按你的要求停止",
     }
 
     def _partial_answer(self, reason: str = "loop_detected") -> str:
@@ -651,8 +882,6 @@ class AgentLoop:
         plan = self.ctx.plan
         if plan is None:
             return None
-        done, total = plan.progress()
-
         signature = (plan.revision, tuple(step.status for step in plan.steps))
         if signature == self._plan_signature:
             self._plan_stall_turns += 1
@@ -661,12 +890,37 @@ class AgentLoop:
             self._plan_stall_turns = 0
 
         return {
-            "revision": plan.revision,
-            "done": done,
-            "total": total,
+            **self._plan_snapshot(),
             "stalled_turns": self._plan_stall_turns,
             "drift": self._plan_scope_drift(tool_uses),
             "mismatch": self._plan_capability_mismatch(tool_uses),
+        }
+
+    def _plan_snapshot(self) -> dict[str, Any]:
+        """返回可安全交给客户端与回放存储的计划台账。
+
+        工具和技能提示属于模型内部的执行线索，前端只需用户可读的
+        研究目标、步骤、状态与依赖关系。
+        """
+        plan = self.ctx.plan
+        if plan is None:
+            return {}
+        done, total = plan.progress()
+        return {
+            "plan_id": plan.plan_id,
+            "goal": plan.goal,
+            "revision": plan.revision,
+            "done": done,
+            "total": total,
+            "steps": [
+                {
+                    "seq": step.seq,
+                    "action": step.action,
+                    "status": step.status,
+                    "dep": list(step.dep),
+                }
+                for step in plan.steps
+            ],
         }
 
     def _plan_hint_text(self, progress: dict[str, Any]) -> str:
@@ -703,16 +957,7 @@ class AgentLoop:
         self, *, succeeded: bool, reason: str | None, tool_calls: int
     ) -> dict[str, Any]:
         snapshot = self.stats.snapshot()
-        plan = self.ctx.plan
-        plan_payload = (
-            {
-                "revision": plan.revision,
-                "done": plan.progress()[0],
-                "total": plan.progress()[1],
-            }
-            if plan is not None
-            else None
-        )
+        plan_payload = self._plan_snapshot() or None
         return {
             "succeeded": succeeded,
             "reason": reason,
@@ -728,7 +973,7 @@ class AgentLoop:
             # 与上方的累计 usage 不同：这是当前窗口的充满程度，
             # compaction 本应降低它。
             "window_tokens": self._window_tokens(),
-            "compactions": len(self.compactions),
+            "compactions": self.compaction_count,
             "tool_calls": tool_calls,
             # 实际经历的轮数：效率评估读取的步数，与 tool_calls 不同，
             # 因为一轮可能调用零个或多个工具。
@@ -784,6 +1029,80 @@ class AgentLoop:
             rounds=self.rounds,
         )
 
+    def _checkpoint_plan(self) -> dict | None:
+        """本次运行的研究计划，序列化用于断点（docs 03.3）。
+
+        计划是唯一无法从已落库的消息重建的执行态——它只活在 ``ctx`` 里，
+        因此"恢复后在同一份计划上继续"必须靠它。
+        """
+        plan = self.ctx.plan
+        return plan.to_dict() if plan is not None else None
+
+    def _save_checkpoint(self, *, status: str, reason: str = "", partial_answer: str = "") -> None:
+        """写下本轮的断点；无存储的调用方（eval/脚本/子代理）为空操作。
+
+        同步 SQLite 写入：这一点在取消路径上很关键——``CancelledError`` 之下
+        任何 ``await`` 都可能被立刻打断，而一次 sqlite 调用不会。
+        """
+        if self.store is None:
+            return
+        try:
+            persisted = self.store.message_seq_range(self.conversation_id)[1]
+            self.store.save_checkpoint(
+                self.conversation_id,
+                status=status,
+                reason=reason,
+                rounds=self.rounds,
+                turn_index=self.turn,
+                plan=self._checkpoint_plan(),
+                partial_answer=partial_answer,
+                persisted_seq=persisted,
+            )
+        except Exception:  # noqa: BLE001 - 断点写失败不该影响本轮收尾
+            log.exception("checkpoint_save_failed")
+
+    async def _stop_turn(self, *, tool_calls: int) -> AgentTurnOutcome:
+        """按用户要求结束本次运行，并保留既有成果（docs 03.3）。
+
+        与 ``_fail`` 的关键差别：停止不是失败，因此**不发** ``error`` 事件——
+        用户按了停止却看到一条错误提示是错的。已确立的内容照常以 ``answer``
+        交付并落库，使停止不会让已付出的取数与结论白费。
+        """
+        reason = "user_stopped"
+        answer = self._partial_answer(reason=reason) if self._has_partial_findings() else ""
+        if answer:
+            await self._emit("answer", {"text": answer})
+            # 与 ``_fail`` 同理：只在事件里见过的答案重载后会消失，因此把部分
+            # 发现也写为本轮的 assistant 消息，随本轮一起落库。
+            self.memory.append_assistant(Msg(role="assistant", content=answer))
+        else:
+            # 没有可交付的发现：清掉流式中途的半句话。否则用户会看到一句
+            # 被截断的草稿，误以为那是一个答案。
+            await self._emit("text_reset", {})
+        # ``resumable`` 告知客户端：这不是终点，可以基于断点继续。
+        await self._emit(
+            "done",
+            {
+                **self._done_payload(
+                    succeeded=False, reason=reason, tool_calls=tool_calls
+                ),
+                "resumable": True,
+            },
+        )
+        return AgentTurnOutcome(
+            answer=answer,
+            succeeded=False,
+            usage=self.usage,
+            error=None,
+            reason=reason,
+            tool_calls=tool_calls,
+            retry_count=self.stats.retry_count,
+            tool_duration_ms=self.stats.snapshot().tool_duration_ms,
+            citations=self._citation_ids(),
+            trace=list(self.trace),
+            rounds=self.rounds,
+        )
+
     async def run(self, user_msg: str) -> AgentTurnOutcome:
         """运行一次完整的 agent 轮次循环，返回本轮结果。
 
@@ -826,6 +1145,14 @@ class AgentLoop:
         # 在对话首轮，于构建 prompt 之前加载已持久化的记忆。后续轮次复用
         # 它（见 ctx）而非重新查询：系统提示词每轮要测量三次，这些测量必须一致。
         await self._load_memory_if_first_turn(user_msg)
+        # 断点属于"一轮"，而一个会话可承载多轮，因此它必须在每次 run() 都检查：
+        # 会话复用时上面的加载会提前返回，挂在里面就会漏掉"同一窗口内继续"。
+        # 放在这里（而非更晚）是为了让本轮第一次 prompt 组装就能看到恢复的计划。
+        self._restore_checkpoint()
+        # 语义召回按**本轮问题**刷新（docs 03.6.4 LTM）：与情节的标的驱动不同，
+        # "哪个知识跟当前问题相关"只有拿到问题文本才能判断。它发生在 prompt
+        # 组装之前，因此本轮三次测量看到的是同一份文本。
+        self.ctx.refresh_semantic_recall(user_msg, index=self.semantic_index)
         # 在追加之前打开本轮的写缓冲区，这样用户消息会被缓存以供持久化，
         # 而不会被重置操作丢弃。
         self.memory.pending = []
@@ -846,9 +1173,73 @@ class AgentLoop:
         self.rounds = 0
         self._call_meta = {}
 
-        outcome = await self._run_turns()
+        # 路由：从问题本身推断需要哪些方法论，并注入其正文。放在轮次循环之前，因此
+        # 第一次模型调用就已经看得到方法，而不是等到某一轮才补上——简单提问没有计划，
+        # 这是它唯一能拿到方法论的时机。
+        if self.route_skills:
+            await self._route_methodology()
+
+        try:
+            outcome = await self._run_turns()
+        except BaseException:
+            # 硬取消（连接被掐断、任务被取消、进程即将退出）也必须留下本轮成果。
+            # ``CancelledError`` 继承自 ``BaseException``，会穿出 ``_run_turns``
+            # 里所有 ``except Exception``；若不在这里兜住，下面的持久化将被跳过，
+            # 用户消息与已完成的取数会一并消失——这正是"中断即丢数据"的成因。
+            # ``_persist_turn``/``_save_checkpoint`` 是同步 SQLite 写入，在被取消
+            # 的任务里仍能跑完。
+            self._persist_turn()
+            self._save_checkpoint(status="stopped", reason="interrupted")
+            raise
         self._persist_turn()
+        # 断点是"可继续"状态的载体：正常交付记 completed，运行失败（含用户停止）
+        # 记 stopped。判据取自引擎结论而非异常与否——停止本就不抛异常。
+        self._save_checkpoint(
+            status="completed" if outcome.succeeded else "stopped",
+            reason=outcome.reason or "",
+            partial_answer=outcome.answer if not outcome.succeeded else "",
+        )
         return outcome
+
+    async def _route_methodology(self) -> list[str]:
+        """按问题意图注入方法论正文，返回本次新注入的目标键。
+
+        注入是幂等的（``ctx.inject_methodology`` 按目标去重），因此一条追问不会重复
+        注入同一份方法；只有首次命中才计入 ``context_routed`` 事件，使"为什么这段方法
+        会在这里"可归因。
+        """
+        capabilities = capabilities_in_text(self._last_user_msg)
+        report = report_requested(self._last_user_msg)
+        if self.ctx.plan is not None:
+            plan = self.ctx.plan
+            capabilities |= capabilities_in_text(self._plan_prose(plan))
+            hinted = tuple(
+                name for step in plan.steps for name in step.skill_hint if name
+            )
+        else:
+            hinted = ()
+
+        targets = route(capabilities=capabilities, hinted=hinted, report=report)
+        if not targets:
+            return []
+
+        registry = SkillRegistry(self.settings.paths.skills_dir)
+        injected: list[str] = []
+        for target in targets:
+            try:
+                _meta, body, _record = registry.load(target.skill, file=target.file)
+            except SkillError:
+                # 技能包缺失或格式错误只是"这份方法这次没有"，不该让整个回合失败。
+                continue
+            if body.strip() and self.ctx.inject_methodology(target.key, body):
+                injected.append(target.key)
+
+        if injected:
+            await self._emit(
+                "context_routed",
+                {"skills": injected, "capabilities": sorted(c.value for c in capabilities)},
+            )
+        return injected
 
     async def _run_turns(self) -> AgentTurnOutcome:
         """驱动模型轮次直到产出最终答案、耗尽轮次预算或触发中止。
@@ -861,6 +1252,10 @@ class AgentLoop:
         # 完整 Prompt 只在明确要求时构造，避免默认开启追踪时白算一遍消息历史。
         capture_messages = bool(getattr(self.observer, "tracing_capture_payloads", False))
         for _ in range(self.settings.context.max_turns):
+            # 轮次边界是停止的第一个自然检查点：一轮已经完整收尾，此时停下
+            # 不会破坏对话记录的格式（不存在半截的工具调用）。
+            if self._stopped():
+                return await self._stop_turn(tool_calls=tool_calls_total)
             self.turn += 1
             update_turn(self.turn)
             # 窗口维护发生在轮次之间，绝不在请求中途，并且即使摘要失败也不能
@@ -874,6 +1269,9 @@ class AgentLoop:
             first_token_at: float | None = None
             round_input = 0
             round_output = 0
+            # 停止请求是否在本轮流式期间到达。逐 chunk 检查是覆盖最常见场景的
+            # 检查点：用户按下停止时，多半正看着一段长回答在流式输出。
+            stop_requested = False
             # LLM 子 Span 必须包住整个 ``async for`` 消费过程，而不只是
             # provider.stream() 返回的生成器对象——后者在第一次迭代前不会发起
             # 请求，越过消费边界关 Span 会得到 0 耗时。
@@ -894,6 +1292,12 @@ class AgentLoop:
                         policy=self.retry_policy,
                         on_retry=lambda error, index, delay: self._on_retry(error, index, delay),
                     ):
+                        if self._stopped():
+                            # 立刻停止消费，不再等待后续 chunk。此刻尚未收到
+                            # MESSAGE_END，因此 ``tool_uses`` 仍为空——不会留下
+                            # 一个缺少配对的工具调用帧。
+                            stop_requested = True
+                            break
                         if chunk.event is StreamEvent.TEXT_DELTA:
                             # 每个 delta 一到就流式输出，使答案在生成过程中逐步显现，
                             # 而不是在结束时一次性涌出。仍然保留缓冲区，以组装
@@ -962,6 +1366,21 @@ class AgentLoop:
             )
             llm_ms = round((stream_ended - round_started) * 1000)
 
+            if stop_requested:
+                # 停止发生在流式期间：记录这一轮实际产出的内容（对失败/中止的
+                # 运行，轨迹要能显示停止点），然后按停止收尾。此前各轮已确立的
+                # 发现由 ``_stop_turn`` 汇总交付。
+                self._record_round(
+                    thought="".join(deltas),
+                    actions=[],
+                    results=[],
+                    input_tokens=round_input,
+                    output_tokens=round_output,
+                    llm_first_ms=llm_first_ms,
+                    llm_ms=llm_ms,
+                )
+                return await self._stop_turn(tool_calls=tool_calls_total)
+
             if tool_uses:
                 # 本轮结果是一次工具调用，因此此前流出的任何文本都只是草稿，
                 # 而非答案。在展示工具活动之前告知客户端丢弃它；最终答案会在
@@ -1028,6 +1447,11 @@ class AgentLoop:
                     llm_first_ms=llm_first_ms,
                     llm_ms=llm_ms,
                 )
+                # 停止可能在一次耗时较长的工具调用期间到达。此时工具已经跑完，
+                # 其结果已写入本轮缓冲区，因此在这里停下既不浪费这次取数，也
+                # 不会留下缺少配对的工具帧——这是"停止保留成果"最关键的一处。
+                if self._stopped():
+                    return await self._stop_turn(tool_calls=tool_calls_total)
                 # 计划进展在刚运行完的这一轮上评估，然后搭载到下一次请求。
                 # 它是一个信号，绝不是闸门：一轮绝不会因为偏离计划而被拒绝。
                 progress = self._plan_progress(tool_uses)
@@ -1076,14 +1500,20 @@ class AgentLoop:
             answer=self._partial_answer(reason="max_turns_exhausted"),
         )
 
-    def _truncate(self, content: str) -> str:
-        """将单个工具结果限制在 ``context.max_result_tokens`` 个 token 以内。
+    def _truncate(self, content: str, limit: int, *, recovery_path: str | None = None) -> str:
+        """将单个工具结果限制在 ``limit`` 个 token 以内。
 
-        该设置以 token 为单位命名，因此截断依据的是真实的 token 计数而非字符
-        长度（字符上限会让中文文本膨胀到约两倍的预期预算）。
+        预算以 token 为单位命名，因此截断依据的是真实的 token 计数而非字符长度
+        （字符上限会让中文文本膨胀到约两倍的预期预算）。``limit`` 由
+        :func:`finharness.tools.budget.resolve_result_budget` 解析后传入，使渲染侧与
+        编码侧用同一个数字——过去两侧各自读取全局设置，导致 ``detail="full"`` 放宽
+        渲染出的内容又被这里砍回原预算。
+
+        标记必须可据以行动：它给出被省略的规模与完整内容所在（若工具已落盘），
+        而不只是一个 ``[truncated]``。这正是"只看到研报首页"曾经无法被诊断的原因——
+        读者既不知道丢了多少，也不知道去哪里拿回来。
         """
-        limit = self.settings.context.max_result_tokens
-        if self.memory.counter.count(content).tokens <= limit:
+        if limit <= 0 or self.memory.counter.count(content).tokens <= limit:
             return content
         # 二分查找预算内最长的前缀；计数是单调的。
         low, high = 0, len(content)
@@ -1094,19 +1524,53 @@ class AgentLoop:
             else:
                 high = middle - 1
         prefix = content[:low]
-        if limit <= 4:  # 没有空间放置标记
-            return prefix
-        return prefix.rstrip() + self.TRUNCATION_MARKER
+        marker = self._truncation_marker(prefix, content, recovery_path=recovery_path)
+        if self.memory.counter.count(marker).tokens >= limit:
+            return prefix  # 连标记都放不下：宁可无标记，也不超出预算
+        return prefix.rstrip() + marker
 
-    def _encode(self, result: ToolResult) -> str:
+    def _truncation_marker(
+        self, prefix: str, content: str, *, recovery_path: str | None
+    ) -> str:
+        """说明被省略了什么，以及完整内容在哪里可以取回。
+
+        ``TRUNCATION_MARKER`` 作为可检索的哨兵前缀保留（日志/断言据它识别截断），
+        其后追加本次的实际规模与取回位置。
+        """
+        kept = self.memory.counter.count(prefix).tokens
+        total = self.memory.counter.count(content).tokens
+        note = f"{self.TRUNCATION_MARKER}已省略约 {total - kept}/{total} token"
+        if recovery_path:
+            note += f"；完整内容见 {recovery_path}（可用 read_file / read_pdf 分页读取）"
+        return note
+
+    def _encode(self, result: ToolResult, limit: int) -> str:
         payload: dict[str, Any] = {
             "ok": bool(result.ok),
-            "content": self._truncate(result.content),
+            "content": self._truncate(
+                result.content, limit, recovery_path=self._recovery_path(result)
+            ),
             "error": result.error,
         }
         if result.citations:
             payload["citations"] = list(result.citations)
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _recovery_path(result: ToolResult) -> str | None:
+        """结果被裁剪时，指向可读回完整内容的本地载荷。
+
+        工具把它落盘的位置写在 ``RawData.parquet_path`` 上（数据框）或
+        ``RawData.paths``（产物文件）；两者都能让读者取回比上下文更完整的版本。
+        """
+        for source in result.sources or ():
+            for candidate in (
+                getattr(source, "parquet_path", None),
+                *list(getattr(source, "paths", None) or ()),
+            ):
+                if candidate:
+                    return str(candidate)
+        return None
 
     # -- 轨迹记录（docs 03.3） ------------------------------------------------
     # 一轮 = 一次模型调用，加上（若有）它的工具调用及其结果。以有界的小记录
@@ -1270,10 +1734,10 @@ class AgentLoop:
             span.set_attribute("status", "unknown")
             return await self._reject(tool_use, f"unknown tool: {tool_use.name}")
 
-        # 惰性激活闸门：惰性工具的 schema 在被激活之前从未注入，因此现在调用
-        # 它意味着模型绕过了两阶段规则。在结构上拒绝并指出修复方式，而不是
-        # 去执行一个模型从未见过的工具。仅在 registry 确实对工具分层时才应用
-        # （收窄后的 sub-agent registry 不携带任何分层）。
+        # 按需工具的激活闸门：其 schema 此前从未注入，因此模型现在调用它意味着它凭
+        # 名称猜到了工具。这不再是错误——注册层知道全部工具，按需注入只是省 token 的
+        # 手段而非权限——因此就地激活并继续执行，而不是拒绝一次本可完成的调用。
+        # 只在 registry 确实对工具分层时才应用（收窄后的 sub-agent registry 不携带分层）。
         lazy = getattr(self.registry, "lazy_names", None)
         is_active = getattr(self.registry, "is_active", None)
         if (
@@ -1282,11 +1746,14 @@ class AgentLoop:
             and tool_use.name in set(lazy())
             and not is_active(tool_use.name)
         ):
-            span.set_attribute("status", "not_activated")
-            return await self._reject(
-                tool_use,
-                f"tool not activated: {tool_use.name}；请先用 load_tool 激活，"
-                "下一轮才能调用。",
+            self.registry.activate(tool_use.name)
+            self.ctx.activate_tool(tool_use.name)
+            # 单独记一个属性而不是覆盖 status：本次调用随后仍会跑完并得到自己的
+            # 终态（ok/error/timeout），而"这是一次按需激活"是额外事实，不是终态。
+            span.set_attribute("lazy_activated", True)
+            await self._emit(
+                "tool_activated",
+                {"call_id": tool_use.call_id, "name": tool_use.name},
             )
 
         # 循环防护：超过阈值的相同调用无法增加信息（其结果已在对话记录和缓存
@@ -1348,6 +1815,11 @@ class AgentLoop:
         # 构建协调器，因此由循环把会话的协调器交给它。
         if getattr(tool, "needs_coordinator", False) and self.coordinator is not None:
             tool.coordinator = self.coordinator
+        # 长时间工具上报中间进展：call_id 与工具名由循环补齐，工具只描述进展内容，
+        # 无需知道自己在对话里的调用标识。这不是装饰——服务端心跳是 SSE 注释帧，
+        # 客户端看门狗只在真实事件到达时才重置，静默数分钟的工具会被判为卡死而掐断。
+        if getattr(tool, "needs_progress", False):
+            tool.progress = self._progress_emitter(tool_use)
         try:
             result = await asyncio.wait_for(tool.run(**tool_use.args), timeout)
         except TimeoutError:
@@ -1384,6 +1856,7 @@ class AgentLoop:
         duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
         span.set_attribute("status", "ok" if result.ok else "error")
         result.citations = self._register_citations(tool_use, result)
+        self._note_review_outcome(result)
         await self._audit(
             tool,
             tool_use.args,
@@ -1415,7 +1888,23 @@ class AgentLoop:
             content=result.content,
             duration_ms=duration_ms,
         )
-        return tool_use.call_id, self._encode(result)
+        return tool_use.call_id, self._encode(
+            result, self._result_budget(tool, tool_use.args)
+        )
+
+    def _result_budget(self, tool: Any, args: dict[str, Any]) -> int:
+        """按 运维覆盖 → 工具声明 → 全局 解析本次结果的 token 预算。
+
+        这里与工具渲染时（``BaseTool._result_token_budget``）走的是同一个解析器，
+        因此渲染放行的内容不会被这里再砍回去（docs 03.3.3）。
+        """
+        detail = str((args or {}).get("detail") or "summary")
+        return resolve_result_budget(
+            settings=self.settings,
+            tool_name=getattr(tool, "name", ""),
+            tool=tool,
+            detail=detail,
+        )
 
     async def _audit(
         self,
@@ -1454,8 +1943,8 @@ class AgentLoop:
                 rows=rows,
                 cols=cols,
             )
-        except Exception:  # noqa: BLE001 - 审计是尽力而为
-            pass
+        except Exception:  # noqa: BLE001 - 审计失败绝不能中断一轮
+            self._log_audit_failure(action, getattr(tool, "name", "?"))
 
     def _register_citations(self, tool_use: ToolUse, result: ToolResult) -> list[str]:
         """将工具的原始 payload 转换为会话跟踪的 citation id。"""

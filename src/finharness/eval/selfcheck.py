@@ -11,7 +11,14 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 from finharness.provider.base import Provider
-from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUse
+from finharness.types import (
+    STATE_VIEW_META,
+    ModelUsage,
+    Msg,
+    StreamChunk,
+    StreamEvent,
+    ToolUse,
+)
 
 
 class SelfCheckProvider(Provider):
@@ -70,10 +77,17 @@ def _end(
 
 
 def _last_user_text(messages: list[Msg]) -> str:
-    """返回最后一条非空的用户消息内容。"""
+    """返回最后一条非空的用户消息内容。
+
+    跳过研究状态视图：它以 user 角色随请求追加，却不是用户的提问。若把它当成问题，
+    脚本化回放会依据状态块文本而非用例输入选择分支——用例的输入与期望会因此错位。
+    """
     for message in reversed(messages):
-        if message.role == "user" and message.content:
-            return message.content
+        if message.role != "user" or not message.content:
+            continue
+        if message.metadata.get(STATE_VIEW_META):
+            continue
+        return message.content
     return ""
 
 

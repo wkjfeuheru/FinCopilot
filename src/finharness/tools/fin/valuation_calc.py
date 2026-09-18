@@ -6,43 +6,36 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-from pydantic import BaseModel, Field
-
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 
 VALUATION_METHODS = ("dcf", "comps")
 
-
-class ValuationInput(BaseModel):
-    method: str = Field(default="dcf", description="估值方法：dcf（绝对）或 comps（可比）")
-    symbol: str = Field(description="6位A股代码")
-    assumptions: dict[str, Any] = Field(
-        default_factory=dict,
-        description=(
-            "DCF 假设：base_fcf(基期自由现金流,元)、growth_rates{悲观,中性,乐观}、"
-            "wacc、terminal_growth、years(预测期年数)、shares(总股本,股)"
-        ),
-    )
-    peer_metrics: dict[str, float] = Field(
-        default_factory=dict,
-        description="comps 方法：可比组中位数，如 {pe_median, pb_median, target_eps, target_bvps}",
-    )
+_ASSUMPTIONS_HELP = (
+    "DCF 假设：base_fcf(基期自由现金流,元)、growth_rates{悲观,中性,乐观}、"
+    "wacc、terminal_growth、years(预测期年数)、shares(总股本,股)"
+)
+_PEER_HELP = "comps 方法：可比组中位数，如 {pe_median, pb_median, target_eps, target_bvps}"
 
 
-class CalcValuationTool(BaseTool):
-    name = "calc_valuation"
-    description = (
+@tool(
+    name="calc_valuation",
+    description=(
         "按 DCF 或可比公司法估算价值区间与敏感性。假设须由调用方给出，"
         "工具只做计算与呈现，不替调用方下结论。"
-    )
-    input_model = ValuationInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.FIN_CALC
-    timeout = 120
-
+    ),
+    capability=Capability.COMPUTE,
+    # 只在真的要做估值建模时才需要，且参数结构较重，故按需注入。
+    tier=Tier.LAZY,
+    group=ToolGroup.FIN_CALC,
+    timeout=120,
+)
+class CalcValuationTool(BaseTool):
+    @param("method", desc="估值方法：dcf（绝对）或 comps（可比）")
+    @param("symbol", desc="6位A股代码")
+    @param("assumptions", desc=_ASSUMPTIONS_HELP)
+    @param("peer_metrics", desc=_PEER_HELP)
     async def _dispatch(
         self, *, method: str = "dcf", symbol: str, assumptions: dict | None = None,
         peer_metrics: dict | None = None,

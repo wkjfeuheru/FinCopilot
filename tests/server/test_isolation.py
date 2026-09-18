@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from finharness.config.settings import Settings
 from finharness.server.api import create_app
+from finharness.tools.generic.files import ReadFileTool
 from tests.server.conftest import register_and_login
 
 
@@ -21,9 +22,14 @@ class EchoProvider:
         self.seen_user_turns: list[int] = []
 
     async def stream(self, *, system, messages, tools, usage):
-        from finharness.types import ModelUsage, StreamChunk, StreamEvent
+        from finharness.types import STATE_VIEW_META, ModelUsage, StreamChunk, StreamEvent
 
-        turns = sum(1 for message in messages if message.role == "user")
+        # 只数真实提问：会话研究状态视图以 user 角色随请求追加，但不是用户轮次。
+        turns = sum(
+            1
+            for message in messages
+            if message.role == "user" and not message.metadata.get(STATE_VIEW_META)
+        )
         self.seen_user_turns.append(turns)
         yield StreamChunk(StreamEvent.TEXT_DELTA, f"第{turns}轮")
         yield StreamChunk(
@@ -37,8 +43,8 @@ def make_app(tmp_path, provider=None):
         data={"cache_dir": tmp_path / "cache"},
         paths={
             "output_dir": tmp_path / "output",
-            "memory_db": tmp_path / "cache" / "memory.db",
-            "auth_db": tmp_path / "cache" / "users.db",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
         },
     )
     return create_app(provider or EchoProvider(), settings=settings)
@@ -275,7 +281,7 @@ def test_artifacts_are_scoped_to_the_owner(tmp_path):
 
 
 def test_artifact_endpoint_does_not_serve_the_user_database(tmp_path):
-    """data_cache 只开放 parquet/ 子树，否则 users.db 可被直接下载。"""
+    """产物端点只开放该用户自己的缓存命名空间，users.db 不可被下载。"""
     client_a, headers_a, _, _ = make_two_users(tmp_path)
     users_db = Path(client_a.app.state.user_store.db_path)
 
@@ -295,6 +301,119 @@ def test_artifact_endpoint_does_not_serve_the_memory_database(tmp_path):
     )
 
     assert response.status_code == 403
+
+
+# -- 缓存命名空间（docs 03.13 / 隔离方案 P0-1）-------------------------------
+
+def test_each_user_gets_a_separate_cache_namespace(tmp_path):
+    """缓存必须按用户分开，否则载荷路径可由请求形状推算出来。"""
+    client_a, _, client_b, _ = make_two_users(tmp_path)
+    scoped = client_a.app.state.scoped_settings
+    id_a = client_a.finharness_user["id"]
+    id_b = client_b.finharness_user["id"]
+
+    cache_a = scoped(id_a).data.cache_dir
+    cache_b = scoped(id_b).data.cache_dir
+
+    assert cache_a != cache_b
+    assert id_a in cache_a.parts and id_b not in cache_a.parts
+    # output 与 cache 必须同源派生：两者都由同一个 user id 命名。
+    assert scoped(id_a).paths.output_dir.name == id_a
+
+
+def test_artifacts_cannot_reach_another_users_cache(tmp_path):
+    """A 直接请求 B 的缓存载荷路径必须 403，而不是 200。"""
+    client_a, headers_a, _, _ = make_two_users(tmp_path)
+    scoped = client_a.app.state.scoped_settings
+    id_b = client_b_id(client_a)
+
+    b_parquet = scoped(id_b).data.cache_dir / "parquet" / "2026-09" / "deadbeef.parquet"
+    b_parquet.parent.mkdir(parents=True, exist_ok=True)
+    b_parquet.write_bytes(b"payload-owned-by-b")
+
+    response = client_a.get(
+        "/v1/artifacts", params={"path": str(b_parquet)}, headers=headers_a
+    )
+
+    assert response.status_code == 403, "A 不能读到 B 缓存命名空间里的载荷"
+
+
+def client_b_id(client_a) -> str:
+    """从同一应用上取第二个用户的 id（测试只关心它不同于 A）。"""
+    store = client_a.app.state.user_store
+    return store.find_by_username("bob").id
+
+
+def test_artifact_endpoint_serves_the_owners_own_cache(tmp_path):
+    """隔离不能把用户自己的载荷一并挡掉。"""
+    client_a, headers_a, _, _ = make_two_users(tmp_path)
+    scoped = client_a.app.state.scoped_settings
+    id_a = client_a.finharness_user["id"]
+
+    own = scoped(id_a).data.cache_dir / "parquet" / "2026-09" / "cafe.parquet"
+    own.parent.mkdir(parents=True, exist_ok=True)
+    own.write_bytes(b"a-own-payload")
+
+    response = client_a.get("/v1/artifacts", params={"path": str(own)}, headers=headers_a)
+
+    assert response.status_code == 200
+    assert response.content == b"a-own-payload"
+
+
+def test_read_file_cannot_escape_into_another_users_cache(tmp_path):
+    """A 的 read_file 拿到 B 缓存载荷的路径时必须拒绝，而不是读出内容。
+
+    载荷用**文本**而非 parquet：parquet 字节不是合法表格，会让读取因解析失败
+    而落空，于是测试即便路径检查失效也照样"通过"。文本载荷保证唯一能拦住它的
+    就是包含性检查本身。
+    """
+    import asyncio
+
+    client_a, _, _, _ = make_two_users(tmp_path)
+    scoped = client_a.app.state.scoped_settings
+    id_a = client_a.finharness_user["id"]
+    id_b = client_b_id(client_a)
+
+    stolen = "payload-owned-by-b"
+    b_payload = scoped(id_b).data.cache_dir / "parquet" / "2026-09" / "beef.txt"
+    b_payload.parent.mkdir(parents=True, exist_ok=True)
+    b_payload.write_text(stolen, encoding="utf-8")
+
+    tool = ReadFileTool(client_a.app.state.data_for(id_a))
+    result = asyncio.run(tool.run(path=str(b_payload)))
+
+    assert result.ok is False, "越出本用户根的路径必须被拒"
+    assert stolen not in (result.content or "")
+
+
+def test_read_file_reads_the_users_own_cache(tmp_path):
+    """隔离不得把用户自己的载荷一并挡掉（否则上面的测试可被"永远拒绝"讨好）。"""
+    import asyncio
+
+    client_a, _, _, _ = make_two_users(tmp_path)
+    scoped = client_a.app.state.scoped_settings
+    id_a = client_a.finharness_user["id"]
+
+    own = scoped(id_a).data.cache_dir / "parquet" / "2026-09" / "mine.txt"
+    own.parent.mkdir(parents=True, exist_ok=True)
+    own.write_text("a-own-payload", encoding="utf-8")
+
+    tool = ReadFileTool(client_a.app.state.data_for(id_a))
+    result = asyncio.run(tool.run(path=str(own)))
+
+    assert result.ok is True, result.error
+    assert "a-own-payload" in result.content
+
+
+def test_cache_stats_are_per_user(tmp_path):
+    """统计不跨租户聚合：新用户的缓存计数从零开始。"""
+    client_a, headers_a, client_b, headers_b = make_two_users(tmp_path)
+
+    a_stats = client_a.get("/v1/cache/stats", headers=headers_a).json()
+    b_stats = client_b.get("/v1/cache/stats", headers=headers_b).json()
+
+    assert a_stats["entries"] == 0
+    assert b_stats["entries"] == 0
 
 
 # -- 记忆不被跨用户汇聚 ---------------------------------------------------------

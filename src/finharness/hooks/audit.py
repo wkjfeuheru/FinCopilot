@@ -70,6 +70,23 @@ class AuditHook(BaseHook):
             }
         )
 
+    def generation_stopped(self, *, conversation_id: str, rounds: int = 0) -> None:
+        """记录一次用户主动停止生成（docs 03.3）。
+
+        与 ``session_end`` 分开：一次会话可以包含多轮，而停下的是其中某一轮。
+        文档 §8 曾承诺断线时写入 ``aborted`` 审计行却从未实现；这条覆盖了用户
+        主动停止这一真实路径（协作式停止经由轮次日志与断点留痕）。
+        """
+        self.writer.write(
+            {
+                "session_id": self.session_id,
+                "user_id": self.user_id,
+                "action": "generation_stopped",
+                "conversation_id": conversation_id,
+                "rounds": rounds,
+            }
+        )
+
     async def post(
         self,
         tool,
@@ -88,6 +105,9 @@ class AuditHook(BaseHook):
         self.writer.write(
             {
                 "session_id": self.session_id,
+                # 与 session 边界行对齐：逐调用行也要能独立回答"是谁"，
+                # 而不必先 join 会话行才知道操作者。
+                "user_id": self.user_id,
                 "action": action,
                 "turn": turn,
                 "tool": getattr(tool, "name", "unknown"),
@@ -109,6 +129,7 @@ class AuditHook(BaseHook):
         if isinstance(review, dict):
             row = {
                 "session_id": self.session_id,
+                "user_id": self.user_id,
                 "action": "review",
                 "turn": turn,
                 "tool": getattr(tool, "name", "unknown"),

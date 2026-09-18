@@ -67,7 +67,7 @@ version: 1
 | references/risk-identification.md | 行业风险识别（候选清单） | 成稿的风险章节 |
 | assets/report-template.md | 行业研报模板 | 用户要求成稿时 |
 
-**加载纪律**：`load_skill("industry-research", file="references/<文件名>")` 按需逐份加载，
+**加载纪律**：这些文档由系统按问题所涉能力自动注入，无需请求加载——
 一般一单 2–3 份；同一文件只加载一次。
 
 ## 输出契约

@@ -112,17 +112,14 @@ def test_review_catalogue_is_read_only_data_tools_plus_read_file():
     names = set(review_tool_names())
 
     assert {"get_quote", "get_financials", "get_indicators", "read_file"} <= names
-    # Writes、output tools 以及所有 META tool 都被排除。load_tool 最关键：
-    # 它会让 reviewer 扩大自己的 tool 目录。
+    # Writes、output tools 以及所有 META tool 都被排除：它们都会让 reviewer
+    # 扩大自己的目录或改动会话状态。
     assert not {"write_report", "write_file", "make_chart"} & names
     assert not {
         "research_plan",
         "remember_preference",
-        "load_tool",
         "search_tools",
         "ask_user",
-        "load_skill",
-        "list_skills",
     } & names
     # 纯计算器无法获取任何数据，因此不增加校验能力。
     assert not {"calc_metrics", "calc_valuation"} & names
@@ -174,6 +171,62 @@ def test_review_leaves_no_conversation_memory_behind(tmp_path):
 
     # review 是一次片段，而非记忆：除了它自己的 summary 什么都不会返回。
     assert result.summary == "ok"
+
+
+# -- 子代理审计（docs 03.7.3）--------------------------------------------------
+
+
+def test_subagent_tool_calls_are_audited_with_user_id(tmp_path):
+    """子代理不再是审计盲区：它的工具调用以 focus 前缀的 session 落行，
+    并带上与主会话相同的 user_id。"""
+    import json
+
+    from finharness.hooks.audit import AuditHook, AuditLogWriter
+
+    provider = ScriptedProvider(
+        [
+            tool_round(ToolUse("c1", "get_quote", {"symbol": "600519"})),
+            text_round("未发现实质性问题"),
+        ]
+    )
+    settings = make_settings(tmp_path)
+    data = DataAccess([Adapter()], cache=LocalCache(tmp_path / "cache"), settings=settings)
+    audit_path = tmp_path / "audit.jsonl"
+    writer = AuditLogWriter(audit_path)
+    coordinator = Coordinator(
+        provider=provider,
+        data=data,
+        settings=settings,
+        cite=CitationRegistry(),
+        audit_hook_factory=lambda session_id: AuditHook(
+            writer, session_id=session_id, user_id="u_test"
+        ),
+        user_id="u_test",
+    )
+
+    result = run(coordinator.review_risk(topic="t", markdown="body"))
+
+    assert result.ok is True
+    rows = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    tool_rows = [row for row in rows if row.get("action") == "run"]
+    assert tool_rows, "子代理的工具调用必须留下审计行"
+    assert all(row["user_id"] == "u_test" for row in tool_rows)
+    assert all(row["session_id"].endswith("-subagent") for row in tool_rows)
+    assert tool_rows[0]["tool"] == "get_quote"
+
+
+def test_subagent_runs_without_an_audit_factory(tmp_path):
+    """未接线审计工厂时（测试替身路径）子代理照常运行，只是不留痕。"""
+    provider = ScriptedProvider([text_round("ok")])
+    coordinator = make_coordinator(tmp_path, provider)
+
+    result = run(coordinator.review_risk(topic="t", markdown="body"))
+
+    assert result.ok is True
 
 
 # -- 预算 ---------------------------------------------------------------------

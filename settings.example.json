@@ -65,6 +65,7 @@
   "tools": {
     "timeout_default_s": 30,
     "timeout_overrides": {},
+    "result_token_overrides": {},
     "resident": [],
     "lazy": []
   },
@@ -92,10 +93,42 @@
     "compaction_ratio": 0.8,
     "trim_rows": 20,
     "max_result_tokens": 1000,
+    "compaction_result_tokens": 500,
     "max_tool_schema_tokens": 60,
     "short_mem_cap": 200,
     "recall_max_tokens": 400,
-    "ltm_inject_max_tokens": 600
+    "summary_inject_max_tokens": 600,
+    "max_loaded_rounds": 200,
+    "max_window_rounds": 40
+  },
+  "ltm": {
+    "distill_idle_s": 1800,
+    "distill_batch": 3,
+    "distill_max_attempts": 3,
+    "recent_episodes": 5,
+    "inject_max_tokens": 600,
+    "recall_max_tokens": 400,
+    "retention_episodes": 500,
+    "retention_days": 365,
+    "distill_semantics": true,
+    "retention_facts": 300,
+    "retention_facts_days": 730,
+    "semantic_top_k": 5,
+    "semantic_inject_max_tokens": 400,
+    "embeddings": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "env_key": "DASHSCOPE_API_KEY",
+      "model_name": "text-embedding-v4",
+      "timeout_s": 30.0
+    },
+    "vector_db": {
+      "kind": "qdrant",
+      "url": null,
+      "collection": "finharness_semantics",
+      "api_key_env": null,
+      "timeout_s": 10.0,
+      "dim": 0
+    }
   },
   "audit": {
     "log_path": "logs/audit.jsonl"
@@ -124,6 +157,8 @@
     "port": 8000,
     "session_ttl_s": 1800,
     "confirm_ttl_s": 120,
+    "busy_timeout_s": 3600,
+    "user_cache_size": 64,
     "static_dir": "src/finharness/server/static",
     "allow_remote": false
   },
@@ -131,12 +166,25 @@
     "token_ttl_s": 1209600,
     "min_password_len": 8,
     "secure_cookie": false,
-    "allow_register": true
+    "allow_register": true,
+    "login_max_attempts": 10,
+    "login_window_s": 300,
+    "register_max_attempts": 5,
+    "register_window_s": 3600,
+    "claim_legacy_on_first_register": false
+  },
+  "quota": {
+    "turns_per_window": 600,
+    "window_s": 3600,
+    "max_concurrent_streams": 0
   },
   "paths": {
     "output_dir": "output",
-    "memory_db": "data_cache/memory.db",
-    "auth_db": "data_cache/users.db",
+    "state_dir": "state",
+    "memory_db": "state/memory.db",
+    "auth_db": "state/users.db",
+    "config_db": "state/config.db",
+    "secret_key": "state/secret.key",
     "skills_dir": "skills"
   },
   "search": {

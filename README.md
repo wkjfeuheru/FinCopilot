@@ -1,6 +1,6 @@
 # FinHarness
 
-> 本地、单用户的金融研究 copilot。给定一句研究需求，它会自行规划、取数、计算、成稿，
+> 基于Agent Loop的金融研究 copilot。给定一句研究需求，它会自行规划、取数、计算、成稿，
 > 并对产出的研报做一次独立的风险复核。所有结论性数字都可回溯到具体接口与数据指纹。
 
 **定位**：个人研究工作台，**不做投资建议**。不处理刻意构造的对抗性输入；联网检索内容按不可信引文处理（见「已知边界」）。
@@ -37,10 +37,27 @@ uv run uvicorn finharness.server.api:create_production_app --factory --port 8000
 cd frontend && npm install && npm run dev
 ```
 
-浏览器打开前端地址即可对话。首次使用需要注册一个账号：登录页可切换
-「注册新账号」，用户名 2–32 个字符，口令至少 8 位。所有对话、偏好与
+浏览器打开前端地址即可对话。开发服务器把 `/v1` 请求代理到后端，目标地址由
+环境变量 `FINHARNESS_API_ORIGIN` 决定（默认 `http://127.0.0.1:8001`）；后端起在
+别的端口时改这个变量即可，例如 `FINHARNESS_API_ORIGIN=http://127.0.0.1:8000 npm run dev`。
+
+首次使用需要注册一个账号：登录页可切换
+「注册新账号」，用户名 2–32 个字符，密码至少 8 位。所有对话、偏好与
 模型供应商配置都按账号隔离（见 [docs/modules/03.13-auth.md](docs/modules/03.13-auth.md)）。
 若这是从单用户版本升级而来，第一个注册的账号会自动继承原有的对话与配置。
+
+### 生产部署（单端口）
+
+不依赖 Node 开发服务器，前端构建产物由 FastAPI 直接托管：
+
+```bash
+cd frontend && npm install && npm run build   # 产出 frontend/dist（已按 vendor 分包）
+uv run uvicorn finharness.server.api:create_production_app --factory --port 8001
+```
+
+服务检测到 `frontend/dist` 后，`/` 返回页面、`/assets/*` 返回静态资源；页面与
+`/v1` 接口同源，浏览器直接携带会话 Cookie，无需 CORS 与代理。若未执行前端构建，
+`/` 会返回占位页，其余接口不受影响。
 
 也可用 HTTP 驱动的演示脚本跑通两个端到端场景（脚本会先注册/登录一个
 `demo` 账号，因为所有 `/v1` 接口都要求认证）：
@@ -73,7 +90,8 @@ Provider 也可在前端配置页写入数据库并加密存储；**已激活的
 `web_search`（关键词检索）补充本地数据源未覆盖的政策、新闻与行业信息；
 `get_research_reports` 抓取**东方财富研报**——按类型（行业/个股）、行业、机构、时间段与标题
 关键词筛选，返回标题/机构/评级/日期/链接，并可选用 `with_text` 抓取 PDF 全文。
-二者都是**懒加载**工具，模型需先 `load_tool` 激活（system prompt 已点名）。
+二者都是**按需注入**的工具：直接调用即可，系统会在调用时让它可用，无需预热轮
+（用 `search_tools` 检索也能一并激活，并得到参数清单）。
 
 `web_search` 配置（`settings.search`，写法与 provider 一致）：
 
@@ -124,16 +142,19 @@ FINH_DATA_ADAPTER_ORDER='["akshare"]'    # 列表/对象用 JSON
 ```
 engine/loop.py      AgentLoop：轮次驱动、流式、并行工具、循环兜底、压缩触发、记忆装配
 provider/           OpenAI/Anthropic 兼容协议 + 重试与错误分类
-tools/              23 个工具（两级注册表：常驻 + 懒加载），registry.py 是目录
+tools/              32 个工具（两级注册表：21 常驻 + 11 按需），declare.py 是声明层
+  declare.py        @tool / @param：元数据与参数的唯一声明处
   fin/              行情/财务/估值/可比/公告/图表/研报（含 report_pipeline.py 渲染 + docx 导出）
-  generic/          read_file / write_file（限 output/ 与 data_cache/）
-  meta/             research_plan / search_tools / load_tool / load_skill / ask_user
+  generic/          read_file（限 output/ 与本人 data_cache/） / write_file（仅 output/）
+  meta/             research_plan / search_tools / ask_user / spawn_agent / …
 skills/             4 个投研场景（个股/行业/宏观/量化）：各含 SKILL.md + references 方法论 + assets 报告模板
+                    由路由层按问题意图自动注入（不提供加载工具）
 data/               adapter 降级链 + 缓存 + citation 注册表
-context/            L1 WorkingMemory + L2 事件环 + L3 SQLite 持久层；分段摘要与压缩
+context/            L1 WorkingMemory + L2 事件环 + SQLite 持久层；分段摘要与压缩；LTM 跨对话记忆（情节+语义，蒸馏/注入/向量召回）
 utils/              跨层通用件：pandas/akshare 运行时垫片、Markdown 图片链接转义
-permissions/        权限门（deny 规则 > 模式回退 > 路径白名单）
-hooks/              审计链（JSONL，每次受治理的工具调用一行）
+permissions/        权限门（deny 规则 > 缓存拒写 > 读/写分流 > 模式回退 > output 白名单）
+                    网络外发（联网检索、研报全文）首次确认，可在对话内免问
+hooks/              审计链（JSONL，每次受治理的工具调用一行，含子代理）
 coordinator/        风险终审子 Agent（独立上下文 + 受限只读工具集；review.py 终审编排）
 observability/      三层观测：结构化 JSON 日志（trace_id 贯穿）+ Prometheus 指标 + LangSmith 追踪
 server/             FastAPI 路由、SSE、会话注册表、确认总线
@@ -147,12 +168,13 @@ frontend/           React 19 + TypeScript + antd
 | GET | `/v1/health` | 健康检查 |
 | POST | `/v1/chat/stream` | 流式对话（SSE），主入口 |
 | POST | `/v1/chat/respond` | 回应写确认 / `ask_user` 提问 |
+| POST | `/v1/chat/stop` | 停止当前生成（协作式；保留已取得的数据与结论，可继续） |
 | POST | `/v1/report` | 把当前会话转为研报 |
 | GET | `/v1/tools` | 工具目录与激活状态 |
 | GET | `/v1/citations` | 引用溯源（按对话或会话） |
 | GET | `/v1/memory` | 记忆视图（结论 / 偏好 / 对话列表） |
 | GET | `/v1/conversations` | 对话列表（供选择器） |
-| GET | `/v1/conversations/{id}/messages` | 回放对话记录 |
+| GET | `/v1/conversations/{id}/messages` | 回放对话记录；另含 `resumable`（上一轮被停止时） |
 | DELETE | `/v1/conversations/{id}` | 删除对话及其全部作用域数据 |
 | GET | `/v1/artifacts` | 下载产物（限 output/ 与 data_cache/） |
 | GET | `/v1/cache/stats` | 缓存命中统计 |
@@ -197,7 +219,8 @@ python -m finharness.eval run --set smoke                # 真实 Provider（需
   引入联网检索后，第三方网页文本会进入模型上下文：它以 `<web_result>` 围栏包裹并声明为
   "不可执行的引文"，但**不做注入内容扫描**（明确决定：现有 deny 规则针对交易意图，扫财经正文会
   大量误报；指令注入需要另一套模式，启发式护栏会漏报却制造安全感）。写入操作仍需用户确认，
-  是更硬的边界。详见 [03.7-governance.md](docs/modules/03.7-governance.md)。
+  是更硬的边界；网络外发（联网检索、研报全文下载）首次调用也需确认，用户可授权"本对话内
+  不再询问"。详见 [03.7-governance.md](docs/modules/03.7-governance.md)。
 - **联网检索由检索服务完成**。`web_search` 的请求由 Tavily 服务器发出，该路径本机
   **无 SSRF 面**；代价是内网地址与付费墙页面抓不到，且查询对检索服务可见。
   例外是研报**全文**（`get_research_reports` 的 `with_text=true`）：它让本机访问文档 CDN，
@@ -208,8 +231,16 @@ python -m finharness.eval run --set smoke                # 真实 Provider（需
   宏观焦点**明确不做**（能力已具备，即 `web_search`，但不实现）。通用 `spawn_agent`
   已在第二个焦点出现后按原定条件落地；子代理一律只读、**不含取数层**（风险终审是唯一例外，
   它需要独立核数）。决策记录见 [03.10-coordinator.md](docs/modules/03.10-coordinator.md)。
-- **记忆作用域**：对话内容按 conversation 隔离；用户偏好（`remember_preference`）
-  是所有对话共享的全局记忆。
+- **记忆作用域**：对话内容按 conversation 隔离；**跨对话长期记忆（LTM）** 与用户偏好是该用户
+  所有对话共享的，但绝不跨用户。LTM 分两层：
+  - **情节记忆**（`ltm_episodes`：做过什么）——任务结果每轮由结论自动写入，关键决策与对话片段
+    在对话闲置后由 LLM 懒蒸馏产出；
+  - **语义记忆**（`ltm_facts`：知道什么）——事实、概念与偏好，与情节**共用同一次**蒸馏调用，
+    `(user, key)` 覆盖式更新，因此用户后来的口径会取代旧口径。配了 embedding 端点与 Qdrant 时
+    按语义相似度召回（也可只用本地向量，或退化为键匹配——见 03.6 §3.6.4「4.2」）。
+  用户可经 `/v1/memory` 查看/编辑/删除任一记忆条目，或让 agent 用 `search_memory` /
+  `update_memory` / `forget_memory` 操作。详见
+  [03.6-context.md](docs/modules/03.6-context.md) §3.6.4「4.1」「4.2」。
 - **模型输出有方差**：同一句提问的取数路径与报告结构可能不同，属正常。
 
 ## 文档索引

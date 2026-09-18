@@ -8,15 +8,22 @@
 把它放在这里，而不是放在一个模型可以自行选择的工具里，能让"每份报告
 都经过审查"成为系统的一种属性，而非对模型行为的期望。编排逻辑本身位于
 ``report/review.py``；本工具只负责渲染，然后调用它一次。
+
+复核意见随工具**文本**返回给模型，不构成产物：sidecar 文件（``.review.md``）
+只用于内容哈希闩锁与审计取证，因此它不入 ``attachments``，也不在结果里给出
+路径——终审是模型对模型的内部闸门，用户侧不该看到一份"第二报告"（文档 03.10.7）。
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from pydantic import BaseModel, Field
 
 from finharness.data.raw import RawData
 from finharness.coordinator.review import format_review_lines, review_report
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, ToolGroup, param, tool
 from finharness.tools.fin.report_pipeline import (
     ReportOutline,
     ReportPipeline,
@@ -26,38 +33,40 @@ from finharness.tools.fin.report_pipeline import (
 
 
 class SectionInput(BaseModel):
+    """章节结构。
+
+    这是 ``params_model`` 逃生口的用途：``sections`` 是一个**嵌套结构**（每项含标题、
+    正文、引用与图表），其形态由报告管线定义，而不是工具的调用参数。工具的调用参数
+    仍由 ``@param`` 声明，只有这个嵌套元素沿用模型。
+    """
+
     heading: str = Field(description="章节标题")
     body: str = Field(description="章节正文（markdown，结论性数字需带 {cite:cid}）")
     cids: list[str] = Field(default_factory=list, description="本章节引用的 citation id")
     charts: list[str] = Field(default_factory=list, description="本章节引用的图表路径（make_chart 产出）")
 
 
-class ReportInput(BaseModel):
-    topic: str = Field(description="报告主题，用于文件命名")
-    core_view: list[str] = Field(description="核心观点，每条须含 {cite:cid}")
-    sections: list[SectionInput] = Field(description="正文章节")
-    risks: list[str] = Field(description="风险提示，建议 ≥5 条")
-    formats: list[str] = Field(
-        default_factory=lambda: ["md", "docx"],
-        description="产出形态，默认同时产出 md 与 docx",
-    )
-
-
-class WriteReportTool(BaseTool):
-    name = "write_report"
-    description = (
+@tool(
+    name="write_report",
+    description=(
         "把结构化大纲渲染成研报（markdown + docx）。正文中的结论性数字必须带引用，"
         "未标注来源的数字会在报告中被标记。"
-    )
-    input_model = ReportInput
-    permission = PermissionLevel.WRITE
-    group = ToolGroup.FIN_OUTPUT
+    ),
+    capability=Capability.OUTPUT,
+    group=ToolGroup.FIN_OUTPUT,
+    permission="write",
     # 报告渲染，外加一轮针对真实服务提供方的审查调用。默认的
     # 30s 预算无法覆盖一次审查所需的提供方往返耗时。
-    timeout = 300
-    output_schema_note = "产出 output/<topic>_<YYYYMMDD>.md 与 .docx，并附风险终审意见。"
-    needs_coordinator = True
-
+    timeout=300,
+    output_schema_note="产出 output/<topic>_<YYYYMMDD>.md 与 .docx，并附风险终审意见。",
+    needs_coordinator=True,
+)
+class WriteReportTool(BaseTool):
+    @param("topic", desc="报告主题，用于文件命名")
+    @param("core_view", desc="核心观点，每条须含 {cite:cid}")
+    @param("sections", annotation=list[SectionInput], desc="正文章节")
+    @param("risks", desc="风险提示，建议 ≥5 条")
+    @param("formats", desc="产出形态，默认同时产出 md 与 docx")
     async def _dispatch(
         self,
         *,
@@ -91,7 +100,11 @@ class WriteReportTool(BaseTool):
             tool_names=set(self.registry.names()) if self.registry is not None else set(),
         )
         try:
-            artifact = pipeline.export(outline, formats=tuple(formats or ("md", "docx")))
+            # 落盘 markdown 与 docx 导出（可能起 pandoc 子进程）都是阻塞调用，
+            # 放进线程后 300s 的工具超时才真正生效，且渲染期间不占住事件循环。
+            artifact = await asyncio.to_thread(
+                pipeline.export, outline, formats=tuple(formats or ("md", "docx"))
+            )
         except ReportValidationError as exc:
             # 精确、可操作的反馈，便于模型修正大纲。
             raise ValueError("报告校验未通过：" + "；".join(exc.problems)) from exc
@@ -116,8 +129,6 @@ class WriteReportTool(BaseTool):
             self.coordinator, topic=artifact.topic, markdown_path=artifact.markdown_path
         )
         lines.extend(format_review_lines(outcome))
-        if outcome.review_path:
-            attachments.append(outcome.review_path)
 
         return RawData(
             kind="text",
@@ -125,8 +136,8 @@ class WriteReportTool(BaseTool):
             paths=attachments,
             endpoint="report:pipeline",
             params={"topic": artifact.topic, "citations": len(artifact.citations)},
-            # 审计钩子读取此项来写入审查自身的审计记录；
-            # 该字段绝不会发送给模型服务提供方。
+            # 审计钩子读取此项来写入审查自身的审计记录；该字段绝不会发送给
+            # 模型服务提供方。其中的未结事项同时供循环写入会话状态（docs 03.10.7）。
             metadata={"review": outcome.audit_metadata()},
         )
 

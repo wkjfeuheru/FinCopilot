@@ -43,6 +43,10 @@ _PERIOD_LABEL = {1: "近一年", 2: "近一年", 3: "近三年", 5: "近五年"}
 # 冷却期，而不是在每次调用时重复重试。
 _QUOTE_CANDIDATE_DEADLINE_S = 8.0
 _QUOTE_REQUEST_TIMEOUT_S = 8.0  # 传给接受 timeout 参数的接口
+# K 线序列比快照大，正常返回本就慢一些，因此给更宽的时限；但它同样没有设置
+# 请求超时，一个挂死的接口会吃光整个工具体预算（横截面回测一次要取数百只），
+# 因此候选链上的每次尝试都必须有时限，超时即弃并落到下一个候选。
+_KLINE_CANDIDATE_DEADLINE_S = 15.0
 _UNHEALTHY_AFTER_FAILURES = 2
 _UNHEALTHY_COOLDOWN_S = 300.0
 
@@ -313,6 +317,7 @@ class AkShareAdapter(DataAdapter):
                             symbol=symbol, period=em_period, start_date=start,
                             end_date=end, adjust=adjust or "",
                         ),
+                        deadline_s=_KLINE_CANDIDATE_DEADLINE_S,
                     )
                 else:  # 新浪 / 腾讯变体需要交易所前缀
                     prefixed = prefixed_symbol(symbol, lower=True)
@@ -320,6 +325,7 @@ class AkShareAdapter(DataAdapter):
                         df = self._call(
                             interface,
                             lambda ak: ak.stock_zh_a_daily(symbol=prefixed, adjust=adjust or ""),
+                            deadline_s=_KLINE_CANDIDATE_DEADLINE_S,
                         )
                     else:
                         start = (date.today() - timedelta(days=365 * max(years, 1) + 30)).strftime("%Y%m%d")
@@ -329,6 +335,7 @@ class AkShareAdapter(DataAdapter):
                             lambda ak: ak.stock_zh_a_hist_tx(
                                 symbol=prefixed, start_date=start, end_date=end
                             ),
+                            deadline_s=_KLINE_CANDIDATE_DEADLINE_S,
                         )
                 df = _normalize(df, "kline")
                 if not len(df):

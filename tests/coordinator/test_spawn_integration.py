@@ -79,9 +79,8 @@ def build_loop(tmp_path, provider):
     cite = CitationRegistry()
     ctx = ResearchContext(cite=cite, settings=settings)
     registry = ToolRegistry(data, ctx=ctx, settings=settings)
-    # spawn_agent 是 lazy tool：若其 schema 从未注入，loop 会拒绝运行，
-    # 因此真实模型会先激活它（load_tool）。这里照此处理，
-    # 而不是脚本化一个无效的直接调用。
+    # spawn_agent 是按需工具。直接调用它已经不再被拒绝（就地激活），
+    # 但这里仍显式激活一次，使被测脚本的第一步与"已发现它"的常态一致。
     registry.activate("spawn_agent")
     loop = AgentLoop(
         provider=provider,

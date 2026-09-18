@@ -15,7 +15,23 @@ from finharness.data.access import DataAccess
 from finharness.data.adapters.base import DataAdapter, FetchResult
 from finharness.provider.fake import FakeProvider
 from finharness.server.api import create_app
-from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUse
+from finharness.types import (
+    STATE_VIEW_META,
+    ModelUsage,
+    Msg,
+    StreamChunk,
+    StreamEvent,
+    ToolUse,
+)
+
+
+def _is_user_turn(message: Msg) -> bool:
+    """一条真实的用户提问；排除随请求追加的会话研究状态视图。
+
+    状态视图以 user 角色发送（放在历史之后以利缓存与注意力），但它不是用户轮次——
+    若计入，「恢复历史」类断言会把状态块误当成一问。
+    """
+    return message.role == "user" and not message.metadata.get(STATE_VIEW_META)
 
 
 class EchoProvider(FakeProvider):
@@ -27,7 +43,7 @@ class EchoProvider(FakeProvider):
 
     async def stream(self, *, system, messages, tools, usage: ModelUsage):
         self.requests.append(list(messages))
-        users = [m for m in messages if m.role == "user"]
+        users = [m for m in messages if _is_user_turn(m)]
         self.seen_user_turns.append(len(users))
         yield StreamChunk(StreamEvent.TEXT_DELTA, f"第{len(users)}问已回答")
         yield StreamChunk(
@@ -201,6 +217,17 @@ def test_replay_keeps_planning_tool_events_after_refresh(tmp_path):
         ("research_plan", "completed"),
     ]
 
+    progress = next(
+        event["data"]
+        for event in answer["turn"]["events"]
+        if event["event"] == "plan_progress"
+    )
+    assert progress["goal"] == "完成公司研究"
+    assert progress["steps"] == [
+        {"seq": 1, "action": "分析财务数据", "status": "pending", "dep": []}
+    ]
+    assert "tool_hint" not in progress["steps"][0]
+
 
 def test_replay_keeps_produced_files_after_refresh(tmp_path):
     """刷新后“产出文件”一栏不得消失。
@@ -361,3 +388,69 @@ def test_persisted_citations_are_readable_after_the_session_is_gone(tmp_path):
     assert citation["symbol"] == "600519"
     assert citation["params"] == {"symbol": "600519"}
     assert citation["from_cache"] is False
+
+
+def test_session_scope_is_reclaimed_when_the_session_expires(tmp_path):
+    """会话过期后其执行态必须真的被释放，而不是残留在进程级注册表里。
+
+    这正是"每个会话残留一份记忆"的泄漏点：会话状态若在注册表之外另存一份，
+    注册表淘汰就够不到它。
+    """
+    client, _ = make_client(tmp_path)
+    client.post("/v1/chat/stream", json={"message": "第一问"})
+    registry = client.app.state.session_registry
+    session = next(iter(registry.sessions.values()))
+
+    # 让该会话过期，然后触发一次淘汰（新会话即可）。
+    session.last_active -= 10_000
+    client.post("/v1/chat/stream", json={"message": "另一问"})
+
+    assert session.session_id not in registry.sessions, "过期会话必须被回收"
+
+
+def test_citations_by_session_come_from_the_session_loop(tmp_path):
+    """按 session 读引用时数据来自会话自身，而非另一份进程级副本。"""
+    from finharness.data.citation import Citation
+
+    client, _ = make_client(tmp_path)
+    client.post("/v1/chat/stream", json={"message": "第一问"})
+    registry = client.app.state.session_registry
+    session = next(iter(registry.sessions.values()))
+
+    session.loop.cite.restore(
+        [
+            Citation(
+                cid="cit_000001",
+                tool="get_quote",
+                endpoint="akshare:stock_zh_a_spot_em",
+                symbol="600519",
+                params={"symbol": "600519"},
+                ts="2026-09-12T10:30:00+08:00",
+                rows=1,
+                cols=3,
+                fingerprint="abc123",
+                from_cache=False,
+            )
+        ]
+    )
+
+    body = client.get("/v1/citations", params={"session_id": session.session_id}).json()
+
+    assert body["count"] == 1
+    assert body["citations"][0]["cid"] == "cit_000001"
+
+
+def test_conversation_citation_cache_is_bounded(tmp_path):
+    """对话级引用缓存不能只增不减：进程见过的对话数可以远超活跃数。"""
+    from finharness.data.citation import CitationRegistry
+
+    client, _ = make_client(tmp_path)
+    cache = client.app.state.conversation_citations
+    limit = cache.max_size
+    assert limit > 0, "生产装配必须给出上限"
+
+    for index in range(limit + 10):
+        cache[f"c_{index}"] = CitationRegistry()
+
+    assert len(cache) == limit, "超出上限后必须淘汰，而不是继续增长"
+

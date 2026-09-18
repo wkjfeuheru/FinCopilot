@@ -78,7 +78,7 @@ def score_task(case: EvalCase, run: CaseRun) -> DimensionScore:
     score.add("run_completed", True)
 
     # 逐轮的答案断言；某一轮的期望只作用于该轮。
-    for index, turn in enumerate(case.turns):
+    for index, turn in enumerate(case.all_turns):
         if index >= len(run.turns):
             score.add(f"turn{index + 1}_present", False, "该轮未执行")
             continue
@@ -143,20 +143,20 @@ def score_task(case: EvalCase, run: CaseRun) -> DimensionScore:
     produced = sum(
         len(getattr(turn.outcome, "citations", []) or []) for turn in run.turns
     )
-    if case.turns and case.turns[-1].expect.citations.required:
+    if case.all_turns and case.all_turns[-1].expect.citations.required:
         score.add(
             "citations_required",
             produced > 0,
             f"引用数 {produced}",
         )
     minimum = min(
-        (turn.expect.citations.min for turn in case.turns), default=0
+        (turn.expect.citations.min for turn in case.all_turns), default=0
     )
     if minimum:
         score.add("citations_min", produced >= minimum, f"引用数 {produced} < {minimum}")
 
     # 产物期望同样属于任务成功：报告要么存在且干净，要么该用例未成功。
-    for index, turn in enumerate(case.turns):
+    for index, turn in enumerate(case.all_turns):
         expected = turn.expect.artifacts
         if not expected.report_exported:
             continue
@@ -207,8 +207,6 @@ _ALWAYS_INTERNAL = (
     "get_market_news",
     "make_chart",
     "write_report",
-    "load_skill",
-    "load_tool",
     "search_tools",
     "research_plan",
     "calc_metrics",

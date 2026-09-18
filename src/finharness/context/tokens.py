@@ -109,3 +109,18 @@ def _default_cache_dir() -> Path:
     """项目本地的词表缓存；可由环境变量覆盖。"""
     override = os.environ.get("TIKTOKEN_CACHE_DIR")
     return Path(override) if override else VOCAB_CACHE_DIR
+
+
+_SHARED_COUNTER: "TokenCounter | None" = None
+
+
+def default_counter() -> TokenCounter:
+    """进程内共享的计数器。
+
+    在渲染/注入路径上按需构造计数器会各自解析一次词表；共享一个实例让这些调用
+    保持廉价，且与 :mod:`finharness.tools.base` 中渲染侧用的是同一份计数口径。
+    """
+    global _SHARED_COUNTER
+    if _SHARED_COUNTER is None:
+        _SHARED_COUNTER = TokenCounter()
+    return _SHARED_COUNTER

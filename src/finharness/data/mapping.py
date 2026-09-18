@@ -249,43 +249,64 @@ class MacroSpec:
     value_col: tuple[str, ...]
     unit: str
     frequency: str
+    # 发布机构与发布节奏。它们不参与取数，只用于把「这是截至哪一期的数据」讲清楚：
+    # 读者据此判断当前该看到哪一期、下一期何时发布（见 data/freshness.py）。
+    publisher: str = ""
+    cadence: str = ""
 
 
 MACRO_INDICATORS: Final[dict[str, MacroSpec]] = {
     "pmi_manufacturing": MacroSpec(
-        "制造业PMI", "pmi", "月份", ("制造业-指数",), "指数", "monthly"
+        "制造业PMI", "pmi", "月份", ("制造业-指数",), "指数", "monthly",
+        "中国物流与采购联合会", "当月最后一日发布",
     ),
     "pmi_non_manufacturing": MacroSpec(
-        "非制造业PMI", "pmi", "月份", ("非制造业-指数",), "指数", "monthly"
+        "非制造业PMI", "pmi", "月份", ("非制造业-指数",), "指数", "monthly",
+        "中国物流与采购联合会", "当月最后一日发布",
     ),
     "cpi_yoy": MacroSpec(
-        "CPI同比", "cpi", "月份", ("全国-同比增长",), "%", "monthly"
+        "CPI同比", "cpi", "月份", ("全国-同比增长",), "%", "monthly",
+        "国家统计局", "次月上旬发布（约9-10日）",
     ),
     "ppi_yoy": MacroSpec(
-        "PPI同比", "ppi", "月份", ("当月同比增长",), "%", "monthly"
+        "PPI同比", "ppi", "月份", ("当月同比增长",), "%", "monthly",
+        "国家统计局", "次月上旬发布（与CPI同日）",
     ),
     "m2_yoy": MacroSpec(
-        "M2同比", "money_supply", "月份", ("货币和准货币(M2)-同比增长",), "%", "monthly"
+        "M2同比", "money_supply", "月份", ("货币和准货币(M2)-同比增长",), "%", "monthly",
+        "中国人民银行", "次月中旬发布（约10-15日）",
     ),
     "m1_yoy": MacroSpec(
-        "M1同比", "money_supply", "月份", ("货币(M1)-同比增长",), "%", "monthly"
+        "M1同比", "money_supply", "月份", ("货币(M1)-同比增长",), "%", "monthly",
+        "中国人民银行", "次月中旬发布（约10-15日）",
     ),
     "social_financing": MacroSpec(
-        "社融增量", "shrzgm", "月份", ("社会融资规模增量",), "亿元", "monthly"
+        "社融增量", "shrzgm", "月份", ("社会融资规模增量",), "亿元", "monthly",
+        "中国人民银行", "次月中旬发布（约10-15日）",
     ),
-    "lpr_1y": MacroSpec("1年期LPR", "lpr", "TRADE_DATE", ("LPR1Y",), "%", "monthly"),
-    "lpr_5y": MacroSpec("5年期LPR", "lpr", "TRADE_DATE", ("LPR5Y",), "%", "monthly"),
+    "lpr_1y": MacroSpec(
+        "1年期LPR", "lpr", "TRADE_DATE", ("LPR1Y",), "%", "monthly",
+        "全国银行间同业拆借中心", "每月20日发布",
+    ),
+    "lpr_5y": MacroSpec(
+        "5年期LPR", "lpr", "TRADE_DATE", ("LPR5Y",), "%", "monthly",
+        "全国银行间同业拆借中心", "每月20日发布",
+    ),
     "shibor_on": MacroSpec(
-        "隔夜SHIBOR", "shibor", "日期", ("O/N-定价",), "%", "daily"
+        "隔夜SHIBOR", "shibor", "日期", ("O/N-定价",), "%", "daily",
+        "全国银行间同业拆借中心", "每交易日发布",
     ),
     "bond_10y": MacroSpec(
-        "10年期国债收益率", "bond", "日期", ("中国国债收益率10年",), "%", "daily"
+        "10年期国债收益率", "bond", "日期", ("中国国债收益率10年",), "%", "daily",
+        "中债金融估值中心", "每交易日发布",
     ),
     "usdcny": MacroSpec(
-        "美元兑人民币", "currency", "日期", ("央行中间价", "中行折算价"), "元/美元", "daily"
+        "美元兑人民币", "currency", "日期", ("央行中间价", "中行折算价"), "元/美元", "daily",
+        "中国外汇交易中心", "每交易日发布",
     ),
     "gdp_yoy": MacroSpec(
-        "GDP同比", "gdp", "季度", ("国内生产总值-同比增长",), "%", "quarterly"
+        "GDP同比", "gdp", "季度", ("国内生产总值-同比增长",), "%", "quarterly",
+        "国家统计局", "季后约15-18日发布",
     ),
 }
 MACRO_INDICATOR_LABELS: Final[dict[str, str]] = {

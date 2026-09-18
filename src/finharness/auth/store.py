@@ -1,6 +1,6 @@
 """用户与会话令牌存储（SQLite，users.db）。
 
-* ``users``：用户名唯一（大小写不敏感）、口令只存 PBKDF2 哈希。
+* ``users``：用户名唯一（大小写不敏感）、密码只存 PBKDF2 哈希。
 * ``auth_sessions``：不透明令牌的会话表。令牌本体（``t_`` + 32 字节随机）
   只发给客户端一次；库中只存其 SHA-256，因此库文件泄露也无法冒充登录。
 
@@ -64,7 +64,7 @@ class UserNotFound(UserStoreError):
 
 
 class InvalidCredentials(UserStoreError):
-    """登录凭据不正确时抛出（用户不存在与口令错误同消息，避免枚举）。"""
+    """登录凭据不正确时抛出（用户不存在与密码错误同消息，避免枚举）。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +103,7 @@ def _validate_credentials(username: str, password: str, *, min_password_len: int
     if not _USERNAME_RE.fullmatch(username):
         raise UserStoreError("用户名只能包含字母、数字、下划线、连字符或中文")
     if len(password) < max(min_password_len, _PASSWORD_MIN):
-        raise UserStoreError(f"口令至少需要 {max(min_password_len, _PASSWORD_MIN)} 个字符")
+        raise UserStoreError(f"密码至少需要 {max(min_password_len, _PASSWORD_MIN)} 个字符")
 
 
 class UserStore:
@@ -196,7 +196,7 @@ class UserStore:
         # 用户不存在也做一次哈希校验，使两种失败路径耗时接近，支持时间上不可区分。
         stored = row["password_hash"] if row is not None else hash_password("timing-padding")
         if row is None or not verify_password(password, stored):
-            raise InvalidCredentials("用户名或口令不正确")
+            raise InvalidCredentials("用户名或密码不正确")
         return self._issue(row["id"], ttl_s=ttl_s)
 
     # -- 会话令牌 --------------------------------------------------------------

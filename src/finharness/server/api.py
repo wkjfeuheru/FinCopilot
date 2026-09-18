@@ -7,8 +7,10 @@
 import asyncio
 import contextlib
 import os
+import sqlite3
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -17,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from finharness.auth.dependency import create_require_user
+from finharness.auth.ratelimit import RateLimiter
 from finharness.auth.store import CurrentUser, UserStore
 from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
@@ -33,17 +36,24 @@ from finharness.engine.loop import AgentLoop
 from finharness.engine.prompt import system_prompt
 from finharness.hooks.audit import AuditHook, AuditLogWriter, summarize_args
 from finharness.hooks.base import HookChain
-from finharness.observability import build_observer, setup_logging
-from finharness.permissions.gate import PermissionGate
+from finharness.observability import build_observer, get_logger, setup_logging
+from finharness.permissions.gate import EGRESS_CATEGORY, PermissionGate
 from finharness.provider.fake import FakeProvider
 from finharness.provider.registry import build_provider
 from finharness.provider.resolver import NotConfigured, ProviderResolver
 from finharness.server.auth_api import create_auth_router
 from finharness.server.config_api import create_config_router
 from finharness.server.confirm import ConfirmBus
+from finharness.server.distill_sweeper import (
+    distill_user_backlog,
+    start_distill_sweeper,
+    stop_distill_sweeper,
+)
 from finharness.server.sessions import SessionBusyError, SessionRegistry
-from finharness.server.sse import encode_event
+from finharness.server.sse import HEARTBEAT_S, encode_comment, encode_event
 from finharness.tools.registry import ALL_TOOL_CLASSES, ToolRegistry
+from finharness.types import StopSignal
+from finharness.utils.bounded import BoundedMap
 
 # 单一定义，从 prompts/system.md 加载，使测试与产品发布使用同一份文本
 # （文档说明：它管控规划、引用与收敛）。
@@ -58,12 +68,22 @@ class ChatRequest(BaseModel):
     # 因为服务端会从对话中解析出它。
     session_id: str | None = None
     message: str
-    mode: str = "default"
 
 
 class RespondRequest(BaseModel):
     request_id: str
     response: str
+
+
+class StopRequest(BaseModel):
+    """请求停止一次在飞的生成（docs 03.3）。
+
+    两个 id 都可选但至少给一个：``session_id`` 精确指向执行窗口，
+    ``conversation_id`` 是客户端持久化的句柄（会话过期重建后仍然有效）。
+    """
+
+    session_id: str | None = None
+    conversation_id: str | None = None
 
 
 class QueueSink:
@@ -85,7 +105,10 @@ class QueueSink:
             self.done_at = now
         if event.kind in {
             "tool_status",
+            "tool_activated",
             "context_compacted",
+            # 路由注入了什么方法论是本轮结论的依据之一，重新加载的对话应当仍能看到它。
+            "context_routed",
             "loop_guard",
             "plan_progress",
             "interactive_request",
@@ -124,7 +147,36 @@ def create_app(
     probe_client_factory=None,
 ) -> FastAPI:
     """构建 FastAPI 应用，装配缓存、适配器、会话注册表与全部路由。"""
-    application = FastAPI(title="FinHarness")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """服务启动时拉起 LTM 蒸馏扫描器，关闭时取消它。
+
+        扫描器需要事件循环，而模块级 ``create_app()`` 发生在导入期（无循环），
+        因此不能在构造函数里直接 create_task。闭包在调用时才解析变量，所以
+        这里可以引用下方才赋值/替换的 ``resolver`` 等局部名。
+        """
+        app.state.ltm_sweeper_task = start_distill_sweeper(
+            app_state=app.state,
+            provider_resolver=resolver,
+            settings=settings,
+            observer=observer,
+        )
+        # 向量回填（docs 03.6.4 LTM）：覆盖"先积累了语义条目、之后才配好
+        # embedding 端点"以及"条目被改写导致向量失效"两种情况。放在启动时
+        # 做一次，避免这些条目直到下次蒸馏才重新可召回。失败无妨——语义
+        # 召回是增强项，键匹配始终在。
+        try:
+            for user_id in memory_store.ltm_fact_users():
+                semantic_index.index_pending(user_id=user_id)
+        except Exception:  # noqa: BLE001 - 回填绝不该阻止服务启动
+            pass
+        try:
+            yield
+        finally:
+            await stop_distill_sweeper(getattr(app.state, "ltm_sweeper_task", None))
+
+    application = FastAPI(title="FinHarness", lifespan=lifespan)
     settings = settings or Settings.from_file()
 
     # 日志在任何组件之前配置，使启动期的日志本身就带上下文字段。
@@ -147,12 +199,28 @@ def create_app(
     memory_store = MemoryStore(settings.paths.memory_db)
     application.state.memory_store = memory_store
 
+    # 语义记忆的检索层（docs 03.6.4 LTM）：记录本体在 SQLite，向量只用于
+    # 召回。未配 embedding 端点时 index.enabled=False，语义区块整体不出现，
+    # 记忆的写入与键匹配检索仍然完全可用。
+    from finharness.context.memory.vector import build_vector_store, SemanticIndex
+    from finharness.provider.embeddings import build_embedder
+
+    embedder = build_embedder(settings)
+    semantic_index = SemanticIndex(
+        store=memory_store,
+        embedder=embedder,
+        # 未配 embedding 时连向量后端都不构建：此时语义召回整体关闭，
+        # 记忆的写入与键匹配检索仍然完全可用。
+        vector_store=build_vector_store(settings, memory_store) if embedder else None,
+    )
+    application.state.semantic_index = semantic_index
+
     def store_factory() -> ConfigStore:
         nonlocal config_store
         if config_store is None:
             config_store = ConfigStore(
-                settings.data.cache_dir / "config.db",
-                cipher=SecretCipher(settings.data.cache_dir / "secret.key"),
+                settings.paths.config_db,
+                cipher=SecretCipher(settings.paths.secret_key),
             )
         return config_store
 
@@ -161,13 +229,40 @@ def create_app(
         memory_store.claim_user(user_id)
         store_factory().claim_user(user_id)
 
+    # 认证端点限速（隔离方案 P0-5）：默认按"够挡脚本、不打扰真人"的量级。
+    login_limiter = RateLimiter(
+        limit=settings.auth.login_max_attempts,
+        window_s=settings.auth.login_window_s,
+    )
+    register_limiter = RateLimiter(
+        limit=settings.auth.register_max_attempts,
+        window_s=settings.auth.register_window_s,
+    )
+    # 每租户的对话轮次预算（隔离方案 P0-6）。与 context.max_turns 的分工：
+    # 那一个是单次对话内的上下文预算，这里是一个租户在时间窗口内的资源公平性。
+    turn_limiter = RateLimiter(
+        limit=settings.quota.turns_per_window,
+        window_s=settings.quota.window_s,
+    )
+    application.state.login_limiter = login_limiter
+    application.state.register_limiter = register_limiter
+    application.state.turn_limiter = turn_limiter
+
     application.include_router(
         create_auth_router(
             store=user_store,
             ttl_s=settings.auth.token_ttl_s,
             secure_cookie=settings.auth.secure_cookie,
             allow_register=settings.auth.allow_register,
-            claim_legacy=_claim_legacy,
+            # 存量数据继承是一个"谁先注册谁拿到全部历史"的隐式授权，默认关闭；
+            # 需要时由运维显式打开（settings.auth.claim_legacy_on_first_register）。
+            claim_legacy=(
+                _claim_legacy
+                if settings.auth.claim_legacy_on_first_register
+                else None
+            ),
+            login_limiter=login_limiter,
+            register_limiter=register_limiter,
         )
     )
 
@@ -195,8 +290,23 @@ def create_app(
         EastmoneyReportAdapter(
             timeout_s=settings.search.timeout_s,
             with_text_allowed=settings.search.local_pdf_fallback,
+            pdf_dir=Path(settings.data.cache_dir) / "pdf",
         ),
     ]
+
+    def adapters_for(user_settings: Settings) -> list:
+        """某用户数据面所用的适配器。
+
+        取数适配器（akshare/tushare）与检索适配器全局共享一份：其节流状态保护的是
+        上游数据源，按用户复制会把上游请求速率乘以用户数。唯一必须按用户隔离的是
+        研报适配器——它的全文落盘目录随后要由该用户的 ``read_pdf`` 读回。
+        """
+        return [
+            adapter.with_pdf_dir(Path(user_settings.data.cache_dir) / "pdf")
+            if isinstance(adapter, EastmoneyReportAdapter)
+            else adapter
+            for adapter in adapters
+        ]
 
     shared_data = data_access or DataAccess(
         adapters,
@@ -204,40 +314,89 @@ def create_app(
         settings=settings,
     )
 
-    # 每个用户的工具级 DataAccess：与 shared_data 共享适配器与缓存，
-    # 只是 output/ 换成了 output/<user>/，因此用户之间互不可见。
+    # 每个用户的工具级 DataAccess：与 shared_data 共享适配器，但 output/ 换成
+    # output/<user>/、缓存换成 users/<user>/，因此用户之间互不可见——包括缓存载荷。
     # 测试注入的 DataAccess 替身按原样使用，不引入用户目录。
-    user_data_access: dict[str, DataAccess] = {}
+    # 有界：一个进程可能见过很多用户，缓存按 LRU 封顶，避免只增不减。
+    user_data_access: BoundedMap[str, DataAccess] = BoundedMap(
+        max_size=settings.server.user_cache_size
+    )
+
+    def scoped_settings(user_id: str) -> Settings:
+        """该用户的 settings：产物、缓存与记忆一并落到自己的命名空间下。
+
+        缓存目录必须一起换掉。只换 ``output_dir`` 时，parquet 载荷仍在全局
+        ``data_cache/parquet`` 下，而 ``read_file``/``read_pdf``/``/v1/artifacts``
+        都开放该子树——缓存文件名又是由 endpoint+params 决定的哈希，于是任何
+        知道请求形状的租户都能算出他人的载荷路径。目录分开后，"读不到"由
+        包含性检查强制，而不是靠猜不到文件名。
+        """
+        return settings.model_copy(
+            update={
+                "paths": settings.paths.model_copy(
+                    update={"output_dir": settings.paths.output_dir / user_id}
+                ),
+                "data": settings.data.model_copy(
+                    update={"cache_dir": settings.data.cache_dir / "users" / user_id}
+                ),
+            }
+        )
 
     def data_for(user_id: str) -> DataAccess:
         if data_access is not None:
             return shared_data
         scoped = user_data_access.get(user_id)
         if scoped is None:
-            user_settings = settings.model_copy(
-                update={
-                    "paths": settings.paths.model_copy(
-                        update={"output_dir": settings.paths.output_dir / user_id}
-                    )
-                }
+            user_settings = scoped_settings(user_id)
+            scoped = DataAccess(
+                adapters_for(user_settings),
+                cache=LocalCache(user_settings.data.cache_dir),
+                settings=user_settings,
             )
-            scoped = DataAccess(adapters, cache=data_cache, settings=user_settings)
             user_data_access[user_id] = scoped
         return scoped
+
+    # 暴露出来，使测试能直接断言一个用户的命名空间边界（产物与缓存同源派生），
+    # 而不必通过工具间接推断。
+    application.state.data_for = data_for
+    application.state.scoped_settings = scoped_settings
 
     # 治理：一个确认总线桥接所有会话的交互式请求。
     confirm_bus = ConfirmBus(ttl_s=settings.server.confirm_ttl_s)
     # 暴露出来，使测试与运维人员可以检查待处理的交互式请求。
     application.state.confirm_bus = confirm_bus
-    session_citations: dict[str, CitationRegistry] = {}
-    session_contexts: dict[str, ResearchContext] = {}
-    # 引用也跟随对话，因此产生它们的执行会话过期后仍可寻址。
-    conversation_citations: dict[str, CitationRegistry] = {}
+    # 引用跟随对话，因此产生它们的执行会话过期后仍可寻址。会话级的引用与
+    # 上下文**不**在这里另存一份：它们属于 session.loop（见 loop_factory），
+    # 由 SessionRegistry 的 TTL 统一回收。否则会形成"会话状态两个所有者"，
+    # 而注册表淘汰够不到这里的副本，导致每个会话都永久残留一份记忆。
+    # 有界：一个进程见过的对话数可能远超活跃数，按 LRU 封顶。
+    conversation_citations: BoundedMap[str, CitationRegistry] = BoundedMap(
+        max_size=settings.context.retention_conversations
+    )
+    # 暴露出来，使测试与运维人员可以检查该缓存的大小（有界性是刻意设计）。
+    application.state.conversation_citations = conversation_citations
     fallback_provider = provider
 
     memory_store.prune(
         max_conversations=settings.context.retention_conversations,
         max_age_days=settings.context.retention_days,
+    )
+    # 跨对话长期记忆的独立保留（docs 03.6.4 LTM）：与源对话预算无关——
+    # 记忆自包含，源对话被删不影响它；这条兜底覆盖"只写 task_result、
+    # 从不蒸馏"的用户，避免其 LTM 无界增长。
+    memory_store.prune_all_ltm_episodes(
+        max_episodes=settings.ltm.retention_episodes,
+        max_age_days=settings.ltm.retention_days,
+    )
+    memory_store.prune_all_ltm_facts(
+        max_facts=settings.ltm.retention_facts,
+        max_age_days=settings.ltm.retention_facts_days,
+    )
+    # 对话级的"已确认风险类别"（docs 03.7.1）：网络外发首次确认后在本对话
+    # 免问。与 conversation_citations 同生命周期——对话结束、注册表淘汰时
+    # 一并消亡，因此免问授权不会活得比它所授权的对话更久。
+    confirmed_categories: BoundedMap[str, set[str]] = BoundedMap(
+        max_size=settings.context.retention_conversations
     )
 
     def loop_factory(
@@ -252,32 +411,57 @@ def create_app(
             selected = resolver.current(user_id)
         citations = CitationRegistry()
         ctx = ResearchContext(cite=citations, settings=settings)
-        # 用两个 id 索引：引用与上下文跟随对话，
-        # 而 session id 只是本次执行窗口的句柄。
-        if session_id:
-            session_citations[session_id] = citations
-            session_contexts[session_id] = ctx
+        # 会话级状态只挂在 loop 上（cite/ctx 都会传进 AgentLoop），由
+        # SessionRegistry 的 TTL 连同 session 一起回收；这里只额外登记
+        # 对话级引用，因为对话比执行窗口长寿。
         if conversation_id:
             conversation_citations[conversation_id] = citations
 
         # 工具 schema 按会话生成，因为惰性激活是会话作用域的；
         # ctx 与 registry 相互接线。产物经由 data_for(user_id) 写入
         # output/<user>/，因此用户之间互不可见。
-        registry_for_session = ToolRegistry(
-            data_for(user_id), ctx=ctx, settings=settings
-        )
+        session_data = data_for(user_id)
+        registry_for_session = ToolRegistry(session_data, ctx=ctx, settings=settings)
         audit = AuditHook(
             AuditLogWriter(settings.audit.log_path),
             session_id=session_id or "local",
             user_id=user_id,
         )
-        gate = PermissionGate(
-            settings=settings,
-            confirm=lambda name, args: _ask(
+        # 闸门必须用**该用户自己的** settings：白名单根取自 settings，若用全局
+        # settings，``output/<他人>/`` 与整棵 data_cache/ 都会被判成"产物写入、
+        # 免确认"，而工具侧随后又按用户根拒绝——确认决策就建立在比实际操作更
+        # 宽的根上。确认对话作用于对话（而非会话）：会话过期重建后，用户在本
+        # 对话中给出的"不再询问"仍然有效。
+        confirmed = confirmed_categories.get(conversation_id or "local")
+        if confirmed is None:
+            confirmed = set()
+            confirmed_categories[conversation_id or "local"] = confirmed
+
+        async def _confirm_write(name: str, args: dict) -> bool:
+            answer = await _ask(
                 "confirm",
                 f"工具 {name} 将执行，入参：{summarize_args(args)}",
                 ["y", "n"],
-            ),
+            )
+            return answer == "y"
+
+        async def _confirm_egress(name: str, args: dict) -> bool:
+            answer = await _ask(
+                "confirm",
+                f"工具 {name} 将访问外部网络并引入第三方内容，入参：{summarize_args(args)}",
+                ["y", "y_remember", "n"],
+            )
+            if answer == "y_remember":
+                confirmed.add(EGRESS_CATEGORY)
+                return True
+            return answer == "y"
+
+        gate = PermissionGate(
+            settings=getattr(session_data, "settings", None) or settings,
+            confirm=_confirm_write,
+            conversation_id=conversation_id or "local",
+            confirmed_categories=confirmed,
+            confirm_egress=_confirm_egress,
         )
         loop = AgentLoop(
             provider=selected,
@@ -293,6 +477,7 @@ def create_app(
             store=memory_store,
             user_id=user_id,
             observer=observer,
+            semantic_index=semantic_index,
         )
 
         async def _ask(kind: str, prompt: str, options: list[str]):
@@ -310,10 +495,33 @@ def create_app(
         # 构造之后注入，使回调可以通过此 loop 发送事件。
         loop.interactive = _ask
         loop.audit = audit
+        # LTM 懒蒸馏的兜底翼（docs 03.6.4）：用户开新对话时补蒸馏其闲置的
+        # 未处理对话。SSE 断线与 TTL 回收都跳不出这条路径——只要用户还在
+        # 用，漏网的蒸馏最终都会在这里补上。fire-and-forget：绝不阻塞新对话。
+        if conversation_id:
+            asyncio.create_task(
+                distill_user_backlog(
+                    provider=selected,
+                    store=memory_store,
+                    settings=settings,
+                    user_id=user_id,
+                    exclude_conversation=conversation_id,
+                    observer=observer,
+                    index=semantic_index,
+                )
+            )
         return loop
 
-    registry = SessionRegistry(loop_factory, ttl_s=settings.server.session_ttl_s)
+    registry = SessionRegistry(
+        loop_factory,
+        ttl_s=settings.server.session_ttl_s,
+        busy_timeout_s=settings.server.busy_timeout_s,
+    )
     application.state.session_registry = registry
+    # LTM 懒蒸馏的前一翼（docs 03.6.4）：周期扫描闲置对话并补蒸馏。
+    # 文档曾承诺的"每 60s 会话 TTL 回收"并不存在（注册表是惰性淘汰且无回调），
+    # 因此蒸馏不等会话结束——闲置判定直接读 conversations.last_active_at。
+    # 实际启动在 lifespan 中（需要事件循环）。
     application.include_router(
         create_config_router(
             store_factory=store_factory,
@@ -376,10 +584,67 @@ def create_app(
             raise HTTPException(status_code=404, detail="请求不存在或已超时")
         return {"ok": True}
 
+    @application.post("/v1/chat/stop")
+    async def chat_stop(
+        body: StopRequest, user: CurrentUser = Depends(require_user)
+    ) -> dict:
+        """请求停止当前在飞的生成（docs 03.3）。
+
+        这是**协作式**停止：置位信号后引擎在下一个等待点（流式 chunk、轮次
+        边界、工具返回后）收尾。它因此不会丢弃已有成果——本轮结论照常落库，
+        断点记为可继续。前端若在宽限期内没等到终止帧，可以再断开连接兜底。
+
+        幂等：停止一个已经结束、或本就不在运行的生成不是错误，返回
+        ``{"stopping": false}`` 即可，客户端无需区分这两种情况。
+        """
+        session = registry.find(
+            session_id=body.session_id or None,
+            conversation_id=body.conversation_id or None,
+        )
+        # 会话句柄是全局的：他人的 session/conversation 视同不存在，
+        # 与其余按 id 取用的端点同一口径（404 而非 403，不泄露存在性）。
+        if session is None or (user.id and session.user_id != user.id):
+            raise HTTPException(status_code=404, detail="会话或对话不存在")
+        if not session.busy or session.stop_signal is None:
+            # 生成已结束或尚未开始：对它而言停止已经成立。
+            return {"stopping": False, "conversation_id": session.conversation_id}
+        session.stop_signal.request()
+        # 引擎若正停在写确认/提问的 future 上，仅置位信号它不会被观察到，
+        # 要等 confirm_ttl_s（默认 120s）超时。这里同步解除该等待，与断线
+        # 路径（chat_stream 的 CancelledError 分支）做法一致。
+        confirm_bus.cancel_session(session.session_id)
+        # 审计留痕：谁在哪个对话上停止了生成。失败不影响停止本身。
+        audit = getattr(session.loop, "audit", None)
+        if audit is not None:
+            rounds = int(getattr(session.loop, "rounds", 0) or 0)
+            try:
+                audit.generation_stopped(
+                    conversation_id=session.conversation_id, rounds=rounds
+                )
+            except Exception:  # noqa: BLE001 - 审计写失败不该阻断停止
+                get_logger("finharness.server.api").exception("stop_audit_failed")
+        get_logger("finharness.server.api").info(
+            "chat_stream_stop_requested",
+            extra={
+                "session_id": session.session_id,
+                "conversation_id": session.conversation_id,
+            },
+        )
+        return {"stopping": True, "conversation_id": session.conversation_id}
+
     @application.get("/v1/cache/stats")
     async def cache_stats(user: CurrentUser = Depends(require_user)) -> dict:
-        """返回本地数据缓存的命中统计。"""
-        snapshot = data_cache.stats()
+        """返回**当前用户**数据缓存的命中统计。
+
+        缓存已按用户命名空间分开，因此这里的数字天然只覆盖调用者自己的载荷；
+        没有跨租户的聚合视图。
+        """
+        user_cache = (
+            data_for(user.id).cache
+            if data_access is None
+            else data_cache
+        )
+        snapshot = (user_cache or data_cache).stats()
         return {
             "entries": snapshot.entries,
             "hits": snapshot.hits,
@@ -391,15 +656,58 @@ def create_app(
     async def memory_view(
         conversation_id: str | None = None,
         limit: int = 20,
+        subject: str | None = None,
+        kind: str | None = None,
         user: CurrentUser = Depends(require_user),
     ) -> dict:
         """累积记忆的只读视图。
 
         取代了设计曾提出的 MEMORY.md 文件视图：Web 层正是人类阅读
         它的地方，而且它保持结构化，而不是每轮都重写到一个文件。
+        长期记忆（docs 03.6.4）分两类返回：``episodes``（情节：做过什么）
+        与 ``facts``（语义：知道什么，含 kind='preference' 的偏好），
+        各自带溯源字段，可按标的/类型过滤。``semantic_search`` 报告当前
+        部署是否具备向量召回（配了 embedding 端点为 true）。
         """
         return {
             "notes": memory_store.get_notes(user_id=user.id),
+            "facts": [
+                {
+                    "fa_uid": item.fa_uid,
+                    "key": item.key,
+                    "kind": item.kind,
+                    "statement": item.statement,
+                    "subject": item.subject,
+                    "confidence": item.confidence,
+                    "source_conversation_id": item.source_conversation_id,
+                    "source_ts": item.source_ts,
+                    "updated_at": item.updated_at,
+                    "embedded": item.has_embedding,
+                }
+                for item in memory_store.list_ltm_facts(
+                    user_id=user.id, kind=kind or None, subject=subject, limit=limit
+                )
+            ],
+            "semantic_search": semantic_index.enabled,
+            "episodes": [
+                {
+                    "ep_uid": item.ep_uid,
+                    "kind": item.kind,
+                    "subject": item.subject,
+                    "summary": item.summary,
+                    "cids": list(item.cids),
+                    "source_conversation_id": item.source_conversation_id,
+                    "source_title": item.source_title,
+                    "source_ts": item.source_ts,
+                    "created_at": item.created_at,
+                }
+                for item in memory_store.list_ltm_episodes(
+                    user_id=user.id,
+                    subject=subject,
+                    kind=kind,
+                    limit=limit,
+                )
+            ],
             "conversations": [
                 {
                     "conversation_id": record.conversation_id,
@@ -431,6 +739,106 @@ def create_app(
             ),
         }
 
+    class MemoryEpisodePatch(BaseModel):
+        kind: str | None = None
+        subject: str | None = None
+        summary: str | None = None
+
+    @application.patch("/v1/memory/episodes/{ep_uid}")
+    async def memory_episode_patch(
+        ep_uid: str, body: MemoryEpisodePatch, user: CurrentUser = Depends(require_user)
+    ) -> dict:
+        """编辑一条跨对话情节（治理：用户发现记忆有误或表述不当）。"""
+        try:
+            updated = memory_store.update_ltm_episode(
+                ep_uid,
+                user_id=user.id,
+                kind=body.kind,
+                subject=body.subject,
+                summary=body.summary,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409, detail="编辑后的情节与已有记忆重复"
+            ) from exc
+        if updated is None:
+            raise HTTPException(status_code=404, detail="记忆条目不存在")
+        return {
+            "ok": True,
+            "episode": {
+                "ep_uid": updated.ep_uid,
+                "kind": updated.kind,
+                "subject": updated.subject,
+                "summary": updated.summary,
+            },
+        }
+
+    @application.delete("/v1/memory/episodes/{ep_uid}")
+    async def memory_episode_delete(
+        ep_uid: str, user: CurrentUser = Depends(require_user)
+    ) -> dict:
+        """删除一条跨对话情节（治理：遗忘权）。"""
+        if not memory_store.delete_ltm_episode(ep_uid, user_id=user.id):
+            raise HTTPException(status_code=404, detail="记忆条目不存在")
+        return {"ok": True, "ep_uid": ep_uid}
+
+    class MemoryFactPatch(BaseModel):
+        kind: str | None = None
+        subject: str | None = None
+        statement: str | None = None
+
+    @application.patch("/v1/memory/facts/{fa_uid}")
+    async def memory_fact_patch(
+        fa_uid: str, body: MemoryFactPatch, user: CurrentUser = Depends(require_user)
+    ) -> dict:
+        """编辑一条语义记忆（事实/概念/偏好）。
+
+        用户在此改写偏好即"显式声明"，与蒸馏口径冲突时直接覆盖——
+        ``(user_id, key)`` 的 UPSERT 语义保证只有一个版本的真相。
+        """
+        try:
+            updated = memory_store.update_ltm_fact(
+                fa_uid,
+                user_id=user.id,
+                statement=body.statement,
+                kind=body.kind,
+                subject=body.subject,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if updated is None:
+            raise HTTPException(status_code=404, detail="记忆条目不存在")
+        # 表述变了旧向量即失效；有索引时立即重算。
+        if semantic_index.enabled:
+            try:
+                semantic_index.index_fact(user_id=user.id, key=updated.key)
+            except Exception:  # noqa: BLE001 - 向量重算是增强项
+                pass
+        return {
+            "ok": True,
+            "fact": {
+                "fa_uid": updated.fa_uid,
+                "key": updated.key,
+                "kind": updated.kind,
+                "statement": updated.statement,
+                "subject": updated.subject,
+            },
+        }
+
+    @application.delete("/v1/memory/facts/{fa_uid}")
+    async def memory_fact_delete(
+        fa_uid: str, user: CurrentUser = Depends(require_user)
+    ) -> dict:
+        """删除一条语义记忆（治理：遗忘权）。"""
+        fact = memory_store.get_ltm_fact(fa_uid, user_id=user.id)
+        if fact is None or not memory_store.delete_ltm_fact(fa_uid, user_id=user.id):
+            raise HTTPException(status_code=404, detail="记忆条目不存在")
+        # 同步清理向量库中的点，否则后续召回会命中一个已删除的 id。
+        semantic_index.unindex_fact(fact, user_id=user.id)
+        return {"ok": True, "fa_uid": fa_uid}
+
     @application.get("/v1/artifacts")
     async def download_artifact(
         path: str, user: CurrentUser = Depends(require_user)
@@ -438,13 +846,16 @@ def create_app(
         """提供产出的文件，范围限于该用户自己的产物目录与缓存数据。
 
         在解析之后强制校验包含关系，与 read_file 一致；没有它，
-        该 endpoint 就会变成任意文件读取。缓存侧只开放 ``parquet/``
-        子树——打开整个 data_cache/ 会连带暴露 users.db（口令哈希）
-        与 memory.db（全部用户的对话）。
+        该 endpoint 就会变成任意文件读取。缓存侧只开放该用户自己的
+        命名空间——打开整个 data_cache/ 会连带暴露 users.db（密码哈希）
+        与 memory.db（全部用户的对话），而**只**放开 ``parquet/`` 又会让
+        任何用户读到他人缓存的载荷（文件名是 endpoint+params 的哈希）。
         """
+        user_cache = scoped_settings(user.id).data.cache_dir
         allowed_roots = [
             (Path(settings.paths.output_dir) / user.id).resolve(),
-            (Path(settings.data.cache_dir) / "parquet").resolve(),
+            (Path(user_cache) / "parquet").resolve(),
+            (Path(user_cache) / "pdf").resolve(),
         ]
         try:
             target = Path(path).resolve()
@@ -472,9 +883,11 @@ def create_app(
             # 无论走内存还是落库，都先确认对话属于当前用户。
             if memory_store.get_conversation(conversation_id, user_id=user.id) is None:
                 raise HTTPException(status_code=404, detail="会话或对话不存在")
-            registry = conversation_citations.get(conversation_id)
-            if registry is not None:
-                records = registry.all()
+            # 名字不能叫 registry：那会遮蔽函数外的 SessionRegistry，
+            # 使第 499/507 行的 `registry` 变成未绑定的局部变量。
+            citation_registry = conversation_citations.get(conversation_id)
+            if citation_registry is not None:
+                records = citation_registry.all()
             else:
                 # 对话比服务它的进程更长寿，因此回退到持久化的引用：
                 # 恢复的对话即使在服务端重启后仍能显示其来源。
@@ -483,14 +896,14 @@ def create_app(
             session = registry.sessions.get(session_id)
             if session is None or session.user_id != user.id:
                 raise HTTPException(status_code=404, detail="会话或对话不存在")
-            records = session_citations[session_id].all()
+            records = session.loop.cite.all()
         else:
             # 无过滤参数：只汇总该用户各会话的引用。
             records = [
                 item
-                for sid, s in registry.sessions.items()
+                for s in registry.sessions.values()
                 if s.user_id == user.id
-                for item in session_citations[sid].all()
+                for item in s.loop.cite.all()
             ]
         items: list[dict] = [
             {
@@ -554,9 +967,21 @@ def create_app(
                 if isinstance(message.metadata.get("turn"), dict):
                     item["turn"] = message.metadata["turn"]
                 rendered.append(item)
+        # 上一轮被停止时报告可继续（docs 03.3）：客户端据此在刷新后仍能显示
+        # "继续研究"入口，而不是把一次中断当成一次普通的失败。
+        checkpoint = memory_store.load_latest_checkpoint(conversation_id)
+        resumable = None
+        if checkpoint is not None and checkpoint.recoverable:
+            resumable = {
+                "reason": checkpoint.reason,
+                "rounds": checkpoint.rounds,
+                "plan": checkpoint.plan,
+                "updated_at": checkpoint.updated_at,
+            }
         return {
             "conversation_id": conversation_id,
             "messages": rendered[-max(limit, 1) :],
+            "resumable": resumable,
         }
 
     @application.delete("/v1/conversations/{conversation_id}")
@@ -580,11 +1005,10 @@ def create_app(
             )
         memory_store.delete_conversation(conversation_id)
         conversation_citations.pop(conversation_id, None)
+        # 会话级状态无需在这里清理：它挂在 session/loop 上，随注册表淘汰回收。
         for session_id, session in list(registry.sessions.items()):
             if session.conversation_id == conversation_id:
                 registry.sessions.pop(session_id, None)
-                session_citations.pop(session_id, None)
-                session_contexts.pop(session_id, None)
         return {"ok": True, "conversation_id": conversation_id}
 
     @application.get("/")
@@ -643,23 +1067,49 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except NotConfigured as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # 每租户配额（隔离方案 P0-6）。两次检查都放在 mark_busy 之前，且与它
+        # 之间没有 await，因此在单事件循环内是原子的：并发流上限不会因为两次
+        # 请求交错而双双通过。检查本身只读注册表现状，失败不会留下 busy 残留。
+        cap = settings.quota.max_concurrent_streams
+        if cap and registry.busy_count(user.id) >= cap:
+            raise HTTPException(
+                status_code=429,
+                detail=f"同时进行的对话过多（上限 {cap}），请等待其中一轮结束",
+                headers={"Retry-After": "5"},
+            )
+        turn_decision = turn_limiter.check(f"turns:{user.id}")
+        if not turn_decision.allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"本时段对话轮次已达上限，请 {turn_decision.retry_after_s} 秒后重试",
+                headers={"Retry-After": str(turn_decision.retry_after_s)},
+            )
         sink = QueueSink()
         session.loop.output = sink
-        session.busy = True
+        # 停止信号挂在会话上，使 POST /v1/chat/stop 能从此处之外置位它；
+        # 引擎在每个等待点检查它（docs 03.3）。每次请求新建一个，避免上一次
+        # 请求的停止状态泄漏到下一次。
+        stop_signal = StopSignal()
+        session.stop_signal = stop_signal
+        session.loop.stop_signal = stop_signal
+        registry.mark_busy(session)
         persisted_before = memory_store.message_seq_range(session.conversation_id)[1]
         audit = getattr(session.loop, "audit", None)
         if audit is not None:
-            audit.session_start(
-                mode=settings.permission.default_mode,
-                provider=type(session.loop.provider).__name__,
-                model=getattr(session.loop.provider, "model", ""),
-            )
+            # 审计写失败不能拦住这一轮对话，但也必须可见（隔离方案 P0-8）。
+            try:
+                audit.session_start(
+                    mode=settings.permission.default_mode,
+                    provider=type(session.loop.provider).__name__,
+                    model=getattr(session.loop.provider, "model", ""),
+                )
+            except Exception:  # noqa: BLE001 - 审计失败不阻断会话
+                get_logger("finharness.server.api").exception("session_start_audit_failed")
         # trace_id 在请求入口生成并绑定到当前上下文；``create_task`` 会复制
         # context，因此引擎任务与所有日志自动携带同一个 id。
         observer.bind_request(
             session_id=session.session_id,
             conversation_id=session.conversation_id,
-            mode=request.mode,
         )
         task = asyncio.create_task(session.loop.run(request.message))
 
@@ -669,7 +1119,20 @@ def create_app(
             请求级的耗时/根 Span 由 ``AgentLoop.run`` 持有——它才是服务端、
             eval 与脚本共同的执行边界，在这里再开一个只会重复计数。本层只
             负责绑定 trace id 与传输。
+
+            终止保证：无论引擎是正常结束、抛出异常，还是在没有下发 ``done``
+            的情况下退出，本生成器都保证给客户端一个终止事件（必要时先补一个
+            ``error``）。否则浏览器只能看到连接被静默关闭，界面永久停在
+            "运行中"——那正是"刷新后才看到结果"的成因。两次事件之间的静默
+            由心跳帧兜底。
             """
+            log = get_logger("finharness.server.api")
+            started = time.monotonic()
+            frames = 0
+            terminal_sent = False
+            settled = False
+            engine_error: BaseException | None = None
+
             # 两个 id 都会传递：客户端持久化 conversation_id（持久），
             # 并可能回传 session_id 以在同一窗口内提高效率。
             yield encode_event(
@@ -679,11 +1142,129 @@ def create_app(
                     "conversation_id": session.conversation_id,
                 },
             )
+            log.info(
+                "chat_stream_open",
+                extra={"conversation_id": session.conversation_id, "session_id": session.session_id},
+            )
+
+            async def settle_engine() -> None:
+                """等待引擎收尾并捕获其异常；只结算一次，且绝不让异常逃逸。
+
+                引擎的异常必须在这里被"取走"：否则它既会以"异常未被读取"
+                的形式留在任务上，也会在结算路径上重复抛出。
+                """
+                nonlocal settled, engine_error
+                if settled:
+                    return
+                settled = True
+                try:
+                    await task
+                except (asyncio.CancelledError, GeneratorExit):
+                    raise
+                except BaseException as exc:  # noqa: BLE001 - 收尾失败只降级为日志
+                    engine_error = exc
+                    log.exception("chat_stream_engine_failed")
+
+            def engine_failure() -> BaseException | None:
+                if engine_error is not None:
+                    return engine_error
+                if task.done() and not task.cancelled():
+                    try:
+                        return task.exception()
+                    except BaseException:  # noqa: BLE001 - 取不到即视为无异常
+                        return None
+                return None
+
+            def terminal_frames() -> list[str]:
+                """引擎未下发终止事件时的兜底帧，保证客户端一定收敛。"""
+                nonlocal terminal_sent
+                terminal_sent = True
+                failure = engine_failure()
+                if failure is None:
+                    # 引擎正常返回却没有 ``done``：这是异常路径，但答案通常
+                    # 已落盘，因此对用户按成功收尾，只留一条告警供排查。
+                    log.warning(
+                        "chat_stream_missing_terminal_event",
+                        extra={"elapsed_ms": round((time.monotonic() - started) * 1000)},
+                    )
+                    return [
+                        encode_event(
+                            "done",
+                            {
+                                "succeeded": True,
+                                "reason": None,
+                                "session_id": session.session_id,
+                                "conversation_id": session.conversation_id,
+                            },
+                        )
+                    ]
+                log.error(
+                    "chat_stream_engine_error",
+                    extra={
+                        "elapsed_ms": round((time.monotonic() - started) * 1000),
+                        "error_type": type(failure).__name__,
+                    },
+                )
+                message = f"引擎执行失败：{type(failure).__name__}"
+                return [
+                    encode_event("error", {"reason": "engine_error", "message": message}),
+                    encode_event(
+                        "done",
+                        {
+                            "succeeded": False,
+                            "reason": "engine_error",
+                            "message": message,
+                            "session_id": session.session_id,
+                            "conversation_id": session.conversation_id,
+                        },
+                    ),
+                ]
+
             try:
                 while True:
-                    if task.done() and sink.queue.empty():
-                        break
-                    event = await sink.queue.get()
+                    getter = asyncio.ensure_future(sink.queue.get())
+                    try:
+                        # 同时等待"下一个事件"与"引擎结束"：把 task 放进等待集，
+                        # 引擎不再入队任何事件时循环立即可退，消除了旧实现里
+                        # "先检查 done 再阻塞 get"的竞态（该竞态能把生成器
+                        # 永远挂在 queue.get 上）。
+                        done_set, _ = await asyncio.wait(
+                            {getter, task},
+                            timeout=HEARTBEAT_S,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    except BaseException:
+                        if not getter.done():
+                            getter.cancel()
+                            with contextlib.suppress(BaseException):
+                                await getter
+                        raise
+
+                    if getter in done_set:
+                        event = getter.result()
+                    else:
+                        # 心跳窗口内既没有新事件、引擎也还没结束：下发保活帧。
+                        getter.cancel()
+                        with contextlib.suppress(BaseException):
+                            await getter
+                        if task.done() and sink.queue.empty():
+                            await settle_engine()
+                            if not terminal_sent:
+                                for frame in terminal_frames():
+                                    yield frame
+                            break
+                        # 记录心跳，使"引擎静默了多久"在日志里可见——旧实现下
+                        # 这段静默完全没有痕迹，无法与"连接已死"区分。
+                        log.debug(
+                            "chat_stream_heartbeat",
+                            extra={
+                                "frames": frames,
+                                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                            },
+                        )
+                        yield encode_comment()
+                        continue
+
                     data = event.data
                     if event.kind == "done":
                         data = {
@@ -693,38 +1274,100 @@ def create_app(
                         }
                         # 引擎在将最终回答刷入记忆之前发出 ``done``。
                         # 在浏览器可能观察到完成并刷新页面之前，
-                        # 先完成该刷写并附上重放记录。
-                        await task
+                        # 先完成该刷写并附上重放记录；但这一步失败不得
+                        # 连累终止帧，否则答案已落库、界面却停在运行中。
+                        await settle_engine()
                         turn_metadata = sink.turn_metadata()
                         if turn_metadata is not None:
-                            memory_store.attach_latest_answer_metadata(
-                                session.conversation_id,
-                                metadata={"turn": turn_metadata},
-                                after_seq=persisted_before,
-                            )
+                            try:
+                                memory_store.attach_latest_answer_metadata(
+                                    session.conversation_id,
+                                    metadata={"turn": turn_metadata},
+                                    after_seq=persisted_before,
+                                )
+                            except Exception:  # noqa: BLE001 - 元数据缺失不该中断流
+                                log.exception("chat_stream_attach_metadata_failed")
+                        terminal_sent = True
                     # request_id 属于确认总线，而非引擎载荷的形状，
                     # 因此在传输边缘添加。
                     yield encode_event(_event_name(event.kind), data)
+                    frames += 1
+                    # 只记录有信息量的帧：text_delta 一次可达数千条，逐条落盘
+                    # 只会淹没真正需要排查的时序（工具开始/结束、终止帧）。
+                    if event.kind != "text_delta":
+                        log.debug(
+                            "chat_stream_frame",
+                            extra={
+                                "kind": event.kind,
+                                "frames": frames,
+                                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                            },
+                        )
                     if event.kind == "done":
                         break
-                await task
+
+                await settle_engine()
                 if audit is not None:
                     snapshot = session.loop.stats.snapshot()
-                    audit.session_end(
-                        total_tokens=snapshot.input_tokens + snapshot.output_tokens,
-                        tool_calls=snapshot.tool_calls,
-                    )
+                    try:
+                        audit.session_end(
+                            total_tokens=snapshot.input_tokens + snapshot.output_tokens,
+                            tool_calls=snapshot.tool_calls,
+                        )
+                    except Exception:  # noqa: BLE001 - 审计失败不阻断收尾
+                        get_logger("finharness.server.api").exception(
+                            "session_end_audit_failed"
+                        )
+                log.info(
+                    "chat_stream_close",
+                    extra={
+                        "frames": frames,
+                        "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    },
+                )
             except (asyncio.CancelledError, GeneratorExit):
                 task.cancel()
                 # 中断的流不能一直让模型等待下去。
                 confirm_bus.cancel_session(session.session_id)
-                with contextlib.suppress(asyncio.CancelledError):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+                # 区分两种断流：用户自己按了停止（前端宽限期到期后硬断兜底）
+                # 与传输/代理掐断。两者的运维含义完全不同，混成一条日志会
+                # 让"停止功能坏了吗"无从判断。
+                log.warning(
+                    "chat_stream_stopped"
+                    if stop_signal.requested
+                    else "chat_stream_disconnected",
+                    extra={
+                        "frames": frames,
+                        "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    },
+                )
                 raise
+            except Exception:
+                # 传输层自身的意外失败：至少给客户端一个终止事件，
+                # 而不是静默断流。落盘由引擎负责，这里只负责收尾。
+                log.exception("chat_stream_transport_failed")
+                if not terminal_sent:
+                    for frame in terminal_frames():
+                        yield frame
             finally:
+                # 停止信号属于本次请求：清掉它，避免下一次请求一开始就处于
+                # "已请求停止"的状态。``release`` 也会清，这里覆盖异常路径。
+                session.stop_signal = None
                 registry.release(session)
 
-        return StreamingResponse(events(), media_type="text/event-stream")
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={
+                # 反缓冲：每一帧都应尽快到达浏览器，否则"运行中"与"已完成"
+                # 之间的帧会被中间代理攒着一起发，用户看到的就是界面卡住。
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     return application
 

@@ -127,3 +127,59 @@ def test_busy_conversation_cannot_be_resumed_concurrently():
         return session
 
     asyncio.run(run())
+
+
+def test_abandoned_busy_session_is_eventually_reclaimed():
+    """一个被遗弃的 busy 会话（流挂了、release 没跑到）不能永久占着内存。
+
+    在飞请求不能被误伤，但 busy 持续到离谱就只能是被遗弃了。
+    """
+
+    async def run():
+        registry = SessionRegistry(factory, ttl_s=10, busy_timeout_s=30)
+        abandoned = await registry.ensure(None)
+        registry.mark_busy(abandoned)
+        # 模拟"很久以前就进入 busy 且从未释放"。
+        abandoned.busy_since -= 3600
+        await registry.ensure(None)
+        return registry, abandoned
+
+    registry, abandoned = asyncio.run(run())
+
+    assert abandoned.session_id not in registry.sessions
+
+
+def test_in_flight_busy_session_is_never_reclaimed():
+    """刚开始的 busy 请求必须留着，否则同一对话会被并发写入。"""
+
+    async def run():
+        registry = SessionRegistry(factory, ttl_s=10, busy_timeout_s=30)
+        session = await registry.ensure(None)
+        registry.mark_busy(session)
+        # 即便空闲时长超过 TTL，只要 busy 还"新"，就不能动它。
+        session.last_active -= 3600
+        await registry.ensure(None)
+        return registry, session
+
+    registry, session = asyncio.run(run())
+
+    assert session.session_id in registry.sessions
+
+
+def test_release_sweeps_expired_sessions():
+    """一轮结束就该顺手回收其它过期会话，而不是等下一个请求。"""
+
+    async def run():
+        registry = SessionRegistry(factory, ttl_s=10)
+        stale = await registry.ensure(None)
+        active = await registry.ensure(None)
+        # stale 空闲了很久，而 active 刚刚用过。
+        stale.last_active -= 3600
+        registry.release(active)
+        return registry, stale, active
+
+    registry, stale, active = asyncio.run(run())
+
+    assert stale.session_id not in registry.sessions
+    assert active.session_id in registry.sessions
+

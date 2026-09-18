@@ -132,26 +132,26 @@ def test_denied_call_is_recorded_as_non_executed_observation():
     assert outcome.trace[0].actions[0].name == "write_file"
 
 
-def test_lazy_tool_called_before_activation_is_an_observation():
+def test_a_direct_lazy_call_is_activated_and_recorded_as_success():
     async def scenario():
         provider = ScriptedProvider(
             [
                 tool_round(ToolUse("c1", "run_backtest", {})),
-                text_round("需要先激活。"),
+                text_round("已跑完。"),
             ]
         )
         # 真实 registry 会对能力分层建模；run_backtest 默认是懒加载的。
         real = ToolRegistry(data=None)
         assert "run_backtest" in real.lazy_names()
         loop = make_loop(provider, registry=real)
-        return await loop.run("回测")
+        return await loop.run("回测"), real
 
-    outcome = run(scenario())
+    outcome, registry = run(scenario())
 
+    # 直接调用不再是一次被拒绝的观测：就地激活后照常执行。
+    assert registry.is_active("run_backtest") is True
     observation = outcome.trace[0].observations[0]
     assert observation.name == "run_backtest"
-    assert observation.ok is False
-    assert observation.error is not None and "not activated" in observation.error
 
 
 def test_loop_detected_round_is_recorded_before_failure():

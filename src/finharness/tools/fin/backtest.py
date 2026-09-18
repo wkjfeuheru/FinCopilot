@@ -14,46 +14,36 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, Field
 
 from finharness.data.frames import persist_frame
 from finharness.data.raw import RawData
 from finharness.factor.engine import FactorEngine, FactorError
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 
 TRADING_DAYS = 252
 MAX_POOL_SIZE = 300
+# 面板取数的进展上报间隔（只）。太小会淹没事件流，太大则静默期过长——
+# 1.0s 全局节流下 10 只约 10 秒，短于客户端空闲看门狗，足以持续喂给它真实事件。
+_PROGRESS_EVERY = 10
 DEFAULT_RF_RATE = 0.015
 # 试验预算：该场景的过拟合防线。超出即让本次调用失败，
 # 而不是默默放任数据窥探（fishing expedition）。
 MAX_TRIALS = 50
 
 
-class BacktestInput(BaseModel):
-    symbol: str | None = Field(default=None, description="单股序列模式的 6 位 A 股代码；与 pool 二选一")
-    pool: list[str] | str | None = Field(
-        default=None,
-        description="横截面模式的股票池：指数名/代码（沪深300/中证500/中证1000）、申万行业名，或显式 6 位代码列表",
-    )
-    factor_expr: str | None = Field(
-        default=None, description="因子表达式（AST 白名单求值，如 ts_mean(close,20)/ts_mean(close,60)-1）"
-    )
-    strategy: str | None = Field(default=None, description="内建策略（单股）：ma 双均线 / momentum 动量")
-    params: dict[str, Any] = Field(
-        default_factory=dict,
-        description="策略参数：ma→{fast,slow}；momentum→{window,holding}；横截面→{groups,rebalance}",
-    )
-    years: int = Field(default=2, description="回测回溯年数")
-    is_ratio: float = Field(default=0.7, description="样本内占比（按时间顺序切分，严禁随机切分）")
-    cost_bps: float = Field(default=0.0, description="单边交易成本（基点）")
-    slippage_bps: float = Field(default=0.0, description="单边滑点（基点）")
-    rf_rate: float = Field(default=DEFAULT_RF_RATE, description="年化无风险利率（夏普口径）")
-    trials: int = Field(default=1, description="本次会话累计候选因子试验次数（上限 50）")
+_PARAMS_HELP = (
+    "策略参数：ma→{fast,slow}；momentum→{window,holding}；"
+    "横截面→{groups,rebalance,max_symbols}"
+)
+
+
 
 
 @dataclass(slots=True)
@@ -118,18 +108,47 @@ def _max_drawdown(equity: pd.Series) -> float:
     return abs(float((equity / peak - 1).min()))
 
 
-class RunBacktestTool(BaseTool):
-    name = "run_backtest"
-    description = (
+@tool(
+    name="run_backtest",
+    description=(
         "运行回测并输出绩效（年化/夏普/最大回撤/卡玛/胜率/盈亏比）、样本内外分段与买入持有基准；"
         "支持单股时序策略/因子与横截面分组/IC 检验。策略或因子以参数声明，不执行任意代码。"
-    )
-    input_model = BacktestInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.FIN_CALC
-    timeout = 300
-    output_schema_note = "返回绩效表（样本外在前）、样本内外对比、基准对比与过拟合检查字段。"
+    ),
+    capability=Capability.COMPUTE,
+    # 重量级计算（面板取数、IC/分组回测）：由量化因子场景按需触发，而非随每次请求携带。
+    tier=Tier.LAZY,
+    group=ToolGroup.FIN_CALC,
+    # 横截面面板要逐只取数，且受 data.throttle_seconds 全局节流约束：300 只成分股
+    # 冷启动就可能超过 5 分钟。300s 的旧预算在这种规模下必然超时（面板取数本身
+    # 未产生任何结果就已被取消），因此按最坏规模给足余量。
+    timeout=900,
+    output_schema_note="返回绩效表（样本外在前）、样本内外对比、基准对比与过拟合检查字段。",
+)
+class RunBacktestTool(BaseTool):
+    # 横截面面板要逐只取数，冷启动可达数分钟；不上报进展会让客户端在静默期
+    # 判定卡死而掐断连接（docs 03.12）。
+    needs_progress = True
 
+    @param("symbol", desc="单股序列模式的 6 位 A 股代码；与 pool 二选一")
+    @param(
+        "pool",
+        desc="横截面模式的股票池：指数名/代码（沪深300/中证500/中证1000）、申万行业名，或显式 6 位代码列表",
+    )
+    @param(
+        "factor_expr",
+        desc=(
+            "因子表达式（AST 白名单求值）。时序（单股）如 ts_mean(close,20)/ts_mean(close,60)-1；"
+            "横截面必须含 rank/zscore/quantile 算子，如 rank(ts_std(close/ts_delay(close,1)-1,20))"
+        ),
+    )
+    @param("strategy", desc="内建策略（单股）：ma 双均线 / momentum 动量")
+    @param("params", desc=_PARAMS_HELP)
+    @param("years", desc="回测回溯年数")
+    @param("is_ratio", desc="样本内占比（按时间顺序切分，严禁随机切分）")
+    @param("cost_bps", desc="单边交易成本（基点）")
+    @param("slippage_bps", desc="单边滑点（基点）")
+    @param("rf_rate", desc="年化无风险利率（夏普口径）")
+    @param("trials", desc="本次会话累计候选因子试验次数（上限 50）")
     async def _dispatch(
         self,
         *,
@@ -304,11 +323,27 @@ class RunBacktestTool(BaseTool):
             raise ValueError("横截面回测的因子应包含 rank/zscore/quantile 等横截面算子")
 
         symbols = await self._resolve_pool(pool)
+        resolved = len(symbols)
         limit = int(params.get("max_symbols", MAX_POOL_SIZE))
-        if len(symbols) > limit:
+        capped = resolved > limit
+        if capped:
             symbols = symbols[:limit]
         groups = max(int(params.get("groups", 5)), 2)
         rebalance = max(int(params.get("rebalance", 5)), 1)
+
+        # 池一旦确定就上报规模与是否截断：这是用户最快能得到的反馈，也避免
+        # "检验了中证500"实为前 300 只却无从察觉的误导。
+        await self._report_progress(
+            {
+                "phase": "pool",
+                "resolved": resolved,
+                "capped": capped,
+                "total": len(symbols),
+                "groups": groups,
+                "rebalance": rebalance,
+                "years": years,
+            }
+        )
 
         closes = await self._panel(symbols, years=years)
         if closes is None or closes.shape[1] < groups:
@@ -323,6 +358,13 @@ class RunBacktestTool(BaseTool):
         lines = [f"# 横截面因子回测", "", f"因子表达式：`{factor_expr}`", ""]
         lines.append(f"股票池：{len(closes.columns)} 只 · 区间 {closes.index.min().date()} ~ {closes.index.max().date()}")
         lines.append(f"分组：{groups} 组 · 调仓周期：{rebalance} 日 · 成本 {cost_bps:.0f}bp + 滑点 {slippage_bps:.0f}bp")
+        # 截断必须写在结果里：否则 500 只的指数被静默取前 300 只，用户会把
+        # 结论误当作对完整成分股池的检验。
+        if capped:
+            lines.append(
+                f"- **股票池截断**：解析到 {resolved} 只，受上限 {limit} 限制仅纳入前 "
+                f"{len(closes.columns)} 只有效成分；可用 `params.max_symbols` 调整上限。"
+            )
         lines.append("")
 
         # IC：因子行与前向收益之间的 Spearman 秩相关。
@@ -523,7 +565,12 @@ class RunBacktestTool(BaseTool):
         return cleaned
 
     async def _panel(self, symbols: list[str], *, years: int) -> pd.DataFrame | None:
-        """逐标的取收盘价并对齐为「日期 x 标的」面板。"""
+        """逐标的取收盘价并对齐为「日期 x 标的」面板。
+
+        面板构建是横截面回测里最慢的一段（逐只网络取数且受全局节流约束），因此
+        这里按完成数上报进度：每 ``_PROGRESS_EVERY`` 只一次，使客户端在整段取数
+        期间持续收到真实事件，而不是只有会被客户端忽略的心跳注释帧。
+        """
 
         async def one(symbol: str) -> tuple[str, pd.Series] | None:
             try:
@@ -538,12 +585,43 @@ class RunBacktestTool(BaseTool):
             frame = frame.dropna(subset=["date"]).sort_values("date").set_index("date")
             return symbol, pd.to_numeric(frame["close"], errors="coerce")
 
-        results = await asyncio.gather(*(one(s) for s in symbols))
+        total = len(symbols)
+        started = time.monotonic()
         series: dict[str, pd.Series] = {}
-        for item in results:
-            if item is not None:
-                symbol, values = item
-                series[symbol] = values
+        fetched = 0
+        tasks = [asyncio.ensure_future(one(s)) for s in symbols]
+        try:
+            for completed in asyncio.as_completed(tasks):
+                result = await completed
+                fetched += 1
+                if result is not None:
+                    series[result[0]] = result[1]
+                if fetched % _PROGRESS_EVERY == 0 or fetched == total:
+                    elapsed = time.monotonic() - started
+                    await self._report_progress(
+                        {
+                            "phase": "panel",
+                            "fetched": fetched,
+                            "total": total,
+                            "available": len(series),
+                            "elapsed_s": round(elapsed, 1),
+                            # 线性外推，仅作量级提示；取数快慢随命中缓存与网络波动。
+                            "eta_s": round(elapsed / fetched * (total - fetched), 1) if fetched else None,
+                        }
+                    )
+        finally:
+            # 工具级的 asyncio.wait_for 超时会取消本协程；此时未完成的取数任务必须
+            # 一并取消，否则它们会继续在后台跑并占用线程池。
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
         if not series:
             return None
         return pd.DataFrame(series).sort_index()
+
+    async def _report_progress(self, payload: dict[str, Any]) -> None:
+        """上报一次中间进展；未注入回调时静默跳过（如单测直接调用工具）。"""
+        report = getattr(self, "progress", None)
+        if report is None:
+            return
+        await report(payload)

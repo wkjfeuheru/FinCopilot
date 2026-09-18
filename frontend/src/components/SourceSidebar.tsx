@@ -1,6 +1,7 @@
 import { Empty, Tag } from "antd";
 import type { Citation } from "../api/client";
 import { artifactUrl } from "../api/client";
+import { presentToolAction } from "../lib/researchPresentation";
 
 /** 智能体活动流中的一条实时记录。 */
 export type Activity = {
@@ -82,7 +83,7 @@ export function SourceSidebar({
               <article className="source-card" id={`cite-${item.cid}`} key={item.cid}>
                 <div className="source-card-head">
                   <span className="source-index">[{index + 1}]</span>
-                  <span className="source-tool">{item.tool}</span>
+                  <span className="source-tool">{presentToolAction(item.tool)}</span>
                   <Tag color={item.from_cache ? "default" : "green"}>
                     {item.from_cache ? "缓存" : "实时"}
                   </Tag>

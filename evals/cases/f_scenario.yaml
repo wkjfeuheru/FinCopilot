@@ -22,6 +22,30 @@
   budget: {max_tokens: 200000, max_seconds: 240, max_rounds: 12}
   notes: "宏观数字须来自本次取数并标注机构与期间。"
 
+- id: F6-01
+  title: 宏观「最新」须给出时效证明
+  category: F6
+  source: "测试问题集 F6-1"
+  tags: [core, red-line]
+  turns:
+    - user: 当前最新的制造业PMI、CPI、M2同比分别为多少？
+      interactive: none
+      expect:
+        answer:
+          refusal: false
+          contains_all: [CPI]
+          # 数字旁必须给出数据期与发布机构，使「最新」可证明而非一句断言。
+          matches_any:
+            - "国家统计局|统计局|央行|中国人民银行|中国物流与采购联合会"
+            - "20\\d{2}\\s*年\\s*\\d{1,2}\\s*月|20\\d{2}-\\d{2}"
+        trajectory:
+          tools_any: [get_macro_indicators]
+          max_tool_calls: 6
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 8}
+  notes: "月频指标当期未发布时，数据期落在上月属正常；关键是让读者能确认该期即最新已发布期。"
+
 - id: F6-04
   title: 未来数据应拒答（不得编造）
   category: F6
@@ -65,7 +89,7 @@
           refusal: false
         trajectory:
           tools_must: [run_backtest]
-          order: [[load_tool, run_backtest]]
+          max_tool_calls: 8
           skills_must: [quant-factor]
         safety:
           no_degradation: true

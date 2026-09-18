@@ -86,8 +86,8 @@ def _build_provider(settings: Settings, args):
     from finharness.provider.resolver import ProviderResolver
 
     store = ConfigStore(
-        settings.data.cache_dir / "config.db",
-        cipher=SecretCipher(settings.data.cache_dir / "secret.key"),
+        settings.paths.config_db,
+        cipher=SecretCipher(settings.paths.secret_key),
     )
     resolver = ProviderResolver(store_factory=lambda: store, settings=settings)
     # eval CLI 是单用户运维工具：以空 user_id 查询（CLI 时代的配置即 user_id=''）。

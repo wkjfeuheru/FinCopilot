@@ -1,7 +1,12 @@
 import { useState } from "react";
 import type { StoredTurn } from "../api/client";
+import { planFromEvent, presentToolAction, presentToolProgress } from "../lib/researchPresentation";
+import type { ResearchPlan } from "../lib/researchPresentation";
+import { ResearchPlanLedger } from "./ResearchPlanLedger";
 
-export type TraceStatus = "running" | "done" | "error" | "info";
+/** 一步/一轮的执行状态。``stopped`` 是用户主动停止，刻意区别于 ``error``：
+ * 停止不是失败，界面不该用错误色与"出错"措辞来呈现它。 */
+export type TraceStatus = "running" | "done" | "error" | "info" | "stopped";
 
 export type AgentStep = {
   key: string;
@@ -27,15 +32,16 @@ export type TurnMetrics = {
 
 export type TurnTrace = {
   planned: boolean;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "stopped";
   steps: AgentStep[];
+  plan?: ResearchPlan;
   metrics?: TurnMetrics;
 };
 
 const KIND_LABELS: Record<AgentStep["kind"], string> = {
   analysis: "分析",
   plan: "规划",
-  skill: "Skill",
+  skill: "研究方法",
   tool: "工具",
   agent: "子代理",
   final: "汇总",
@@ -44,21 +50,15 @@ const KIND_LABELS: Record<AgentStep["kind"], string> = {
 
 function storedKind(name: string): AgentStep["kind"] {
   if (name === "research_plan") return "plan";
-  if (name === "load_skill" || name === "list_skills") return "skill";
   return "tool";
 }
 
 function storedLabel(name: string): string {
-  if (name === "research_plan") return "制定研究计划";
-  if (name === "load_skill") return "加载研究 Skill";
-  if (name === "list_skills") return "检索可用 Skill";
-  if (name === "write_report") return "生成研报并执行风险终审";
-  if (name === "make_chart") return "绘制研究图表";
-  return `调用 ${name}`;
+  return presentToolAction(name);
 }
 
 function storedAgentLabel(name: string): string {
-  return name === "risk" ? "风险审阅子代理" : `${name} 子代理`;
+  return name === "risk" ? "风险审阅子代理" : "独立研究子代理";
 }
 
 /** 从随历史回答持久化的事件中重建可见的执行记录。 */
@@ -68,6 +68,7 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
   let steps: AgentStep[] = [
     { key: "analysis", kind: "analysis", label: "理解问题并确定研究路径", status: "done" },
   ];
+  let plan: ResearchPlan | undefined;
   let metrics: TurnMetrics | undefined;
 
   const upsert = (next: AgentStep) => {
@@ -98,6 +99,21 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
           : { attachments: (data.attachments as string[] | undefined) ?? [] }),
       });
     }
+    if (event.event === "tool_progress") {
+      // 进展事件只更新正在运行那一步的说明。历史回放与实时流走同一条渲染路径，
+      // 否则刷新后长任务的进度说明会凭空消失。已存在的步骤保持其既有状态，
+      // 避免进展事件晚于完成事件到达时把"已完成"回退成"运行中"。
+      const callId = String(data.call_id ?? "");
+      const detail = presentToolProgress(data);
+      if (callId && detail) {
+        if (steps.some((step) => step.key === callId)) {
+          steps = steps.map((step) => (step.key === callId ? { ...step, detail } : step));
+        } else {
+          const name = String(data.name ?? "tool");
+          upsert({ key: callId, kind: storedKind(name), label: storedLabel(name), status: "running", detail });
+        }
+      }
+    }
     if (event.event === "context_compacted") {
       const before = Number(data.before_tokens ?? 0);
       const after = Number(data.after_tokens ?? 0);
@@ -109,38 +125,38 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
         detail: `${before.toLocaleString("zh-CN")} → ${after.toLocaleString("zh-CN")} Token${data.degraded ? " · 摘要降级" : ""}`,
       });
     }
-    if (event.event === "loop_guard") {
-      const aborted = data.action === "would_abort";
+    // 路由注入与按需激活都是引擎的隐式动作，用户看不到工具调用，因此这里显式
+    // 记一行——否则"模型为什么知道这个方法/这个工具"在界面上无从解释。
+    if (event.event === "context_routed") {
+      const skills = (data.skills as string[] | undefined) ?? [];
+      if (skills.length) {
+        upsert({
+          key: `routed-${skills.join(",")}`,
+          kind: "skill",
+          label: "注入研究方法",
+          status: "done",
+          detail: skills.join("、"),
+        });
+      }
+    }
+    if (event.event === "tool_activated") {
       upsert({
-        key: `guard-${String(data.call_id ?? steps.length)}`,
+        key: `activated-${String(data.call_id ?? data.name)}`,
         kind: "system",
-        label: aborted ? "终止重复调用" : "跳过重复调用",
-        status: aborted ? "error" : "info",
-        detail: String(data.name ?? ""),
+        label: "按需启用研究能力",
+        status: "done",
+        detail: presentToolAction(String(data.name ?? "")),
       });
     }
+    // loop_guard 与实时流一致地不进 trace：去重属引擎自愈，不是用户可见的
+    // 执行节点；升级为提前结束本轮时由 error 事件说明。
     if (event.event === "plan_progress") {
       planned = true;
-      const revision = Number(data.revision ?? 1);
-      const done = Number(data.done ?? 0);
-      const total = Number(data.total ?? 0);
-      const drift = (data.drift as string[] | undefined) ?? [];
-      const mismatch = (data.mismatch as string[] | undefined) ?? [];
-      const stalled = Number(data.stalled_turns ?? 0);
-      const detail = [
-        `进度 ${done}/${total}`,
-        revision > 1 ? `第 ${revision} 版` : "",
-        drift.length ? `目标外：${drift.join("、")}` : "",
-        mismatch.length ? `能力外：${mismatch.join("、")}` : "",
-        stalled ? `停滞 ${stalled} 轮` : "",
-      ].filter(Boolean).join(" · ");
-      upsert({
-        key: "plan-progress",
-        kind: "plan",
-        label: "研究计划进度",
-        status: "info",
-        detail,
-      });
+      plan = planFromEvent(data) ?? plan;
+      if (plan) {
+        // 计划是独立台账，避免与普通执行动作混在同一条流水里。
+        steps = steps.filter((step) => step.key !== "plan-progress");
+      }
     }
     if (event.event === "interactive_request") {
       upsert({
@@ -153,10 +169,15 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
     }
     if (event.event === "done") {
       const succeeded = data.succeeded !== false;
-      status = succeeded ? "done" : "error";
+      // 用户主动停止的一轮不是失败：它带着已有成果正常收尾，因此还原为
+      // stopped（黄/中性态 + "已停止"），而不是 error。刷新后重放的历史
+      // 走的是这条路径，与实时流的处理必须一致。
+      const stopped = data.reason === "user_stopped";
+      const restingStatus = stopped ? ("stopped" as const) : ("error" as const);
+      status = succeeded ? "done" : stopped ? "stopped" : "error";
       steps = steps.map((step) =>
         step.status === "running"
-          ? { ...step, status: succeeded ? ("done" as const) : ("error" as const) }
+          ? { ...step, status: succeeded ? ("done" as const) : restingStatus }
           : step,
       );
       const perAgent =
@@ -178,7 +199,7 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
         key: "final",
         kind: "final",
         label: "整理研究结论",
-        status: succeeded ? "done" : "error",
+        status: succeeded ? "done" : restingStatus,
       });
       const usage = (data.usage as Record<string, unknown> | undefined) ?? {};
       const inputTokens = Number(usage.input_tokens ?? 0);
@@ -192,10 +213,11 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
         totalDurationMs: Number(turn.total_duration_ms ?? 0),
         toolDurationMs: Number(data.tool_duration_ms ?? 0),
       };
+      plan = planFromEvent((data.plan as Record<string, unknown> | undefined) ?? {}) ?? plan;
     }
   }
 
-  return { planned, status, steps, metrics };
+  return { planned: planned || Boolean(plan), status, steps, plan, metrics };
 }
 
 function formatDuration(value: number | null): string {
@@ -208,52 +230,30 @@ function statusLabel(status: TraceStatus): string {
   if (status === "running") return "进行中";
   if (status === "done") return "已完成";
   if (status === "error") return "失败";
+  if (status === "stopped") return "已停止";
   return "已记录";
 }
 
 function StepMark({ status }: { status: TraceStatus }) {
   return (
     <span className={`trace-step-mark trace-step-mark-${status}`} aria-hidden="true">
-      {status === "done" ? "✓" : status === "error" ? "!" : status === "running" ? "" : "·"}
+      {status === "done"
+        ? "✓"
+        : status === "error"
+          ? "!"
+          : status === "running"
+            ? ""
+            : status === "stopped"
+              ? "■"
+              : "·"}
     </span>
-  );
-}
-
-function PlanProgress({ trace }: { trace: TurnTrace }) {
-  const planningDone = trace.steps.some((step) => step.kind === "plan" && step.status === "done");
-  const executionDone = trace.steps.some((step) => step.kind === "final");
-  const finalDone = trace.steps.some((step) => step.kind === "final" && step.status === "done");
-  const phaseDone = [planningDone, executionDone, finalDone].filter(Boolean).length;
-  const progress = trace.status === "done" ? 100 : Math.min(92, Math.round((phaseDone / 3) * 100));
-
-  return (
-    <div className="plan-progress" aria-label={`复杂任务完成进度 ${progress}%`}>
-      <div className="plan-progress-head">
-        <span>复杂任务进度</span>
-        <strong>{progress}%</strong>
-      </div>
-      <div className="plan-progress-track">
-        <span style={{ width: `${progress}%` }} />
-      </div>
-      <div className="plan-phases">
-        {[
-          ["规划", planningDone],
-          ["执行", executionDone],
-          ["汇总", finalDone],
-        ].map(([label, done], index) => (
-          <span key={String(label)} className={done ? "done" : phaseDone === index ? "active" : ""}>
-            <i />{label}
-          </span>
-        ))}
-      </div>
-    </div>
   );
 }
 
 export function TurnMetricsBar({ metrics }: { metrics: TurnMetrics }) {
   const items = [
     { label: "总 Token", value: metrics.totalTokens.toLocaleString("zh-CN"), title: `输入 ${metrics.inputTokens.toLocaleString("zh-CN")} · 输出 ${metrics.outputTokens.toLocaleString("zh-CN")}` },
-    { label: "Steps", value: String(metrics.steps) },
+    { label: "执行节点", value: String(metrics.steps) },
     { label: "首 Token 延迟", value: formatDuration(metrics.firstTokenMs) },
     { label: "总耗时", value: formatDuration(metrics.totalDurationMs), title: `工具累计耗时 ${formatDuration(metrics.toolDurationMs)}` },
   ];
@@ -287,13 +287,17 @@ export function AgentTrace({ trace }: { trace: TurnTrace }) {
           分析与执行过程
         </span>
         <span className="trace-summary-meta">
-          {trace.status === "running" ? "Agent 正在工作" : `${completed} 个节点已完成`}
+          {trace.status === "running"
+            ? "研究任务执行中"
+            : trace.status === "stopped"
+              ? `已停止 · ${completed} 个节点已完成`
+              : `${completed} 个节点已完成`}
         </span>
       </summary>
       <div className="trace-content">
-        {trace.planned && <PlanProgress trace={trace} />}
+        {trace.plan && <ResearchPlanLedger plan={trace.plan} />}
         <ol className="trace-steps">
-          {trace.steps.map((step) => (
+          {trace.steps.filter((step) => !(trace.plan && step.kind === "plan")).map((step) => (
             <li className={`trace-step trace-step-${step.status}`} key={step.key}>
               <StepMark status={step.status} />
               <span className="trace-step-kind">{KIND_LABELS[step.kind]}</span>

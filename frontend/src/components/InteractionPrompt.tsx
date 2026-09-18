@@ -19,6 +19,13 @@ type Props = {
  * 确认（y/n），以及模型提出澄清问题。它们共用同一个
  * 通道，因此共用同一个对话框。
  */
+
+/** 确认按钮的展示文案：y_remember 是网络访问确认的"本对话不再询问"应答。 */
+function confirmLabel(option: string): string {
+  if (option === "y") return "允许";
+  if (option === "y_remember") return "允许并本对话不再询问";
+  return "拒绝";
+}
 export function InteractionPrompt({ interaction, onRespond, busy }: Props) {
   const [freeText, setFreeText] = useState("");
 
@@ -51,12 +58,12 @@ export function InteractionPrompt({ interaction, onRespond, busy }: Props) {
             {interaction.options.map((option) => (
               <Button
                 key={option}
-                type={isConfirm && option === "y" ? "primary" : "default"}
+                type={isConfirm && option.startsWith("y") ? "primary" : "default"}
                 danger={isConfirm && option === "n"}
                 disabled={busy}
                 onClick={() => onRespond(interaction.requestId, option)}
               >
-                {isConfirm ? (option === "y" ? "允许" : "拒绝") : option}
+                {isConfirm ? confirmLabel(option) : option}
               </Button>
             ))}
           </Space>

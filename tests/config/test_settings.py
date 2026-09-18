@@ -143,7 +143,10 @@ def test_default_relative_paths_use_the_configuration_file_parent(tmp_path):
     assert settings.data.cache_dir == (tmp_path / "data_cache").resolve()
     assert settings.audit.log_path == (tmp_path / "logs" / "audit.jsonl").resolve()
     assert settings.server.static_dir == (tmp_path / "src" / "finharness" / "server" / "static").resolve()
-    assert settings.paths.memory_db == (tmp_path / "data_cache" / "memory.db").resolve()
+    assert settings.paths.memory_db == (tmp_path / "state" / "memory.db").resolve()
+    # 状态文件默认与 agent 可达的 data_cache/ 分开（隔离方案 P0-3）。
+    assert settings.paths.auth_db == (tmp_path / "state" / "users.db").resolve()
+    assert settings.paths.secret_key == (tmp_path / "state" / "secret.key").resolve()
 
 
 def test_provider_overrides_deep_merge_preset_defaults(tmp_path):
@@ -420,3 +423,93 @@ def test_web_has_its_own_cache_ttl(tmp_path):
     settings = Settings.from_file(write_settings(tmp_path, {"model": {"provider": "fake"}}))
 
     assert settings.data.cache_ttl_days["web"] == 1
+
+
+def test_result_token_overrides_are_parsed_from_the_environment(monkeypatch, tmp_path):
+    """按工具覆盖结果预算，与 timeout_overrides 对称。"""
+    path = write_settings(tmp_path, {"model": {"provider": "fake"}})
+    monkeypatch.setenv(
+        "FINH_TOOLS_RESULT_TOKEN_OVERRIDES", '{"read_pdf": 8000, "get_quote": 200}'
+    )
+
+    settings = Settings.from_file(path)
+
+    assert settings.tools.result_token_overrides == {"read_pdf": 8000, "get_quote": 200}
+
+
+def test_result_token_overrides_are_frozen(monkeypatch, tmp_path):
+    settings = Settings(
+        tools={"result_token_overrides": {"read_pdf": 8000}}
+    )
+
+    with pytest.raises(TypeError):
+        settings.tools.result_token_overrides["get_quote"] = 10
+
+
+def test_the_compaction_transcript_budget_is_settings_backed(monkeypatch, tmp_path):
+    """压缩转录稿的批注上限过去是 compaction.py 里的字符硬编码。"""
+    path = write_settings(tmp_path, {"model": {"provider": "fake"}})
+    monkeypatch.setenv("FINH_CONTEXT_COMPACTION_RESULT_TOKENS", "750")
+
+    settings = Settings.from_file(path)
+
+    assert settings.context.compaction_result_tokens == 750
+
+
+# -- 状态文件与 agent 可达目录的分离（隔离方案 P0-3）--------------------------
+
+def test_state_files_may_not_live_in_the_cache_dir(tmp_path):
+    """密钥/租户库落在 data_cache 内必须直接失败，而不是仅警告。"""
+    payload = {
+        "data": {"cache_dir": str(tmp_path / "data_cache")},
+        "paths": {"memory_db": str(tmp_path / "data_cache" / "memory.db")},
+    }
+
+    with pytest.raises(SettingsError, match="agent 可达目录"):
+        Settings.from_file(write_settings(tmp_path, payload))
+
+
+def test_state_files_may_not_live_in_the_output_dir(tmp_path):
+    payload = {
+        "paths": {
+            "output_dir": str(tmp_path / "output"),
+            "secret_key": str(tmp_path / "output" / "secret.key"),
+        }
+    }
+
+    with pytest.raises(SettingsError, match="agent 可达目录"):
+        Settings.from_file(write_settings(tmp_path, payload))
+
+
+def test_direct_construction_also_enforces_state_separation(tmp_path):
+    """约束是模型级校验，因此绕过 from_file() 的调用方也拦得住。"""
+    with pytest.raises(ValidationError):
+        Settings(
+            data={"cache_dir": tmp_path / "cache"},
+            paths={"auth_db": tmp_path / "cache" / "users.db"},
+        )
+
+
+def test_state_files_outside_reachable_dirs_are_accepted(tmp_path):
+    settings = Settings(
+        data={"cache_dir": tmp_path / "cache"},
+        paths={
+            "output_dir": tmp_path / "output",
+            "state_dir": tmp_path / "state",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
+            "config_db": tmp_path / "state" / "config.db",
+            "secret_key": tmp_path / "state" / "secret.key",
+        },
+    )
+
+    assert settings.paths.secret_key == tmp_path / "state" / "secret.key"
+
+
+def test_state_dir_is_env_configurable(monkeypatch, tmp_path):
+    path = write_settings(tmp_path, {"model": {"provider": "fake"}})
+    monkeypatch.setenv("FINH_PATHS_STATE_DIR", "var/state")
+
+    settings = Settings.from_file(path)
+
+    assert settings.paths.state_dir == (tmp_path / "var" / "state").resolve()

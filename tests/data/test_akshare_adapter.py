@@ -226,6 +226,32 @@ def test_quote_moves_on_when_a_candidate_exceeds_its_deadline(monkeypatch):
     assert time.perf_counter() - started < 1.0
 
 
+def test_kline_moves_on_when_a_candidate_exceeds_its_deadline(monkeypatch):
+    """K 线候选链同样必须有时限。
+
+    横截面回测一次要取数百只标的，而 K 线接口不接受请求超时；没有一个候选接口挂死
+    的时限保护，单只标的就能吃掉整个工具预算（docs 03.5）。
+    """
+    class Ak:
+        def stock_zh_a_hist(self, **kwargs):
+            time.sleep(3.0)  # 远长于截止时间
+            return pd.DataFrame()
+
+        def stock_zh_a_daily(self, **kwargs):
+            return _tx_frame()
+
+    monkeypatch.setattr(akshare_adapter, "_KLINE_CANDIDATE_DEADLINE_S", 0.2)
+    adapter = AkShareAdapter(throttle_seconds=0)
+    monkeypatch.setattr(akshare_adapter, "_import_akshare", lambda: Ak())
+    started = time.perf_counter()
+
+    result = adapter.fetch_kline("600519", "day", None, 2)
+
+    # 早在慢候选源返回之前，就已经回落到下一个候选接口。
+    assert result.interface == "stock_zh_a_daily"
+    assert time.perf_counter() - started < 1.0
+
+
 def test_tencent_quote_receives_a_request_timeout_and_prefixed_symbol(monkeypatch):
     class Ak:
         def __init__(self):

@@ -15,8 +15,9 @@ from finharness.data.access import DataAccess
 from finharness.data.adapters.tavily_adapter import TavilyAdapter
 from finharness.data.cache import LocalCache
 from finharness.tools.base import PermissionLevel, ToolGroup
+from finharness.tools.declare import Tier
 from finharness.tools.generic.web import WebSearchTool
-from finharness.tools.registry import DEFAULT_LAZY_TOOLS, review_tool_names
+from finharness.tools.registry import review_tool_names
 
 
 def make_access(tmp_path, handler) -> DataAccess:
@@ -82,7 +83,7 @@ def test_empty_search_results_still_carry_the_notice(tmp_path):
 def test_web_search_is_lazy_and_read_only():
     assert WebSearchTool.permission is PermissionLevel.READ
     assert WebSearchTool.group is ToolGroup.GENERIC
-    assert "web_search" in DEFAULT_LAZY_TOOLS
+    assert WebSearchTool.tier is Tier.LAZY
 
 
 def test_reviewer_cannot_reach_the_web():

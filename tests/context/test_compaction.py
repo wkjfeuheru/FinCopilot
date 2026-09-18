@@ -92,7 +92,7 @@ def test_compaction_is_skipped_below_the_threshold(tmp_path):
 
     loop = asyncio.run(run())
 
-    assert loop.compactions == []
+    assert list(loop.compactions) == []
 
 
 def test_summary_replaces_the_middle_and_keeps_recent_rounds(tmp_path):
@@ -261,3 +261,55 @@ def test_compaction_summary_is_observed_and_accounted(tmp_path):
     rendered = metrics.render().decode()
     assert 'llm_tokens_total{call_type="compaction",kind="input"' in rendered
     assert "40.0" in rendered
+
+
+# -- 转录稿裁剪：按 token 而非字符 ---------------------------------------------
+
+
+def test_the_transcript_clip_is_token_based_and_settings_driven():
+    """转录稿过去把每条结果硬编码截到 800 字符。
+
+    在按 token 计量的体系里，那是一个更紧、又与语言无关的第二个上限——中文下
+    800 字符仅约 470 token，一条刚在上下文预算下幸存的结果会在压缩时被砍得更短。
+    现在它按 token 预算裁剪，因此可以断言真实 token 数。
+    """
+    from finharness.context.compaction import _render_transcript
+
+    settings = Settings(context=ContextSettings(context_window_tokens=600, compaction_ratio=0.5))
+    ctx = ResearchContext(cite=CitationRegistry(), settings=settings)
+    memory = WorkingMemory(ctx=ctx, settings=settings, counter=COUNTER)
+    for index in range(5):
+        memory.append(Msg(role="user", content=f"问题{index}"))
+        memory.append(
+            Msg(role="assistant", content=None, tool_uses=[ToolUse(f"c{index}", "get_quote", {})])
+        )
+        memory.append(
+            Msg(role="tool_result", content=None, tool_results=[(f"c{index}", "内容" * 2000)])
+        )
+
+    transcript = _render_transcript(
+        memory.raw, counter=COUNTER, max_result_tokens=200
+    )
+
+    # 每条结果都被裁到预算内：5 条各约 200 token，总计远低于未裁剪的量。
+    assert COUNTER.count(transcript).tokens < 200 * 5 + 200
+    # 裁剪是显式的，而不是静默丢弃。
+    assert "已截断" in transcript
+
+
+def test_a_zero_budget_keeps_the_transcript_verbatim():
+    """预算为 0 表示"不裁剪"，而不是"裁到空"。"""
+    from finharness.context.compaction import _render_transcript
+
+    settings = Settings(context=ContextSettings(context_window_tokens=600, compaction_ratio=0.5))
+    ctx = ResearchContext(cite=CitationRegistry(), settings=settings)
+    memory = WorkingMemory(ctx=ctx, settings=settings, counter=COUNTER)
+    memory.append(Msg(role="user", content="问题"))
+    memory.append(
+        Msg(role="assistant", content=None, tool_uses=[ToolUse("c1", "get_quote", {})])
+    )
+    memory.append(Msg(role="tool_result", content=None, tool_results=[("c1", "原始结果")]))
+
+    transcript = _render_transcript(memory.raw, counter=COUNTER, max_result_tokens=0)
+
+    assert "原始结果" in transcript

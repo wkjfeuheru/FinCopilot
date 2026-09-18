@@ -15,7 +15,19 @@ from finharness.server.api import (
     create_app,
     create_production_app,
 )
-from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
+from finharness.types import (
+    STATE_VIEW_META,
+    ModelUsage,
+    StreamChunk,
+    StreamEvent,
+    ToolUse,
+)
+
+
+def _is_state_view(message) -> bool:
+    """随请求追加的会话研究状态视图，不是对话记录条目。"""
+    return bool(message.metadata.get(STATE_VIEW_META))
+
 
 
 class ScriptedProvider(Provider):
@@ -102,6 +114,9 @@ def parse_events(text: str) -> list[tuple[str, dict]]:
     events: list[tuple[str, dict]] = []
     for frame in text.split("\n\n"):
         if not frame.strip():
+            continue
+        # 心跳是注释帧（以 ``:`` 开头，不含 event/data），按规范应被忽略。
+        if frame.lstrip().startswith(":"):
             continue
         name = None
         payload = None
@@ -197,7 +212,7 @@ def make_client(provider=None, data_access=None, tmp_path=None) -> TestClient:
     """构建一个客户端，其 memory store 与缓存位于临时目录中。
 
     若不显式传入 settings 对象，应用会使用仓库中的
-    data_cache/memory.db，于是每个聊天测试都会把对话追加到
+    state/memory.db，于是每个聊天测试都会把对话追加到
     开发者真实的 store 中。
     """
     if tmp_path is None:
@@ -209,8 +224,8 @@ def make_client(provider=None, data_access=None, tmp_path=None) -> TestClient:
         data={"cache_dir": tmp_path / "cache"},
         paths={
             "output_dir": tmp_path / "output",
-            "memory_db": tmp_path / "cache" / "memory.db",
-            "auth_db": tmp_path / "cache" / "users.db",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
         },
     )
     from tests.server.conftest import authed_client
@@ -303,18 +318,20 @@ def test_tools_endpoint_lists_m1_financial_tools() -> None:
             "make_chart",
             "write_report",
             "read_file",
+            "read_pdf",
             "write_file",
             "web_search",
             "research_plan",
             "update_plan_step",
             "record_conclusion",
             "search_tools",
-            "list_skills",
-            "load_skill",
-            "load_tool",
             "spawn_agent",
+            "summarize_document",
             "ask_user",
             "remember_preference",
+            "search_memory",
+            "update_memory",
+            "forget_memory",
         ]
     }
 
@@ -331,7 +348,10 @@ def test_second_turn_reuses_session_history() -> None:
     )
 
     assert second.status_code == 200
-    assert [message.content for message in provider.requests[-1]] == [
+    # 末尾是随请求追加的研究状态视图（不是对话记录），故只看真实历史。
+    assert [
+        message.content for message in provider.requests[-1] if not _is_state_view(message)
+    ] == [
         "first",
         "answer",
         "second",
@@ -410,8 +430,8 @@ def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session(
                 data={"cache_dir": tmp_path / "cache"},
                 paths={
                     "output_dir": tmp_path / "output",
-                    "memory_db": tmp_path / "cache" / "memory.db",
-                    "auth_db": tmp_path / "cache" / "users.db",
+                    "memory_db": tmp_path / "state" / "memory.db",
+                    "auth_db": tmp_path / "state" / "users.db",
                 },
             ),
         )
@@ -493,7 +513,7 @@ def test_metrics_endpoint_is_absent_when_disabled(tmp_path) -> None:
     settings = Settings(
         model={"provider": "fake"},
         data={"cache_dir": tmp_path / "cache"},
-        paths={"output_dir": tmp_path / "out", "memory_db": tmp_path / "cache" / "memory.db"},
+        paths={"output_dir": tmp_path / "out", "memory_db": tmp_path / "state" / "memory.db"},
     )
     client = TestClient(create_app(FakeProvider(["hi"]), settings=settings))
 
@@ -507,8 +527,8 @@ def test_metrics_endpoint_reports_request_and_token_counters(tmp_path) -> None:
         data={"cache_dir": tmp_path / "cache"},
         paths={
             "output_dir": tmp_path / "out",
-            "memory_db": tmp_path / "cache" / "memory.db",
-            "auth_db": tmp_path / "cache" / "users.db",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
         },
         observability={"metrics": {"enabled": True}},
     )
@@ -566,3 +586,82 @@ def test_production_factory_rejects_tracing_without_a_key(monkeypatch, tmp_path)
 
     with pytest.raises(SettingsError, match="LANGSMITH_API_KEY"):
         create_production_app(settings_path)
+
+
+def test_stream_synthesizes_done_when_engine_ends_without_one(
+    monkeypatch, tmp_path
+) -> None:
+    """引擎没有下发 ``done`` 就返回时，传输层必须补一个终止事件。
+
+    否则浏览器只能看到连接被静默关闭，界面永远停在"运行中"，
+    这正是"刷新后才看到结果"的成因。
+    """
+    from finharness.engine.loop import AgentLoop
+    from finharness.types import AgentTurnOutcome
+
+    async def silent_run(self, user_msg: str) -> AgentTurnOutcome:
+        # 引擎正常返回，但不向 sink 发任何终止事件。
+        return AgentTurnOutcome(answer="done-ish")
+
+    monkeypatch.setattr(AgentLoop, "run", silent_run)
+    client = make_client(FakeProvider(["unused"]), tmp_path=tmp_path)
+
+    response = client.post("/v1/chat/stream", json={"message": "question"})
+
+    events = parse_events(response.text)
+    names = [name for name, _ in events]
+    assert names[-1] == "done", names
+    assert names.count("done") == 1
+    assert events[-1][1]["succeeded"] is True
+
+
+def test_stream_reports_terminal_error_when_engine_raises(monkeypatch, tmp_path) -> None:
+    """引擎抛出异常时，客户端仍应收到 ``error`` 与 ``done``，而不是静默断流。"""
+    from finharness.engine.loop import AgentLoop
+
+    async def exploding_run(self, user_msg: str):
+        raise RuntimeError("engine blew up")
+
+    monkeypatch.setattr(AgentLoop, "run", exploding_run)
+    client = make_client(FakeProvider(["unused"]), tmp_path=tmp_path)
+
+    response = client.post("/v1/chat/stream", json={"message": "question"})
+
+    events = parse_events(response.text)
+    names = [name for name, _ in events]
+    assert "error" in names, names
+    assert names[-1] == "done", names
+    error = next(payload for name, payload in events if name == "error")
+    assert error["reason"] == "engine_error"
+    assert events[-1][1]["succeeded"] is False
+
+
+def test_stream_emits_heartbeat_during_silence(monkeypatch, tmp_path) -> None:
+    """引擎长时间静默时应下发心跳注释帧，避免代理攒帧/截断连接。"""
+    from finharness.engine.loop import AgentLoop
+    from finharness.types import AgentTurnOutcome
+
+    async def slow_run(self, user_msg: str) -> AgentTurnOutcome:
+        await asyncio.sleep(0.3)
+        return AgentTurnOutcome(answer="late")
+
+    monkeypatch.setattr(AgentLoop, "run", slow_run)
+    monkeypatch.setattr("finharness.server.api.HEARTBEAT_S", 0.05)
+    client = make_client(FakeProvider(["unused"]), tmp_path=tmp_path)
+
+    response = client.post("/v1/chat/stream", json={"message": "question"})
+
+    assert ": keep-alive" in response.text
+    # 心跳不得污染事件流：解析后仍只有终止性的 done 收尾。
+    events = parse_events(response.text)
+    assert [name for name, _ in events][-1] == "done"
+
+
+def test_stream_response_sets_anti_buffering_headers(tmp_path) -> None:
+    """SSE 响应必须禁止中间层缓存与缓冲，否则帧会被攒着一起发。"""
+    client = make_client(FakeProvider(["hello"]), tmp_path=tmp_path)
+
+    response = client.post("/v1/chat/stream", json={"message": "question"})
+
+    assert response.headers["cache-control"] == "no-cache, no-transform"
+    assert response.headers["x-accel-buffering"] == "no"

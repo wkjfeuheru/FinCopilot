@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from finharness.context.tokens import CHARS_PER_TOKEN
+
 # 当调用方未提供时的默认描述长度预算。
 DEFAULT_MAX_DESC_LEN = 60
 
@@ -33,5 +35,5 @@ def schema_tokens(schema: dict, *, counter: Any | None = None) -> int:
     function = schema.get("function", {})
     text = str(function.get("description", "")) + str(function.get("parameters", ""))
     if counter is None:
-        return int(len(text) / 1.7)
+        return int(len(text) / CHARS_PER_TOKEN)
     return counter.count(text).tokens

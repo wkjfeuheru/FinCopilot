@@ -78,6 +78,10 @@ class CitationRegistry:
         一旦对话需要持久化，编号稳定性就很重要：已存储的摘要或
         结论会以 ``cit_000005`` 指代某条数据，若在重新加载时重新编号，
         就会在不知不觉中把这些引用指向不同的数据。
+
+        恢复同样受容量上限约束：长对话的引用可能远超上限，无界恢复会让
+        每次重载都把整份引用史读进内存——那正是 ``register`` 想避免的。
+        这里丢弃的是最旧的条目，与 ``register`` 的淘汰方向一致。
         """
         for citation in citations:
             if citation.cid in self._by_id:
@@ -85,6 +89,13 @@ class CitationRegistry:
             self._items.append(citation)
             self._by_id[citation.cid] = citation
             self._counter = max(self._counter, _cid_ordinal(citation.cid))
+            self._trim()
+
+    def _trim(self) -> None:
+        """把条目数压回上限，最旧的先出。"""
+        while len(self._items) > self._max_entries:
+            dropped = self._items.pop(0)
+            self._by_id.pop(dropped.cid, None)
 
     def register(
         self,
@@ -119,9 +130,7 @@ class CitationRegistry:
         )
         self._items.append(citation)
         self._by_id[citation.cid] = citation
-        if len(self._items) > self._max_entries:
-            dropped = self._items.pop(0)
-            self._by_id.pop(dropped.cid, None)
+        self._trim()
         return citation
 
     def get(self, cid: str) -> Citation | None:

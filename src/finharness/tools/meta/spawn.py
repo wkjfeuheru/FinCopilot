@@ -15,54 +15,53 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel
 
 from finharness.coordinator import GENERAL_FOCUS, MAX_SPAWN_TASKS
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
+
+_TASKS_HELP = (
+    "并行子任务列表，每项须自包含（谁、要什么、材料在哪）。"
+    f"1-{MAX_SPAWN_TASKS} 项，各自独立无先后依赖。"
+)
 
 
-class SpawnAgentInput(BaseModel):
-    tasks: list[str] = Field(
-        min_length=1,
-        max_length=MAX_SPAWN_TASKS,
-        description=(
-            "并行子任务列表，每项须自包含（谁、要什么、材料在哪）。"
-            f"1-{MAX_SPAWN_TASKS} 项，各自独立无先后依赖。"
-        ),
-    )
-    context: str | None = Field(
-        default=None, description="所有子任务共享的背景说明，可选"
-    )
+def _require_a_task(value: BaseModel) -> BaseModel:
+    """空条目会派生一个无事可做的子代理，为回答一个空串付出整个上下文的代价。
 
-    @field_validator("tasks")
-    @classmethod
-    def _no_blank_tasks(cls, value: list[str]) -> list[str]:
-        # 空条目会派生一个无事可做的子代理，为回答一个空串付出整个上下文的代价。
-        # 在 schema 层拒绝，而不是留到下游。
-        if not any(task and task.strip() for task in value):
-            raise ValueError("tasks 至少需要一项非空任务")
-        return value
+    在参数模型层拒绝，而不是留到下游。
+    """
+    tasks = getattr(value, "tasks", None) or []
+    if not any(task and task.strip() for task in tasks):
+        raise ValueError("tasks 至少需要一项非空任务")
+    return value
 
 
-class SpawnAgentTool(BaseTool):
-    name = "spawn_agent"
-    description = (
+@tool(
+    name="spawn_agent",
+    description=(
         "把若干各自独立、无需相互等待的任务分派给子代理并行处理，"
         "每个子代理在自己的上下文里完成、只回结论，因此大量中间材料不占用主上下文。"
         "子代理只读、不取数：材料需写在任务里或以本地文件路径给出。"
-    )
-    input_model = SpawnAgentInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.META
+    ),
+    capability=Capability.META,
+    # 扇出会派生多个并发子代理，成本高且多数问题用不到，故按需注入。
+    tier=Tier.LAZY,
+    group=ToolGroup.META,
     # 扇出至多 MAX_SPAWN_TASKS 个并发的子代理，每个都要运行自己的若干轮，
     # 因此预算须覆盖最慢的那个兄弟任务，而不是一次模型调用。
-    timeout = 300
+    timeout=300,
     # 由循环注入（docs 03.10）：工具无法自行构建协调器，因为那需要 provider，
     # 而工具永远看不到它。
-    needs_coordinator = True
-    output_schema_note = "返回每个子任务的结论与用量；子代理过程不回流。"
-
+    needs_coordinator=True,
+    output_schema_note="返回每个子任务的结论与用量；子代理过程不回流。",
+    model_validator=_require_a_task,
+)
+class SpawnAgentTool(BaseTool):
+    @param("tasks", annotation=list[str], desc=_TASKS_HELP, min_length=1, max_length=MAX_SPAWN_TASKS)
+    @param("context", desc="所有子任务共享的背景说明，可选")
     async def _dispatch(self, *, tasks: list[str], context: str | None = None) -> RawData:
         """把任务列表交给协调器并行派生，返回聚合后的各子任务结论文本。"""
         if self.coordinator is None:

@@ -269,3 +269,108 @@ def test_a_non_pdf_body_is_reported_without_solving(monkeypatch):
         fetch_pdf_bytes("https://host/a.pdf", opener=FakeOpener())
 
     assert "未返回 PDF" in str(exc.value)
+
+
+# -- 分页与落盘：read_pdf / summarize_document 的底层能力 ----------------------
+
+
+def test_extract_pdf_pages_keeps_page_boundaries():
+    """分页读取需要页边界，合并后的整段文本无法回答"第 N 页从哪开始"。"""
+    from finharness.data.adapters.pdf_fetch import extract_pdf_pages
+    from tests.data.pdf_fixtures import make_multi_page_pdf
+
+    pages = extract_pdf_pages(make_multi_page_pdf(["zqxalpha", "zqxbeta", "zqxgamma"]))
+
+    assert len(pages) == 3
+    assert "zqxalpha" in pages[0]
+    assert "zqxbeta" in pages[1]
+    assert "zqxgamma" in pages[2]
+
+
+def test_extract_pdf_text_still_joins_all_pages():
+    from finharness.data.adapters.pdf_fetch import extract_pdf_text
+    from tests.data.pdf_fixtures import make_multi_page_pdf
+
+    text = extract_pdf_text(make_multi_page_pdf(["zqxone", "zqxtwo"]))
+
+    assert "zqxone" in text and "zqxtwo" in text
+
+
+def test_a_blank_pdf_is_reported_as_unreadable_not_empty():
+    """扫描件是"已下载但不可读"，与"没有内容"是不同的事实。"""
+    from finharness.data.adapters.pdf_fetch import extract_pdf_text
+
+    with pytest.raises(AdapterError) as exc:
+        extract_pdf_text(make_pdf(""))
+
+    assert "未抽取到文本" in str(exc.value)
+
+
+def test_save_pdf_bytes_is_content_addressed_and_idempotent(tmp_path):
+    """同一份内容写两次只落一个文件：抓取重复不导致磁盘膨胀。"""
+    from finharness.data.adapters.pdf_fetch import save_pdf_bytes
+
+    data = make_pdf("zqxsame")
+    first = save_pdf_bytes(data, tmp_path)
+    second = save_pdf_bytes(data, tmp_path)
+
+    assert first == second
+    assert first.is_file()
+    assert first.read_bytes() == data
+    assert len(list(tmp_path.glob("*.pdf"))) == 1
+    # 不同的内容得到不同的文件名。
+    other = save_pdf_bytes(make_pdf("zqxother"), tmp_path)
+    assert other != first
+    assert len(list(tmp_path.glob("*.pdf"))) == 2
+
+
+def test_save_pdf_bytes_leaves_no_partial_file_behind(tmp_path):
+    from finharness.data.adapters.pdf_fetch import save_pdf_bytes
+
+    save_pdf_bytes(make_pdf("zqxpartial"), tmp_path)
+
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_parse_page_range_handles_the_supported_forms():
+    from finharness.data.adapters.pdf_fetch import parse_page_range
+
+    assert parse_page_range(None, 10) == (1, 1)
+    assert parse_page_range("3", 10) == (3, 3)
+    assert parse_page_range("2-5", 10) == (2, 5)
+    assert parse_page_range("4-", 10) == (4, 10)
+    assert parse_page_range("-3", 10) == (1, 3)
+
+
+def test_parse_page_range_rejects_nonsense():
+    from finharness.data.adapters.pdf_fetch import parse_page_range
+
+    with pytest.raises(AdapterError):
+        parse_page_range("abc", 10)
+
+
+def test_read_pdf_pages_clamps_an_overlong_end(tmp_path):
+    """末页超出总页数时修剪到实际的最后一页，而不是返回空。"""
+    from finharness.data.adapters.pdf_fetch import read_pdf_pages
+    from tests.data.pdf_fixtures import make_multi_page_pdf
+
+    target = tmp_path / "r.pdf"
+    target.write_bytes(make_multi_page_pdf(["zqxa", "zqxb"]))
+
+    pages, first, last, total = read_pdf_pages(target, "2-99")
+
+    assert (first, last, total) == (2, 2, 2)
+    assert "zqxb" in pages[0]
+
+
+def test_read_pdf_pages_refuses_a_page_past_the_end(tmp_path):
+    from finharness.data.adapters.pdf_fetch import read_pdf_pages
+    from tests.data.pdf_fixtures import make_multi_page_pdf
+
+    target = tmp_path / "r.pdf"
+    target.write_bytes(make_multi_page_pdf(["zqxa"]))
+
+    with pytest.raises(AdapterError) as exc:
+        read_pdf_pages(target, "9")
+
+    assert "超出范围" in str(exc.value)

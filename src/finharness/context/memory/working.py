@@ -147,7 +147,13 @@ class WorkingMemory:
         return (boundary, discarded)
 
     def _rounds_to_keep(self) -> int:
-        """有多少最近轮次能放进预算，且绝不低于下限。"""
+        """有多少最近轮次能放进预算，且绝不低于下限。
+
+        还要受 ``max_window_rounds`` 封顶：当轮次数是压缩的触发原因时（内容都很
+        小、永远触不到 token 阈值），按预算能"全部留下"，边界就会是 0，压缩
+        什么都不做而触发条件持续为真，形成每轮空转。封顶让轮次触发的压缩真正
+        推进。
+        """
         floor = self.settings.context.min_recent_rounds
         if not self.raw:
             return floor
@@ -171,6 +177,9 @@ class WorkingMemory:
                 break
             used += chunk_tokens
             kept += 1
+        cap = int(self.settings.context.max_window_rounds)
+        if cap > 0:
+            kept = min(kept, cap)
         return max(kept, floor)
 
     def round_count(self) -> int:

@@ -25,6 +25,7 @@ import re
 import socket
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Callable, NamedTuple
 from urllib.parse import urljoin, urlparse
 
@@ -252,11 +253,12 @@ def fetch_pdf_bytes(
     raise AdapterError(f"未能获取 PDF（{reason}）")
 
 
-def extract_pdf_text(data: bytes) -> str:
-    """逐页提取 PDF 的文本层。
+def extract_pdf_pages(data: bytes) -> list[str]:
+    """逐页提取 PDF 的文本层，返回按页码顺序排列的列表。
 
-    没有文本层的 PDF（扫描件）会被如实报告为如此，而不是返回空内容："已下载但
-    不可读" 与 "无此文档" 对阅读者而言是不同的答案。
+    与 :func:`extract_pdf_text` 的区别在于**保留页边界**：分页读取（``read_pdf``）
+    需要知道第 N 页从何开始，而合并后的整段文本无法回答这个问题。单页出错只丢该页，
+    不让其余页随之丢失——扫描件里夹一页图片不该让整份文档变成"不可读"。
     """
     try:
         from pypdf import PdfReader
@@ -276,10 +278,95 @@ def extract_pdf_text(data: bytes) -> str:
             pages.append(page.extract_text() or "")
         except Exception:  # noqa: BLE001 - 单页出错不能让其余内容丢失
             pages.append("")
-    text = "\n".join(pages).strip()
+    return pages
+
+
+def extract_pdf_text(data: bytes) -> str:
+    """逐页提取 PDF 的文本层，并合并为整段文本。
+
+    没有文本层的 PDF（扫描件）会被如实报告为如此，而不是返回空内容："已下载但
+    不可读" 与 "无此文档" 对阅读者而言是不同的答案。
+    """
+    text = "\n".join(extract_pdf_pages(data)).strip()
     if not text:
         raise AdapterError("PDF 已下载但未抽取到文本（可能是扫描件，需 OCR）")
     return text
+
+
+def save_pdf_bytes(data: bytes, directory: str | Path) -> Path:
+    """把 PDF 落盘到内容寻址的文件名，并返回其路径。
+
+    文件名取自内容的 sha256 前缀：同一份文档重复抓取只写一次（天然去重），且内容
+    不可变、无需失效逻辑。先写临时文件再 ``replace``，使读取方永远看不到半个文件。
+    落盘是让"全文"在上下文之外仍然可用的前提——上下文只承载有界预览与这个句柄。
+    """
+    import hashlib
+    import os
+    import tempfile
+
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    target_dir = Path(directory)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{digest}.pdf"
+    if target.is_file() and target.stat().st_size == len(data):
+        return target
+    handle, temp_name = tempfile.mkstemp(dir=target_dir, suffix=".part")
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+        os.replace(temp_name, target)
+    except Exception:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
+    return target
+
+
+_PAGE_RANGE_RE = re.compile(r"^\s*(\d*)\s*-\s*(\d*)\s*$")
+
+
+def parse_page_range(spec: str | None, total: int) -> tuple[int, int]:
+    """把 ``"1-3"`` / ``"5"`` / ``"2-"`` / ``None`` 解析为闭区间 ``(first, last)``。
+
+    页码从 1 开始，且会被夹到 ``total`` 之内。非法或越界的取值由调用方转述，
+    这里只负责在给定时给出一个可用的区间。
+    """
+    if spec is None or not str(spec).strip():
+        return 1, min(total, 1) if total else 1
+    text = str(spec).strip()
+    match = _PAGE_RANGE_RE.match(text)
+    if match:
+        start = int(match.group(1)) if match.group(1) else 1
+        end = int(match.group(2)) if match.group(2) else total
+        return start, end
+    if text.isdigit():
+        page = int(text)
+        return page, page
+    raise AdapterError(f"无法识别的页码范围：{spec}（可用 '3'、'1-3'、'2-'）")
+
+
+def read_pdf_pages(path: str | Path, pages: str | None = None) -> tuple[list[str], int, int, int]:
+    """读取本地 PDF 的指定页，返回 ``(页文本列表, 首页, 末页, 总页数)``。
+
+    越界会被如实修剪并返回实际的页区间，使调用方能说明"你要的第 9 页只有 6 页"，
+    而不是静默返回一个空列表。
+    """
+    target = Path(path)
+    if not target.is_file():
+        raise AdapterError(f"文件不存在：{path}")
+    try:
+        data = target.read_bytes()
+    except OSError as exc:
+        raise AdapterError(f"读取 PDF 失败：{exc}") from exc
+
+    all_pages = extract_pdf_pages(data)
+    total = len(all_pages)
+    if total == 0:
+        raise AdapterError("PDF 不含任何页面")
+    first, last = parse_page_range(pages, total)
+    if first < 1 or first > total:
+        raise AdapterError(f"页码超出范围：第 {first} 页（共 {total} 页）")
+    last = max(first, min(last, total))
+    return all_pages[first - 1 : last], first, last, total
 
 
 def fetch_pdf_text(url: str, **kwargs) -> str:

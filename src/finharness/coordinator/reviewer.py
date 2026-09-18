@@ -144,6 +144,9 @@ class Coordinator:
         cite: CitationRegistry,
         counter: Any | None = None,
         on_usage: Callable[[str, int, int], None] | None = None,
+        stop_signal_provider: Callable[[], Any | None] | None = None,
+        audit_hook_factory: Callable[[str], Any] | None = None,
+        user_id: str = "",
     ) -> None:
         self.provider = provider
         self.data = data
@@ -158,6 +161,15 @@ class Coordinator:
         # 子代理的 LLM Span 需要与主循环区分（call_type=subagent）；未接线时
         # 子代理仍会运行，只是不产生自己的 Span。
         self._observer: Any | None = None
+        # 主循环停止信号的取值器（docs 03.3）：子代理在启动前取一次，因此用户
+        # 在主循环等待子代理扇出时按下的停止也能被它们看到。传取值器而非信号
+        # 本身，因为信号是在 loop 构造之后才装上的。
+        self._stop_signal_provider = stop_signal_provider
+        # 子代理审计（docs 03.7.3）：审计不可移除是全局不变量，子代理不应是
+        # 盲区。工厂按子代理 session_id 产出 hook，使复核者与 worker 的行为
+        # 各自落行；未接线时子代理仍运行，只是不留痕（测试替身路径）。
+        self._audit_hook_factory = audit_hook_factory
+        self._user_id = user_id
 
     def bind_accounting(self, *, usage: Any, stats: Any, observer: Any | None = None) -> None:
         """挂接主循环的计数器与观测器，使子代理的开销被记到那里。"""
@@ -165,6 +177,15 @@ class Coordinator:
         self._stats = stats
         if observer is not None:
             self._observer = observer
+
+    def _current_stop_signal(self) -> Any | None:
+        """当前主循环的停止信号；未接线时返回 None（子代理永不因此停下）。"""
+        if self._stop_signal_provider is None:
+            return None
+        try:
+            return self._stop_signal_provider()
+        except Exception:  # noqa: BLE001 - 取值失败只是"子代理不响应停止"
+            return None
 
     # -- 风险复核 ----------------------------------------------------------
     async def review_risk(self, *, topic: str, markdown: str) -> SubAgentResult:
@@ -264,6 +285,16 @@ class Coordinator:
         # 代理同时运行时也保持精确。
         scoped_cite = ScopedCitationRegistry(self.cite)
         sub_ctx = ResearchContext(cite=scoped_cite, settings=sub_settings)
+        sub_session_id = f"{focus}-subagent"
+        # 子代理审计行与主会话可区分（session_id 带 focus 前缀），但归属于同一
+        # 用户与写入器：检索 audit.jsonl 时不必先知道会话结构也能回答"谁做的"。
+        from finharness.hooks.base import HookChain
+
+        sub_hooks = HookChain(
+            [self._audit_hook_factory(sub_session_id)]
+            if self._audit_hook_factory is not None
+            else []
+        )
 
         sub_loop = AgentLoop(
             provider=self.provider,
@@ -279,13 +310,21 @@ class Coordinator:
             # 不设 store：这次运行是它自己的一个片段，而非对话记忆。它的
             # transcript 随本次调用一起消亡。
             store=None,
-            session_id=f"{focus}-subagent",
+            session_id=sub_session_id,
+            hooks=sub_hooks,
+            user_id=self._user_id,
             # 子代理的模型调用以 call_type=subagent 标记，使其 token 与耗时
             # 在指标里与主循环分开；它的 ``run()`` 也因此不发射请求级指标，
             # 避免把子代理算作一次用户请求。
             observer=self._observer,
             call_type="subagent",
+            # 场景路由属于主循环：子代理的输入只有任务文本，据此推断意图只会往核查者
+            # 的上下文里塞进与本次核查无关的方法论，并平白多花 token。
+            route_skills=False,
         )
+        # 子代理与主循环共享同一个停止信号：否则用户在主循环等子代理扇出时按
+        # 停止，要等这个子代理自己跑完才生效。共享而非复制，使置位即刻可见。
+        sub_loop.stop_signal = self._current_stop_signal()
 
         try:
             outcome = await sub_loop.run(_sub_request(task=task, context=context))

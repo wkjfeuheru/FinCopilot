@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -39,6 +40,11 @@ def validate_symbol(symbol: str) -> str:
     if not re.fullmatch(r"\d{6}", str(symbol)):
         raise ValueError("symbol must be a 6-digit A-share code")
     return symbol
+
+
+def _now_stamp() -> str:
+    """本次取数的抓取时刻，与缓存条目所用的时间戳格式一致（本地时区、秒级）。"""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _data_date(df: pd.DataFrame | None, fallback: str) -> str:
@@ -107,6 +113,7 @@ class DataAccess:
                     df=df, endpoint=entry.endpoint, params=cache_params,
                     from_cache=True, cache_key=entry.cache_key,
                     parquet_path=entry.file_path, data_date=entry.data_date,
+                    fetched_at=entry.created_ts,
                 )
 
         errors: list[str] = []
@@ -145,6 +152,7 @@ class DataAccess:
             interface = result.interface if isinstance(result, FetchResult) else kind
             endpoint = f"{adapter.name}:{interface}"
             data_date = _data_date(df, LocalCache.today())
+            fetched_at = _now_stamp()
             if self.cache is not None:
                 entry = await self.cache.put(
                     lookup_key=lookup_key,
@@ -158,9 +166,12 @@ class DataAccess:
                     return self._raw(
                         df=df, endpoint=endpoint, params=cache_params,
                         cache_key=entry.cache_key, parquet_path=entry.file_path,
-                        data_date=data_date,
+                        data_date=data_date, fetched_at=fetched_at,
                     )
-            return self._raw(df=df, endpoint=endpoint, params=cache_params, data_date=data_date)
+            return self._raw(
+                df=df, endpoint=endpoint, params=cache_params,
+                data_date=data_date, fetched_at=fetched_at,
+            )
 
         raise DataUnavailableError("; ".join(errors) or "no data adapter configured")
 
@@ -174,6 +185,7 @@ class DataAccess:
         from_cache: bool = False,
         cache_key: str | None = None,
         parquet_path: str | None = None,
+        fetched_at: str | None = None,
     ) -> RawData:
         return RawData(
             kind="df",
@@ -184,6 +196,7 @@ class DataAccess:
             from_cache=from_cache,
             cache_key=cache_key,
             parquet_path=parquet_path,
+            fetched_at=fetched_at,
         )
 
     # -- 语义方法 -----------------------------------------------------

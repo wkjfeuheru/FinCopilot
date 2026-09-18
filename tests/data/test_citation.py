@@ -74,6 +74,28 @@ def test_registry_is_bounded_and_evicts_oldest():
     assert registry.get("cit_000005") is not None
 
 
+def test_restore_is_also_bounded():
+    """长对话重载引用时也不能无界增长：restore 必须与 register 同样受上限约束。"""
+    source = CitationRegistry(max_entries=100)
+    for i in range(20):
+        source.register(
+            tool="t", endpoint="e", symbol=str(i), params={}, rows=1, cols=1, fingerprint="x"
+        )
+
+    restored = CitationRegistry(max_entries=5)
+    restored.restore(source.all())
+
+    assert len(restored.all()) == 5
+    # 保留的是最新的 5 条，且编号不被重排（已存储的摘要仍能指向它们）。
+    assert [item.cid for item in restored.all()] == [
+        "cit_000016",
+        "cit_000017",
+        "cit_000018",
+        "cit_000019",
+        "cit_000020",
+    ]
+
+
 def test_fingerprint_is_stable_and_content_sensitive():
     a = pd.DataFrame({"close": [1, 2]})
     b = pd.DataFrame({"close": [1, 2]})

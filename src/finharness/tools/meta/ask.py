@@ -2,28 +2,22 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
-
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 
-class AskUserInput(BaseModel):
-    question: str = Field(description="要问用户的问题，需具体、可回答")
-    options: list[str] = Field(
-        default_factory=list, description="可选项；留空表示自由文本回答"
-    )
-
-
+@tool(
+    name="ask_user",
+    description="当关键信息缺失且无法从数据推断时，向用户提问以澄清需求。",
+    capability=Capability.META,
+    group=ToolGroup.META,
+    timeout=130,
+    needs_interactive=True,
+)
 class AskUserTool(BaseTool):
-    name = "ask_user"
-    description = "当关键信息缺失且无法从数据推断时，向用户提问以澄清需求。"
-    input_model = AskUserInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.META
-    timeout = 130
-    needs_interactive = True
-
+    @param("question", desc="要问用户的问题，需具体、可回答")
+    @param("options", desc="可选项；留空表示自由文本回答")
     async def _dispatch(self, *, question: str, options: list[str] | None = None) -> RawData:
         """经由注入的交互回调向用户提问；超时未答时返回提示模型继续的文本。"""
         if self.interactive is None:

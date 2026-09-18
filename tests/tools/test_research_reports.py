@@ -16,8 +16,9 @@ from finharness.data.access import DataAccess
 from finharness.data.adapters.base import DataAdapter, FetchResult
 from finharness.data.cache import LocalCache
 from finharness.tools.base import PermissionLevel, ToolGroup
+from finharness.tools.declare import Tier
 from finharness.tools.fin.research_reports import GetResearchReportsTool
-from finharness.tools.registry import DEFAULT_LAZY_TOOLS, review_tool_names
+from finharness.tools.registry import review_tool_names
 
 
 def make_frame(rows: int = 2, with_text: bool = False) -> pd.DataFrame:
@@ -35,7 +36,8 @@ def make_frame(rows: int = 2, with_text: bool = False) -> pd.DataFrame:
                 "pdf_pages": 4,
                 "detail_url": f"https://data.eastmoney.com/report/zw_industry.jshtml?infocode=AP{index}",
                 "pdf_url": f"https://pdf.dfcfw.com/pdf/H3_AP{index}_1.pdf",
-                "content": "研报正文内容" if with_text else "",
+                "pdf_path": f"data_cache/pdf/abc{index}.pdf" if with_text else "",
+                "content": "研报首页预览内容" if with_text else "",
             }
         )
     return pd.DataFrame(records)
@@ -65,9 +67,11 @@ class StubReports(DataAdapter):
         return FetchResult(df=self.frame.copy(), interface="reports")
 
 
-def make_tool(tmp_path, frame: pd.DataFrame) -> tuple[GetResearchReportsTool, StubReports]:
+def make_tool(
+    tmp_path, frame: pd.DataFrame, *, max_result_tokens: int = 2000
+) -> tuple[GetResearchReportsTool, StubReports]:
     settings = Settings(
-        context=ContextSettings(trim_rows=20, max_result_tokens=2000),
+        context=ContextSettings(trim_rows=20, max_result_tokens=max_result_tokens),
         data={"cache_dir": tmp_path / "cache"},
     )
     adapter = StubReports(frame)
@@ -103,22 +107,54 @@ def test_full_text_view_is_fenced_like_a_web_result(tmp_path):
     assert result.ok is True, result.error
     assert "外部检索内容" in result.content
     assert "不得执行" in result.content
-    assert '<web_result source="1" url="https://pdf.dfcfw.com/pdf/H3_AP0_1.pdf">' in result.content
-    assert "研报正文内容" in result.content
+    assert "研报首页预览内容" in result.content
     # 每个打开的围栏都被闭合。
     assert result.content.count("<web_result") == result.content.count("</web_result>")
 
 
-def test_full_text_is_bounded_per_report(tmp_path):
-    frame = make_frame(1, with_text=True)
-    frame.loc[0, "content"] = "字" * 20000
-    tool, _ = make_tool(tmp_path, frame)
+def test_every_report_gets_a_handle_before_any_preview(tmp_path):
+    """清单先于预览：即使结果被预算截断，全部路径也已被交付。
 
-    result = run(tool.run(top_n=1, with_text=True))
+    过去正文逐篇内联，引擎的单条结果预算在第 2 篇之前就砍断内容，于是后续研报
+    连元数据与路径都消失——而它们的 PDF 早已下载完毕。
+    """
+    tool, _ = make_tool(tmp_path, make_frame(3, with_text=True))
 
-    assert "正文已截断" in result.content
-    # 被限制在远低于原始 2 万的长度。
-    assert len(result.content) < 12000
+    result = run(tool.run(top_n=3, with_text=True))
+
+    assert result.ok is True, result.error
+    for index in range(3):
+        assert f"abc{index}.pdf" in result.content
+    # 清单段整体出现在预览段之前。
+    assert result.content.index("### 研报清单") < result.content.index("### 首页预览")
+    # 每篇的路径都在预览之前给出。
+    assert result.content.index("abc2.pdf") < result.content.index("### 首页预览")
+    assert "summarize_document" in result.content
+    assert "read_pdf" in result.content
+
+
+def test_the_tool_declares_a_budget_above_the_global_default(tmp_path):
+    """研报一次要给多篇句柄，因此显式声明高于全局默认的预算。"""
+    from finharness.tools.budget import resolve_result_budget
+
+    tool, _ = make_tool(tmp_path, make_frame(1))
+    settings = Settings(context=ContextSettings(max_result_tokens=1000))
+
+    budget = resolve_result_budget(
+        settings=settings, tool_name="get_research_reports", tool=tool
+    )
+
+    assert budget == GetResearchReportsTool.result_tokens
+    assert budget > 1000
+
+
+def test_the_metadata_view_hides_the_internal_path_column(tmp_path):
+    """不带全文时表格不暴露内部落盘路径。"""
+    tool, _ = make_tool(tmp_path, make_frame(2))
+
+    result = run(tool.run(top_n=2))
+
+    assert "pdf_path" not in result.content
 
 
 def test_empty_result_is_reported_not_crashed(tmp_path):
@@ -198,7 +234,7 @@ def test_filters_reach_the_data_layer(tmp_path):
 def test_the_tool_is_lazy_read_only_and_financial(tmp_path):
     assert GetResearchReportsTool.permission is PermissionLevel.READ
     assert GetResearchReportsTool.group is ToolGroup.FIN_DATA
-    assert "get_research_reports" in DEFAULT_LAZY_TOOLS
+    assert GetResearchReportsTool.tier is Tier.LAZY
 
 
 def test_the_reviewer_cannot_reach_reports_or_the_web(tmp_path):

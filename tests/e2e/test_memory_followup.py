@@ -61,7 +61,7 @@ def _build(tmp_path):
         permission=PermissionSettings(default_mode="auto"),
         context=ContextSettings(context_window_tokens=32000),
         data={"cache_dir": tmp_path / "cache"},
-        paths={"memory_db": tmp_path / "cache" / "memory.db", "output_dir": tmp_path / "output"},
+        paths={"memory_db": tmp_path / "state" / "memory.db", "output_dir": tmp_path / "output"},
     )
     provider = OpenAICompatProvider(
         base_url="https://api.deepseek.com/v1",

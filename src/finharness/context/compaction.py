@@ -17,6 +17,7 @@ from typing import Any
 from finharness.config.settings import Settings
 from finharness.context.memory.summary import SummaryLayer
 from finharness.context.memory.working import KEEP_RECENT_ROUNDS, WorkingMemory
+from finharness.context.tokens import CHARS_PER_TOKEN, truncate_to_tokens
 from finharness.observability import NullObserver
 from finharness.provider.base import Provider
 from finharness.types import Msg, ModelUsage, StreamEvent
@@ -83,9 +84,18 @@ class AutoCompactor:
         )
 
     def needs_compaction(self) -> bool:
-        return self.memory.over_budget(
+        """是否该压缩：token 超预算，或窗口内轮次超过硬上限。
+
+        token 阈值只管住"窗口有多大"，管不住"有多少轮"。轮次少但每轮很小的
+        对话永远触不到 token 阈值，于是历史可以无限加长——那同样是内存。轮次
+        上限与 token 阈值并列，专门堵住这种长期陪伴式对话。
+        """
+        if self.memory.over_budget(
             system=self.system, tools=self.tools, extra_text=self.state_text
-        )
+        ):
+            return True
+        limit = int(self.settings.context.max_window_rounds)
+        return limit > 0 and self.memory.round_count() > limit
 
     async def compact(self) -> CompactionResult:
         """缩减窗口；失败时降级为“丢弃最旧内容”的回退方案。"""
@@ -174,7 +184,11 @@ class AutoCompactor:
         这次调用会以 ``call_type=compaction`` 记入指标，并通过 ``on_usage``
         回填给会话统计，使压缩开销在成本视图里可见而不是凭空消失。
         """
-        transcript = _render_transcript(messages)
+        transcript = _render_transcript(
+            messages,
+            counter=self.memory.counter,
+            max_result_tokens=int(self.settings.context.compaction_result_tokens),
+        )
         collected: list[str] = []
         usage: ModelUsage | None = None
         observer = self.observer if self.observer is not None else NullObserver()
@@ -229,8 +243,19 @@ def _foldable_boundary(messages: list[Msg]) -> int:
     return _recent_boundary(messages, KEEP_RECENT_ROUNDS)
 
 
-def _render_transcript(messages: list[Msg]) -> str:
-    """把消息列表渲染成供摘要模型阅读的纯文本对话记录。"""
+def _render_transcript(
+    messages: list[Msg],
+    *,
+    counter: Any | None = None,
+    max_result_tokens: int = 0,
+) -> str:
+    """把消息列表渲染成供摘要模型阅读的纯文本对话记录。
+
+    工具结果按 *token* 预算裁剪：这里过去是字符硬编码 ``raw[:800]``，而整个体系的其余
+    部分按 token 计量，于是同一条结果在压缩转录稿里被砍得比在上下文里更短（中文下
+    800 字符仅约 470 token）。给出 ``counter`` 时按真实 token 计数裁剪，与其它预算
+    同一口径。
+    """
     lines: list[str] = []
     for message in messages:
         if message.role == "user" and message.content:
@@ -242,8 +267,17 @@ def _render_transcript(messages: list[Msg]) -> str:
                 lines.append(f"[调用工具] {tool_use.name} {tool_use.args}")
         elif message.role == "tool_result":
             for call_id, raw in message.tool_results:
-                lines.append(f"[工具结果 {call_id}] {raw[:800]}")
+                lines.append(f"[工具结果 {call_id}] {_clip_result(raw, counter, max_result_tokens)}")
     return "\n".join(lines)
+
+
+def _clip_result(raw: str, counter: Any | None, max_tokens: int) -> str:
+    """把一条工具结果裁到 token 预算内；无计数器时退回字符近似。"""
+    if max_tokens <= 0:
+        return raw
+    if counter is None:
+        return raw[: int(max_tokens * CHARS_PER_TOKEN)]
+    return truncate_to_tokens(raw, counter, max_tokens, marker="…（已截断）")
 
 
 def _ms(started: float) -> int:

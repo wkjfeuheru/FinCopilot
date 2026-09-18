@@ -152,3 +152,55 @@ def test_an_unreviewed_report_is_audited_as_such(tmp_path):
     assert review["action"] == "review"
     assert review["status"] == "unreviewed"
     assert review["error"] == "max_turns_exhausted"
+
+
+# -- 审计失败必须可见（隔离方案 P0-8）-----------------------------------------
+
+def test_a_failing_writer_raises_so_callers_can_report_it(tmp_path):
+    """写入器不再吞掉 I/O 错误：调用方（引擎/服务端）负责记录它。
+
+    这里断言的是"错误会浮上来"这一契约本身；引擎侧把它记成 WARNING 而不再
+    静默 ``pass``，因此审计不可用这件事是可观测的。
+    """
+    import pytest
+
+    writer = AuditLogWriter(tmp_path / "audit.jsonl")
+    # 目录换成文件，使后续 open(..., "a") 必然失败。
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory", encoding="utf-8")
+    writer.path = blocker / "audit.jsonl"
+
+    with pytest.raises(OSError):
+        writer.write({"action": "run"})
+
+
+def test_engine_reports_an_audit_failure_instead_of_swallowing_it(tmp_path, caplog):
+    """引擎的审计钩子失败时必须留下 WARNING，而不是无声无息。
+
+    这是 P0-8 的回归点：过去这里是 ``except Exception: pass``，于是"审计完全
+    写不进去"与"一切正常"在外部看来毫无区别。
+    """
+    import asyncio
+    import logging
+
+    from finharness.engine.loop import AgentLoop
+    from finharness.hooks.base import HookChain
+
+    class BoomHook:
+        async def post(self, *args, **kwargs):
+            raise OSError("audit disk full")
+
+    loop = AgentLoop.__new__(AgentLoop)  # 只借用真实方法，不做完整构造
+    loop.hooks = HookChain([BoomHook()])
+
+    with caplog.at_level(logging.WARNING, logger="finharness.engine.loop"):
+        asyncio.run(
+            loop._audit(
+                FakeTool(), {"symbol": "600519"},
+                action="run", verdict="allow",
+                result=ToolResult(content="ok", ok=True),
+            )
+        )
+
+    # 审计失败绝不能中断这一轮：调用正常返回，同时留下可观测的 WARNING。
+    assert any("审计写入失败" in record.message for record in caplog.records)

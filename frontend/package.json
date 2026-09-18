@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "vitest run",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
@@ -17,10 +18,12 @@
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
+    "@types/node": "^26.5.1",
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "esbuild": "^0.28.2",
     "typescript": "latest",
-    "vite": "latest"
+    "vite": "latest",
+    "vitest": "^3.2.7"
   }
 }

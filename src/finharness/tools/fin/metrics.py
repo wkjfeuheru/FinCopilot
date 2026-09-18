@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
-from pydantic import BaseModel, Field
 
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 # 不同报表格式的列关键词不同，故按子串匹配。
 _NET_MARGIN_KEYS = ("销售净利率", "net_margin", "net profit margin")
@@ -28,22 +30,17 @@ def _find_column(df: pd.DataFrame, keys: tuple[str, ...]) -> str | None:
     return None
 
 
-class MetricsInput(BaseModel):
-    method: str = Field(default="dupont", description="分析方法，当前支持 dupont")
-    symbol: str | None = Field(default=None, description="6位A股代码；与 cids 二选一")
-    cids: list[str] = Field(
-        default_factory=list, description="复用的数据引用 id（来自先前工具结果）"
-    )
-
-
+@tool(
+    name="calc_metrics",
+    description="按杜邦框架分解 ROE（净利率×周转率×权益乘数），可复用已取数据。",
+    capability=Capability.COMPUTE,
+    group=ToolGroup.FIN_CALC,
+    timeout=60,
+)
 class CalcMetricsTool(BaseTool):
-    name = "calc_metrics"
-    description = "按杜邦框架分解 ROE（净利率×周转率×权益乘数），可复用已取数据。"
-    input_model = MetricsInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.FIN_CALC
-    timeout = 60
-
+    @param("method", desc="分析方法，当前支持 dupont")
+    @param("symbol", desc="6位A股代码；与 cids 二选一")
+    @param("cids", desc="复用的数据引用 id（来自先前工具结果）")
     async def _dispatch(
         self, *, method: str = "dupont", symbol: str | None = None, cids: list[str] | None = None
     ) -> RawData:
@@ -107,8 +104,6 @@ class CalcMetricsTool(BaseTool):
             citation = cite.get(cid)
             if citation is None or not citation.parquet_path:
                 continue
-            from pathlib import Path
-
             path = Path(citation.parquet_path)
             if path.is_file():
                 return pd.read_parquet(path)

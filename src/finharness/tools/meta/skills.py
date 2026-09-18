@@ -1,17 +1,20 @@
-"""技能目录及其元工具（docs 03.8）。
+"""技能目录与场景路由（docs 03.8）。
 
 *技能* 是一个场景包：一份 ``SKILL.md`` 掌管流程（步骤、场景边界、何时查阅哪个文件），
-方法论位于同级的 ``references/*.md`` 中，报告模板位于 ``assets/*.md``。加载按需且分
-两阶段：``list_skills`` 只读 frontmatter（并枚举随包文件）而不触碰正文；``load_skill``
-注入一份正文——场景流程，或单个参考文件。
+方法论位于同级的 ``references/*.md`` 中，报告模板位于 ``assets/*.md``。
 
-加载是幂等的，且按目标可观测：重复加载零成本，每次加载都可追溯。
+加载不再是一个模型可调用的工具，而是引擎的**路由**动作：引擎从用户消息与计划意图推断
+需要哪些能力，据此注入对应的场景流程与方法论。理由有两条。其一，模型不该管理自己的
+提示词里放什么——那是引擎的职责。其二，"该不该加载"取决于意图，而意图在模型发出工具
+调用之前就已经可从文本判定；把它做成工具只会让每份方法论都多付一次往返。
+
+注入是幂等的，且按目标可观测：同一目标每个会话只注入一次，每次都留档。
 
 Frontmatter schema：
 
     name / description            —— 这是哪个场景、何时进入
     inputs / outputs              —— 语义契约
-    use_cases / examples          —— 供模型选择的辅助信息
+    use_cases / examples          —— 供检索层选择场景的辅助信息
     related_skills                —— 组合技能；仅作为提示呈现，不自动加载
     allowed_tools                 —— 正文预期使用的建议工具
     content_estimate / version    —— 预算提示与修订版本
@@ -23,15 +26,13 @@ Frontmatter schema：
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
 
-from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.declare import Capability
 
 FILE_DIRS = ("references", "assets")
 
@@ -162,17 +163,21 @@ class SkillRegistry:
         return list(self._metas.values())
 
     def describe(self) -> str:
+        """目录的可读描述，供 CLI `/skills` 与排障使用。
+
+        它不再是一个模型可调用的工具（模型不经工具调用去了解自己有哪些方法），但
+        "这个包里有什么"仍需要一个可打印的视图。
+        """
         if not self._metas:
             return "（技能库为空）"
         blocks: list[str] = []
         for meta in self._metas.values():
             lines = [f"- {meta.name}：{meta.selection_hint()}"]
             if meta.files:
-                lines.append(
-                    "  可加载文件：" + "、".join(meta.files) + "（load_skill 的 file 参数）"
-                )
+                lines.append("  可加载文件：" + "、".join(meta.files))
             blocks.append("\n".join(lines))
         return "\n".join(blocks)
+
 
     def search(self, query: str, *, limit: int = 5) -> list[tuple[SkillMeta, int]]:
         """关键词检索，返回 (技能, 得分) 对。
@@ -266,81 +271,130 @@ class SkillRegistry:
         """点名组合技能的提示；它们不会被自动加载。"""
         if not meta.related_skills:
             return ""
-        return "本技能可复用：" + "、".join(meta.related_skills) + "（按需自行 load_skill）"
+        return "本技能可复用：" + "、".join(meta.related_skills)
 
 
-# --- 工具 ------------------------------------------------------------------
+# --- 路由（引擎侧） ----------------------------------------------------------
 
-class ListSkillsInput(BaseModel):
-    """无参数：列出目录的代价始终很低。"""
+# 能力 -> 该方法论所在文件。这是"注册-发现-路由"里**路由**那一层的映射表：意图（能力）
+# 到载体（场景与方法论文档）的对应关系。
+#
+# 关键词表不在这里重写：它由 ``capabilities`` 持有，因为"这句话在说什么"与"这次用错没
+# 用错工具"必须是同一个判断。这里只回答"既然如此，该读哪一份方法论"。
+_METHODOLOGY_BY_CAPABILITY: dict[Capability, tuple[str, str]] = {
+    Capability.FINANCIAL: ("equity-research", "references/profitability.md"),
+    Capability.VALUATION: ("equity-research", "references/valuation.md"),
+    Capability.PEER: ("equity-research", "references/industry-focus.md"),
+    Capability.INDUSTRY: ("industry-research", "references/competition.md"),
+    Capability.MACRO: ("macro-research", "references/cycle.md"),
+    Capability.COMPUTE: ("quant-factor", "references/single-series.md"),
+}
+
+# 需要多少个研究能力同时命中，才值得连场景流程（SKILL.md）一起注入。
+#
+# 场景流程描述的是"一次完整研究的步骤编排"，对单点提问是无用的开销；方法论则回答"这个
+# 指标该怎么读"，单点提问正需要它。两道门槛因此不同，这也是简单提问（"茅台 ROE 为什么
+# 掉这么多"）能拿到方法论、却不会被塞进一份权益研究流程的原因。
+_SKILL_FLOW_THRESHOLD = 2
+
+# 成稿请求的关键词。报告模板只在真的要出成稿时才注入：它是排版契约，对"解释一下差异"
+# 这类对话内作答是纯开销，而 prompt 明确写了只有用户点名要报告才走成稿流程。
+_REPORT_KEYWORDS = ("研报", "报告", "成稿", "导出", "写一份", "出一份")
+# 成稿请求命中时使用的默认场景（用户要报告但没指明研究维度）。
+_DEFAULT_REPORT_SKILL = "equity-research"
+_REPORT_TEMPLATE = "assets/report-template.md"
 
 
-class ListSkillsTool(BaseTool):
-    name = "list_skills"
-    description = "列出可用的投研场景技能（名称+用途+可加载的参考/模板文件），不加载正文。"
-    input_model = ListSkillsInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.META
-    timeout = 10
-
-    async def _dispatch(self) -> RawData:
-        """返回技能目录的可读描述（名称、用途与可加载文件）。"""
-        registry = SkillRegistry(self.data.settings.paths.skills_dir)
-        return RawData(kind="text", text=registry.describe(), endpoint="skills:list")
+def report_requested(text: str) -> bool:
+    """该文本是否明确要求出成稿。"""
+    lowered = str(text or "").lower()
+    return any(word in lowered for word in _REPORT_KEYWORDS)
 
 
-class LoadSkillInput(BaseModel):
-    name: str = Field(description="场景技能名，如 equity-research")
-    file: str | None = Field(
-        default=None,
-        description=(
-            "要加载的场景文件路径，如 references/valuation.md 或 assets/report-template.md；"
-            "省略则加载场景流程（SKILL.md）。可用文件见 list_skills。"
-        ),
-    )
+@dataclass(frozen=True, slots=True)
+class RoutedSkill:
+    """路由结果的一项：要注入哪个技能的哪份正文。"""
+
+    skill: str
+    file: str | None
+    key: str
 
 
-class LoadSkillTool(BaseTool):
-    name = "load_skill"
-    description = (
-        "加载场景技能的流程（SKILL.md）或其参考/模板文件（references/、assets/ 下的 md）。"
-        "重复加载同一目标幂等，零成本。"
-    )
-    input_model = LoadSkillInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.META
-    timeout = 10
+def route(
+    *,
+    capabilities: set[Capability],
+    hinted: tuple[str, ...] = (),
+    report: bool = False,
+) -> list[RoutedSkill]:
+    """把"这次需要什么能力"解析为要注入的方法论。
 
-    async def _dispatch(self, *, name: str, file: str | None = None) -> RawData:
-        """加载技能流程或其中某个参考/模板文件，组装带复用提示与正文的文本载荷。"""
-        registry = SkillRegistry(self.data.settings.paths.skills_dir)
-        meta, body, record = registry.load(name, file=file)
+    ``capabilities`` 是引擎从用户消息与计划意图推断出的能力集合；``hinted`` 是计划步骤
+    显式写下的技能名（``skill_hint``），它优先于推断——模型点名了就照给；``report`` 表示
+    用户明确要成稿，此时额外注入报告模板。
 
-        # 会话上下文记录加载过的目标以供系统提示状态块使用，并告知本次是否为重复加载。
-        key = record.name
-        already_in_session = self.ctx is not None and key in self.ctx.loaded_skills
-        if self.ctx is not None:
-            self.ctx.add_skill(key)
+    返回按注入顺序排列的目标列表：先场景流程（若跨过门槛），后方法论，最后模板。
+    """
+    targets: list[RoutedSkill] = []
+    seen: set[str] = set()
 
-        reused = record.reused or already_in_session
-        sections: list[str] = []
-        if file:
-            sections.append(
-                f"已加载（复用，未重复注入）：{key}" if reused else f"参考文件：{key}"
-            )
-        else:
-            sections.append("已加载（复用，未重复注入）：" + name if reused else "技能：" + name)
-            if meta.inputs:
-                sections.append("输入：" + "；".join(meta.inputs))
-            if meta.outputs:
-                sections.append("产出：" + "；".join(meta.outputs))
-            hint = registry.dependency_hint(meta)
-            if hint:
-                sections.append(hint)
-        sections.append(body)
-        return RawData(
-            kind="text",
-            text="\n\n".join(sections),
-            endpoint="skills:load",
-            params={"name": meta.name, "file": file or "", "reused": record.reused},
-        )
+    def add(skill: str, file: str | None) -> None:
+        key = skill if file is None else f"{skill}/{file}"
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(RoutedSkill(skill=skill, file=file, key=key))
+
+    for name in hinted:
+        cleaned = str(name or "").strip()
+        if cleaned:
+            add(cleaned, None)
+
+    for capability in sorted(capabilities, key=lambda item: item.value):
+        mapping = _METHODOLOGY_BY_CAPABILITY.get(capability)
+        if mapping is None:
+            continue
+        skill, file = mapping
+        if len(capabilities & _researched_capabilities()) >= _SKILL_FLOW_THRESHOLD:
+            add(skill, None)
+        add(skill, file)
+
+    if report:
+        # 成稿时模板是必备契约：字号、章节与引用附录的形状都由它决定。用户要了报告却
+        # 没能指明研究维度时，用默认场景的模板而不是不给模板。
+        skill = _report_skill(capabilities, hinted)
+        add(skill, _REPORT_TEMPLATE)
+
+    return targets
+
+
+def _report_skill(capabilities: set[Capability], hinted: tuple[str, ...]) -> str:
+    """成稿应使用哪个场景的模板。
+
+    优先计划点名过的场景，其次按能力推断（行业问题用行业模板），最后退回默认。
+    取第一个已识别的场景即可：模板之间的差异小于"有没有模板"的差异。
+    """
+    for name in hinted:
+        cleaned = str(name or "").strip()
+        if cleaned:
+            return cleaned
+    for capability in sorted(capabilities, key=lambda item: item.value):
+        mapping = _METHODOLOGY_BY_CAPABILITY.get(capability)
+        if mapping is not None:
+            return mapping[0]
+    return _DEFAULT_REPORT_SKILL
+
+
+def _researched_capabilities() -> set[Capability]:
+    """研究类能力集合。
+
+    以函数而非模块常量取回，避免 ``capabilities`` 与本模块在导入期相互引用。
+    """
+    from finharness.tools.capabilities import RESEARCH_CAPABILITIES
+
+    return RESEARCH_CAPABILITIES
+
+
+def skill_files(skills_dir: str | Path) -> dict[str, tuple[str, ...]]:
+    """技能名 -> 可加载文件清单，供路由层与目录展示共用。"""
+    registry = SkillRegistry(skills_dir)
+    return {meta.name: meta.files for meta in registry.list_skills()}

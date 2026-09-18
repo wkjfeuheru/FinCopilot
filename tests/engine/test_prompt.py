@@ -62,7 +62,6 @@ def test_prompt_requires_convergence():
 def test_prompt_routes_skills_and_reports():
     text = system_prompt()
 
-    assert "load_skill" in text
     for scenario in (
         "equity-research",
         "industry-research",
@@ -112,13 +111,28 @@ def test_prompt_states_output_discipline():
 def test_prompt_names_the_research_report_tool():
     """report 工具是懒加载的，因此 prompt 是模型发现它的途径。"""
     text = system_prompt()
-    section = text.split("联网与回测能力是懒加载的", 1)[1].split("\n## ", 1)[0]
+    section = text.split("是按需注入的", 1)[1].split("\n## ", 1)[0]
 
     assert "get_research_reports" in section
     # 它必须说明这些参数存在，否则模型不会进行筛选。
     assert "行业" in section and "机构" in section
     # 并说明正文是第三方文本。
     assert "不得臆测" in section or "仅作事实参考" in section
+
+
+def test_prompt_explains_the_handle_then_summarize_workflow():
+    """研报正文不再内联：prompt 必须交代拿到句柄后的下一步。
+
+    否则模型只会看到"路径 + 首页预览"，却不知道自己手上还有一个可摘要、
+    可精读的正文——这会退化成"只有首页摘要"的老问题。
+    """
+    text = system_prompt()
+    section = text.split("是按需注入的", 1)[1].split("\n## ", 1)[0]
+
+    assert "summarize_document" in section
+    assert "read_pdf" in section
+    # 说明了正文为何不内联，以及截断时如何取回。
+    assert "截断" in section and "truncated" in section
 
 
 def test_prompt_explains_when_to_spawn_and_what_it_costs():
@@ -139,7 +153,7 @@ def test_prompt_names_the_backtest_tool_and_its_discipline():
     """run_backtest 同样是懒加载的；prompt 必须指向它，但不能承诺
     可以执行任意代码。"""
     text = system_prompt()
-    section = text.split("联网与回测能力是懒加载的", 1)[1].split("\n## ", 1)[0]
+    section = text.split("是按需注入的", 1)[1].split("\n## ", 1)[0]
 
     assert "run_backtest" in section
     assert "不执行任意代码" in section
@@ -180,7 +194,7 @@ def test_prompt_shows_the_citation_format_by_example():
 
 
 def test_prompt_report_example_matches_the_real_schema():
-    """JSON 示例必须始终能通过 ReportInput 的校验。
+    """JSON 示例必须始终能通过 write_report 参数模型的校验。
 
     偏离 schema 的示例会让模型学到一种会被工具拒绝的数据形状，
     这比完全没有示例更糟。
@@ -188,13 +202,13 @@ def test_prompt_report_example_matches_the_real_schema():
     import json
     import re
 
-    from finharness.tools.fin.writer import ReportInput
+    from finharness.tools.fin.writer import WriteReportTool
 
     blocks = re.findall(r"```json\n(.*?)```", system_prompt(), re.DOTALL)
     assert blocks, "the prompt should carry a JSON example for write_report"
 
     for block in blocks:
-        ReportInput.model_validate(json.loads(block))
+        WriteReportTool.input_model.model_validate(json.loads(block))
 
 
 def test_prompt_forbids_calling_unfetched_data_unavailable():

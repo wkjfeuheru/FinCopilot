@@ -46,6 +46,10 @@ SANDBOX_FORBIDDEN_IDENTIFIERS: tuple[str, ...] = (
 
 _IMPORT_RE = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", re.MULTILINE)
 
+# 递归扫描的深度上限。参数快照来自模型，可能深且宽；限制深度使扫描成本
+# 有界，同时覆盖现实中的嵌套参数结构（如报告 sections）。
+_MAX_SCAN_DEPTH = 8
+
 
 @dataclass(frozen=True, slots=True)
 class RuleHit:
@@ -59,28 +63,53 @@ class RuleHit:
         return f"命中了第 {self.rule_index} 条规则：{self.pattern}（位置：{self.where}）"
 
 
-def scan_text(text: str, *, where: str = "code") -> RuleHit | None:
-    """把拒绝模式应用于一段文本。"""
-    for index, pattern in enumerate(DEFAULT_DENY_PATTERNS, start=1):
+def scan_text(
+    text: str, *, where: str = "code", patterns: tuple[str, ...] | None = None
+) -> RuleHit | None:
+    """把拒绝模式应用于一段文本。
+
+    ``patterns`` 为 None 时使用内置默认集；运维可传入自定义集覆盖它
+    （见 ``PermissionGate`` 的 ``deny_patterns``）。
+    """
+    for index, pattern in enumerate(patterns or DEFAULT_DENY_PATTERNS, start=1):
         if re.search(pattern, text, re.IGNORECASE):
             return RuleHit(rule_index=index, pattern=pattern, where=where)
     return None
 
 
-def scan_args(args: dict) -> RuleHit | None:
-    """把拒绝模式应用于参数快照中的每一个值。"""
-    for value in args.values():
-        if isinstance(value, str):
-            hit = scan_text(value, where="args")
+def scan_value(
+    value, *, where: str = "args", patterns: tuple[str, ...] | None = None, depth: int = 0
+) -> RuleHit | None:
+    """递归扫描任意参数值。
+
+    嵌套必须被遍历：``write_report`` 的 ``sections`` 是 list[dict]，
+    只扫顶层字符串会让注入把交易意图藏在内层对象里逃过检查。
+    深度设上限，避免被深层/自引用结构拖住。
+    """
+    if depth > _MAX_SCAN_DEPTH:
+        return None
+    if isinstance(value, str):
+        return scan_text(value, where=where, patterns=patterns)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            hit = scan_text(str(key), where=where, patterns=patterns)
             if hit is not None:
                 return hit
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                if isinstance(item, str):
-                    hit = scan_text(item, where="args")
-                    if hit is not None:
-                        return hit
+            hit = scan_value(item, where=where, patterns=patterns, depth=depth + 1)
+            if hit is not None:
+                return hit
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            hit = scan_value(item, where=where, patterns=patterns, depth=depth + 1)
+            if hit is not None:
+                return hit
     return None
+
+
+def scan_args(args: dict, *, patterns: tuple[str, ...] | None = None) -> RuleHit | None:
+    """把拒绝模式应用于参数快照中的每一个值（含嵌套结构）。"""
+    return scan_value(args, where="args", patterns=patterns)
 
 
 def scan_sandbox(code: str) -> RuleHit | None:

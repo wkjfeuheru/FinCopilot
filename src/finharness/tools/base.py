@@ -9,45 +9,35 @@ from __future__ import annotations
 
 import re
 from abc import ABC
-from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import pandas as pd
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 
+from finharness.context.tokens import CHARS_PER_TOKEN
 from finharness.data.access import DataAccess, DataUnavailableError
 from finharness.data.raw import RawData
+from finharness.tools.budget import (
+    FULL_DETAIL_MULTIPLIER,
+    resolve_result_budget,
+)
+from finharness.tools.declare import (
+    PermissionLevel,
+    ToolGroup,
+    ToolSpec,
+)
 from finharness.types import ToolResult
 
 MAX_RENDER_ROWS = 20
 MAX_RENDER_COLS = 12
-# ``detail="full"`` 时渲染预算放大的倍数。它是一个有界倍数而非无界：目的是让
-# 调用方已在使用的工具就能回答“再多给点”，而不是另设一个工具重读已取数据。
-# 即使是 ``full`` 也仍在上下文的 token 约束之内。
-FULL_DETAIL_MULTIPLIER = 4
 # 结果被截断时告知阅读者该怎么做。它必须给出真实可执行的下一步：
 # 一个载荷被裁剪的工具自身就能提供更宽的视图。
 FULL_DETAIL_HINT = '需要更多行列：用本工具 detail="full" 重取（数据已缓存，属复用不重复取数）'
 # 当一次取数由本地缓存而非网络提供时前置。这样“是否重复取数？”就能从工具结果本身得到答案。
 CACHE_HIT_NOTE = "数据来源：缓存命中（同一请求此前已取，未重复取数）"
-
-
-class DataInput(BaseModel):
-    """数据获取类工具共享的输入。
-
-    ``detail`` 是**同一次取数的展示策略**，而非另一种能力：同一次调用既可用于摘要
-    也可用于更完整的视图。把它建模为参数——而不是另设一个重读缓存载荷的工具——
-    正是让“读取数据”保持为一种能力、并只有一处地方可索要更多。
-    """
-
-    detail: Literal["summary", "full"] = Field(
-        default="summary",
-        description=(
-            "返回详细程度：summary（默认，摘要+近期明细）或 "
-            'full（更多行列，数据已缓存不重复取数）'
-        ),
-    )
+# 展示策略参数的名字。它由 ``run`` 从参数中摘下并交给渲染器，工具主体不收它（见 declare.py）。
+DETAIL_PARAM = "detail"
 # 截断说明在省略前最多列出多少个被省略的列名。
 _MAX_NAMED_DROPPED_COLUMNS = 6
 # 财务数据框每个报告期一列，形如 ``YYYYMMDD``；年度列（``YYYY1231``）会被优先列出、
@@ -59,31 +49,31 @@ _ANNUAL_PERIOD_RE = re.compile(r"^\d{4}1231$")
 _SHARED_COUNTER = None
 
 
-class PermissionLevel(str, Enum):
-    READ = "read"
-    WRITE = "write"
-
-
-class ToolGroup(str, Enum):
-    FIN_DATA = "金融-数据"
-    FIN_CALC = "金融-计算"
-    FIN_OUTPUT = "金融-输出"
-    GENERIC = "通用"
-    META = "元"
-
-
 class BaseTool(ABC):
-    """声明 schema（经由 ``input_model``）、执行取数、渲染输出。"""
+    """执行取数、渲染输出；元数据与参数由其 ``@tool`` 声明给出。
+
+    类属性是同名 ``ToolSpec`` 字段的投影（由 ``@tool`` 在装饰时写入）。权限链与子代理
+    子集的谓词推导在**类**上读它们，因此需要真实属性而非 ``property``——在类上访问
+    ``property`` 只会拿到描述符对象本身。
+    """
 
     name: str = "tool"
     description: str = ""
     input_model: type[BaseModel] = BaseModel
-    permission: PermissionLevel = PermissionLevel.READ
+    capability: Any = None
+    tier: Any = None
     group: ToolGroup = ToolGroup.GENERIC
+    permission: PermissionLevel = PermissionLevel.READ
     # ``None`` 表示继承 settings.tools.timeout_default_s；仅当该接口需要不同预算时
     # 才声明具体值（docs 03.4.1 超时列）。
     timeout: int | None = None
+    # 单条结果的 token 预算；``None`` 表示继承 context.max_result_tokens。与 ``timeout``
+    # 对称：一次报价只需百来个 token，一份研报或一份长文档的读取则需要数万，让所有工具
+    # 共用一个数字必然要么浪费要么不够（docs 03.3.3）。
+    result_tokens: int | None = None
     output_schema_note: str = ""
+    # 本工具是否消费 ``detail`` 展示策略（``@tool(data_tool=True)``）。
+    data_tool = False
     # 需要用户回复的工具声明此项；由循环注入该可调用对象。
     needs_interactive = False
     interactive = None
@@ -92,6 +82,12 @@ class BaseTool(ABC):
     # 而工具永远看不到它（docs 03.10）。
     needs_coordinator = False
     coordinator = None
+    # 长时间运行的工具体需要向用户报告中间进展（如横截面回测逐只取数）时声明此项；
+    # 由循环注入一个异步回调 ``progress(payload) -> None``。这是必要的而非装饰：服务端
+    # 心跳是 SSE 注释帧，客户端的空闲看门狗只在收到真实事件时才重置，因此一个静默数分钟
+    # 的工具会让界面在"运行中"被看门狗掐断（docs 03.12）。
+    needs_progress = False
+    progress: Any = None
     # 只读复核子代理是否可以调用本工具。大多数只读工具符合条件；联网工具主动退出，
     # 因为一旦复核开始搜索互联网，就会消耗 token 并把不可信文本拉入复核者，毫无收益——
     # 它的职责是拿报告与会话自身的数据做核对。
@@ -100,8 +96,19 @@ class BaseTool(ABC):
     def __init__(self, data: DataAccess, *, ctx: Any | None = None, registry: Any | None = None) -> None:
         self.data = data
         self.ctx = ctx
-        # 元工具（search_tools / load_tool）会检视并激活目录。
+        # 元工具会检视并激活目录（search_tools）。
         self.registry = registry
+
+    @property
+    def spec(self) -> ToolSpec:
+        """本工具的声明。
+
+        取不到说明该类未经 ``@tool`` 装饰——那是声明缺陷，在构造/使用点直接失败，
+        而不是让工具带着空能力与空参数字段继续跑。
+        """
+        from finharness.tools.declare import declared
+
+        return declared(type(self).name)
 
     # -- 执行 ------------------------------------------------------------
     async def _dispatch(self, **kwargs: Any) -> RawData:
@@ -121,12 +128,10 @@ class BaseTool(ABC):
         # ``detail`` 是展示策略而非分发参数：工具主体不接收它，因此在这里把它
         # 抽离出来并挂到结果上交给渲染器。集中处理可避免每个数据工具各自重新实现
         # （或错误实现）同一套宽度开关。
-        is_data_tool = isinstance(self.input_model, type) and issubclass(
-            self.input_model, DataInput
-        )
+        is_data_tool = bool(type(self).data_tool)
         detail = "summary"
         if is_data_tool:
-            detail = str(params.pop("detail", "summary") or "summary")
+            detail = str(params.pop(DETAIL_PARAM, "summary") or "summary")
         # 先绑定处理器：直接在调用表达式中解包会触发钩子 docstring 中提到的同一静态规则。
         handler = self._dispatch
         try:
@@ -161,20 +166,35 @@ class BaseTool(ABC):
 
     @staticmethod
     def _with_provenance_note(raw: RawData, content: str) -> str:
-        """让缓存命中在模型所读的结果中可见。
+        """让缓存命中与数据时效在模型所读的结果中可见。
 
         ``from_cache`` 过去只在报告附录中出现，因此模型在关键时刻无法分辨复用了缓存
         还是重新取数。在结果顶部加一行，才能让“不要重复取数”变得可验证，
         而不是寄望于模型行为。
+
+        数据时效（各序列的最新数据期、发布机构与节奏、抓取时刻）出于同样的理由前置：
+        用户问「最新」而回答落在上一期时，模型必须能区分「该指标按月发布、当期尚未
+        发布」与「系统给的是旧数据」——没有这行它只能猜。
         """
-        if not getattr(raw, "from_cache", False) or not content:
+        if not content:
             return content
-        return CACHE_HIT_NOTE + "\n" + content
+        blocks: list[str] = []
+        if getattr(raw, "from_cache", False):
+            blocks.append(CACHE_HIT_NOTE)
+        freshness = getattr(raw, "freshness", None)
+        if freshness:
+            note = freshness.note()
+            if note:
+                blocks.append(note)
+        if not blocks:
+            return content
+        return "\n".join(blocks) + "\n" + content
 
     def _validate(self, kwargs: dict[str, Any]) -> dict[str, Any]:
-        if self.input_model is BaseModel:
+        model = type(self).input_model
+        if model is BaseModel or not isinstance(model, type):
             return dict(kwargs)
-        return self.input_model.model_validate(kwargs).model_dump(exclude_none=True)
+        return model.model_validate(kwargs).model_dump(exclude_none=True)
 
     # -- 渲染 ------------------------------------------------------------
     def render(self, raw: RawData) -> tuple[str, list[RawData]]:
@@ -241,6 +261,94 @@ class BaseTool(ABC):
         )
         return body + ("\n" + note if note else "")
 
+    def trim_dataframe_grouped(
+        self,
+        df: pd.DataFrame | None,
+        *,
+        group_col: str,
+        per_group_rows: int,
+        source_path: str | None = None,
+        detail: str = "summary",
+    ) -> str:
+        """按分组均匀分配行预算地渲染 markdown 视图。
+
+        ``trim_dataframe`` 对整个数据框做一次 ``head()``。当数据框是若干频率不同的
+        长表纵向堆叠时（宏观指标就是如此：日频的国债收益率与月频的 PMI 同表，
+        每行带 ``indicator``），整体 ``head()`` 会被行数最多的那条序列占满，其余
+        序列**一行都进不了模型**——模型于是只能报告「未展开历史序列」，而数据其实
+        就在手上。按分组各自取最近若干行，才能保证每个指标都可见。
+
+        每个分组的省略量各自如实报告，使「这条序列只有这么长」与「这条被裁掉了」
+        能分辨。
+        """
+        if df is None or not len(df):
+            return "（无数据）"
+        if group_col not in df.columns:
+            return self.trim_dataframe(df, source_path=source_path, detail=detail)
+
+        budget = self._result_token_budget(detail=detail)
+        groups = [(group, block) for group, block in df.groupby(group_col, sort=False)]
+        if not groups:
+            return "（无数据）"
+
+        ordered = self._column_display_order(df)
+        column_cap = (
+            MAX_RENDER_COLS * FULL_DETAIL_MULTIPLIER
+            if detail == "full"
+            else MAX_RENDER_COLS
+        )
+
+        # 先压缩每组的行数，再考虑丢列。长表的所有列都是有效信息（日期/指标/数值/单位），
+        # 靠丢列去满足预算会留下一个只剩日期的表——所以行是可牺牲的一方。
+        chosen_rows = 1
+        shown_limit = min(len(ordered), column_cap)
+        body = ""
+        for candidate_rows in range(per_group_rows, 0, -1):
+            view = pd.concat(
+                [block.head(candidate_rows) for _, block in groups], ignore_index=True
+            )
+            candidate = view[ordered[:shown_limit]].to_markdown(index=False)
+            if self._count_tokens(candidate) <= budget:
+                chosen_rows, body = candidate_rows, candidate
+                break
+        else:
+            # 每组一行仍超预算（列极其宽）：退回按列裁剪。
+            view = pd.concat([block.head(1) for _, block in groups], ignore_index=True)
+            limit = shown_limit
+            while limit >= 1:
+                candidate = view[ordered[:limit]].to_markdown(index=False)
+                if self._count_tokens(candidate) <= budget or limit == 1:
+                    body, chosen_rows, shown_limit = candidate, 1, limit
+                    break
+                limit -= 1
+
+        dropped_columns = [str(c) for c in df.columns if c not in set(map(str, ordered[:shown_limit]))]
+
+        omitted = [
+            (str(group), len(block) - min(chosen_rows, len(block)))
+            for group, block in groups
+            if len(block) > chosen_rows
+        ]
+        parts: list[str] = []
+        if dropped_columns:
+            named = "、".join(dropped_columns[:_MAX_NAMED_DROPPED_COLUMNS])
+            more = len(dropped_columns) - _MAX_NAMED_DROPPED_COLUMNS
+            parts.append(
+                f"已省略列：{named}" + (f" 等 {len(dropped_columns)} 列" if more > 0 else "")
+            )
+        if omitted:
+            detail_bits = "、".join(f"{name} {count} 行" for name, count in omitted)
+            parts.append(f"每组仅展示最近 {chosen_rows} 期，已省略：{detail_bits}")
+        if not parts:
+            return body
+        tail = FULL_DETAIL_HINT if detail != "full" else "已按 detail=full 展示，仍超出预算"
+        if source_path:
+            resolved = Path(source_path)
+            if not resolved.is_absolute():
+                resolved = resolved.resolve()
+            tail = f"{tail}（来源 {resolved}）"
+        return body + "\n（" + "；".join(parts) + "。" + tail + "）"
+
     @staticmethod
     def _column_display_order(df: pd.DataFrame) -> list[str]:
         """把年度报告期列排在前面，其余按数据框原顺序排列。
@@ -287,11 +395,17 @@ class BaseTool(ABC):
         return "（" + "；".join(parts) + "。" + tail + "）"
 
     def _result_token_budget(self, *, detail: str = "summary") -> int:
-        settings = getattr(self.data, "settings", None)
-        if settings is None:
-            return 0  # 未知预算：保持渲染后的数据框原样
-        budget = int(settings.context.max_result_tokens)
-        return budget * FULL_DETAIL_MULTIPLIER if detail == "full" else budget
+        """本工具结果可用的 token 预算，由 :mod:`finharness.tools.budget` 单点解析。
+
+        渲染侧与引擎侧读同一个数字，因此 ``detail="full"`` 的放大不会被引擎的裁剪
+        再收回去（那曾使这个逃生口半失效）。
+        """
+        return resolve_result_budget(
+            settings=getattr(self.data, "settings", None),
+            tool_name=self.name,
+            tool=self,
+            detail=detail,
+        )
 
     @staticmethod
     def _count_tokens(text: str) -> int:
@@ -304,7 +418,7 @@ class BaseTool(ABC):
                 _SHARED_COUNTER = TokenCounter()
             return _SHARED_COUNTER.count(text).tokens
         except Exception:  # noqa: BLE001
-            return int(len(text) / 1.7)
+            return int(len(text) / CHARS_PER_TOKEN)
 
     def _max_rows(self, *, detail: str = "summary") -> int:
         """行数预算取自 settings.context.trim_rows，缺失时回退到默认值。"""

@@ -6,28 +6,51 @@ import pytest
 from finharness.tools.base import ToolGroup
 from finharness.tools.capabilities import (
     RESEARCH_CAPABILITIES,
-    TOOL_CAPABILITY,
     Capability,
     UnknownCapabilityError,
     capabilities_of,
     capability_of,
     is_research_capability,
 )
+from finharness.tools.declare import DECLARED_TOOLS
 from finharness.tools.registry import ALL_TOOL_CLASSES
 
 
 def test_every_registered_tool_has_a_capability():
-    """新增 tool 却无 capability = 映射已过期，这正是先前硬编码
-    白名单腐坏的方式。改为大声失败。"""
+    """每个已注册工具都必须带一条声明。
+
+    覆盖门禁的形态变了、目的没变：过去是"新工具必须在 ``TOOL_CAPABILITY`` 里多写一行"，
+    现在是"新工具必须经 ``@tool`` 声明 capability"。漏声明的工具会在导入期失败，而这条
+    断言守着另一头——注册表里的类必须真的被声明过。
+    """
     registered = {cls.name for cls in ALL_TOOL_CLASSES}
-    missing = registered - set(TOOL_CAPABILITY)
-    assert not missing, f"工具缺少能力映射：{sorted(missing)}"
+    missing = registered - set(DECLARED_TOOLS)
+    assert not missing, f"工具缺少声明：{sorted(missing)}"
 
 
-def test_capability_map_has_no_stale_entries():
-    registered = {cls.name for cls in ALL_TOOL_CLASSES}
-    extra = set(TOOL_CAPABILITY) - registered
-    assert not extra, f"能力映射引用了不存在的工具：{sorted(extra)}"
+def test_every_class_declares_under_its_own_name():
+    """类名与声明名必须一致。
+
+    这条取代了旧的"映射表没有过期条目"：那份手工映射已经不存在了（声明与类同处一地，
+    不可能各自漂移），剩下来真正会出错的是**两者写得不一致**——``@tool(name=...)`` 与类
+    的注册名不同，会让 ``DECLARED_TOOLS`` 与 ``ALL_TOOL_CLASSES`` 各说一套。
+    """
+    for cls in ALL_TOOL_CLASSES:
+        spec = getattr(cls, "__tool_spec__", None)
+        assert spec is not None, f"{cls.__name__} 未经 @tool 声明"
+        assert spec.name == cls.name, f"{cls.__name__}: 声明名 {spec.name} != 类名 {cls.name}"
+        assert DECLARED_TOOLS[cls.name] is spec, cls.name
+
+
+def test_no_two_classes_share_a_declared_name():
+    names = [cls.name for cls in ALL_TOOL_CLASSES]
+    assert len(names) == len(set(names)), "工具名重复会让注册表静默覆盖其中一个"
+
+
+def test_every_declared_capability_is_an_enum_member():
+    """声明里的 capability 必须是枚举成员，而不是恰好同名的字符串。"""
+    for name, spec in DECLARED_TOOLS.items():
+        assert isinstance(spec.capability, Capability), name
 
 
 def test_announcements_and_news_are_different_capabilities():
@@ -53,7 +76,7 @@ def test_macro_and_industry_are_distinct():
 
 def test_research_capabilities_exclude_process_and_presentation():
     for name in ("make_chart", "write_report", "read_file", "web_search",
-                 "load_skill", "research_plan"):
+                 "search_tools", "research_plan"):
         assert not is_research_capability(capability_of(name)), name
 
 

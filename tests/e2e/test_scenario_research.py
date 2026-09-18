@@ -77,8 +77,8 @@ def _build_loop(tmp_path, *, answer_ask: bool = False) -> AgentLoop:
 
     return AgentLoop(
         provider=provider,
-        # 必须把 ctx 接入 registry——load_skill 正是在那里记录已加载的
-        # scenario；生产服务器也这么做。
+        # 必须把 ctx 接入 registry 与循环——方法论正文注入到 ctx，
+        # 由状态块渲染给模型；生产服务器也这么做。
         registry=ToolRegistry(data, ctx=ctx, settings=settings),
         settings=settings,
         system=SYSTEM_PROMPT,

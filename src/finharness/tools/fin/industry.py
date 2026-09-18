@@ -8,29 +8,26 @@
 
 from __future__ import annotations
 
-from pydantic import Field
-
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, DataInput, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 
-class IndustryPerfInput(DataInput):
-    industry: str | None = Field(
-        default=None,
-        description="申万一级行业名或代码，如 白酒/电子/801010；省略则返回申万一级行业总览（估值横向对比）",
-    )
-    years: int = Field(default=1, description="回溯年数")
-
-
+@tool(
+    name="get_industry_perf",
+    description="查询申万行业指数表现：给定行业返回其指数历史行情，省略行业返回申万一级行业总览（含估值）。",
+    capability=Capability.INDUSTRY,
+    group=ToolGroup.FIN_DATA,
+    timeout=60,
+    data_tool=True,
+    output_schema_note="返回行业指数的区间摘要与近期明细，或一级行业总览表。",
+)
 class GetIndustryPerfTool(BaseTool):
-    name = "get_industry_perf"
-    description = "查询申万行业指数表现：给定行业返回其指数历史行情，省略行业返回申万一级行业总览（含估值）。"
-    input_model = IndustryPerfInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.FIN_DATA
-    timeout = 60
-    output_schema_note = "返回行业指数的区间摘要与近期明细，或一级行业总览表。"
-
+    @param(
+        "industry",
+        desc="申万一级行业名或代码，如 白酒/电子/801010；省略则返回申万一级行业总览（估值横向对比）",
+    )
+    @param("years", desc="回溯年数")
     async def _dispatch(self, *, industry: str | None = None, years: int = 1) -> RawData:
         return await self.data.industry_perf(industry, years=years)
 
@@ -61,18 +58,16 @@ class GetIndustryPerfTool(BaseTool):
         return "\n".join(lines) + "\n\n近期明细：\n" + detail, [raw]
 
 
-class IndustryConsInput(DataInput):
-    industry: str = Field(description="申万一级行业名或代码，如 白酒/电子/801010")
-
-
+@tool(
+    name="get_industry_constituents",
+    description="查询申万行业成分股（代码与名称），可作为横截面因子研究的股票池来源。",
+    capability=Capability.INDUSTRY,
+    group=ToolGroup.FIN_DATA,
+    timeout=60,
+    data_tool=True,
+    output_schema_note="返回成分股列表（证券代码/证券名称/权重）。",
+)
 class GetIndustryConstituentsTool(BaseTool):
-    name = "get_industry_constituents"
-    description = "查询申万行业成分股（代码与名称），可作为横截面因子研究的股票池来源。"
-    input_model = IndustryConsInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.FIN_DATA
-    timeout = 60
-    output_schema_note = "返回成分股列表（证券代码/证券名称/权重）。"
-
+    @param("industry", desc="申万一级行业名或代码，如 白酒/电子/801010")
     async def _dispatch(self, *, industry: str) -> RawData:
         return await self.data.industry_constituents(industry)

@@ -4,31 +4,32 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from pydantic import Field
-
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, DataInput, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 
 
 def _default_since() -> str:
     return (date.today() - timedelta(days=180)).isoformat()
 
 
-class AnnouncementsInput(DataInput):
-    symbol: str = Field(description="6位A股代码")
-    since: str = Field(
-        default_factory=_default_since, description="起始日期 YYYY-MM-DD，默认近半年"
-    )
-    top_n: int = Field(default=20, description="返回条数")
-
-
+@tool(
+    name="get_announcements",
+    description="查询A股公司公告（定期报告、临时公告等）。",
+    capability=Capability.ANNOUNCEMENT,
+    # 大多数金融问题从不需要公告全文，而其 schema 每轮都要重发，故按需注入。
+    tier=Tier.LAZY,
+    group=ToolGroup.FIN_DATA,
+    timeout=60,
+    data_tool=True,
+)
 class GetAnnouncementsTool(BaseTool):
-    name = "get_announcements"
-    description = "查询A股公司公告（定期报告、临时公告等）。"
-    input_model = AnnouncementsInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.FIN_DATA
-    timeout = 60
-
+    @param("symbol", desc="6位A股代码")
+    @param(
+        "since",
+        desc="起始日期 YYYY-MM-DD，默认近半年",
+        default_factory=_default_since,
+    )
+    @param("top_n", desc="返回条数")
     async def _dispatch(self, *, symbol: str, since: str, top_n: int = 20) -> RawData:
         return await self.data.announcements(symbol, since=since, top_n=top_n)

@@ -139,3 +139,66 @@ def test_a_real_loop_reviews_the_report_it_wrote(tmp_path):
     assert snapshot.per_agent["risk"]["input_tokens"] == 9
     assert snapshot.per_agent["risk"]["output_tokens"] == 5
     assert snapshot.per_agent["risk"]["runs"] == 1
+
+
+def test_a_high_severity_finding_is_carried_into_the_session_state(tmp_path):
+    """端到端：解析出的高严重度问题必须落进 ctx，并在后续轮次持续可见（docs 03.10.7）。
+
+    这正是"严重问题必须让主 Agent 改"的结构性落点——不是提示词里的一句期望，
+    而是一份挂在会话状态上、模型在之后每一轮都读得到的未结事项。
+    """
+    settings = make_settings(tmp_path)
+    provider = RoleBranchingProvider(
+        [
+            [
+                message_end(
+                    ToolUse(
+                        "call_report",
+                        "write_report",
+                        {
+                            "topic": "集成测试研报",
+                            "core_view": ["观点 {cite:cit_000001}"],
+                            "sections": [
+                                {
+                                    "heading": "章节",
+                                    "body": "正文 {cite:cit_000001}",
+                                    "cids": ["cit_000001"],
+                                }
+                            ],
+                            "risks": ["风险一"],
+                        },
+                    )
+                )
+            ],
+            text_round("报告已完成"),
+        ],
+        review_text="### [高] 营收数字缺引用\n- 位置：财务摘要",
+    )
+    data = DataAccess([], settings=settings)
+    cite = CitationRegistry()
+    cite.register(
+        tool="get_quote", endpoint="fake", symbol="600519", params={},
+        rows=1, cols=1, fingerprint="fp",
+    )
+    ctx = ResearchContext(cite=cite, settings=settings)
+    loop = AgentLoop(
+        provider=provider,
+        registry=ToolRegistry(data, ctx=ctx, settings=settings),
+        settings=settings,
+        system=system_prompt(),
+        cite=cite,
+        ctx=ctx,
+        gate=PermissionGate(settings=settings),
+    )
+
+    outcome = asyncio.run(loop.run("请出一份集成测试研报"))
+
+    assert outcome.succeeded is True, outcome.error
+    # 未结事项按主题记账，且下一轮的状态块会把它带着走。
+    assert "集成测试研报" in ctx.review_findings
+    assert "[高] 营收数字缺引用" in ctx.review_findings["集成测试研报"]
+    block = ctx.state_block()
+    assert "未消解的风险终审问题" in block
+    assert "不得声称已复核" in block
+    # sidecar 仍然落盘（取证与闩锁），但它不是交付物。
+    assert list(Path(settings.paths.output_dir).glob("*.review.md"))

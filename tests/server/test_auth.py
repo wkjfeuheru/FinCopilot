@@ -14,8 +14,8 @@ def make_client(tmp_path, **overrides) -> TestClient:
         data={"cache_dir": tmp_path / "cache"},
         paths={
             "output_dir": tmp_path / "output",
-            "memory_db": tmp_path / "cache" / "memory.db",
-            "auth_db": tmp_path / "cache" / "users.db",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
         },
         **overrides,
     )
@@ -36,7 +36,7 @@ def test_register_returns_a_token_and_the_user_identity(tmp_path):
     assert body["user"]["username"] == "alice"
     assert body["user"]["id"].startswith("u_")
     assert body["token"].startswith("t_")
-    # 口令哈希绝不能出现在响应里。
+    # 密码哈希绝不能出现在响应里。
     assert "password" not in response.text
     assert "pbkdf2" not in response.text
 
@@ -73,7 +73,7 @@ def test_short_password_is_rejected(tmp_path):
     )
 
     assert response.status_code == 422
-    assert "口令" in response.json()["detail"]
+    assert "密码" in response.json()["detail"]
 
 
 def test_too_short_username_is_rejected(tmp_path):
@@ -91,8 +91,8 @@ def test_registration_can_be_disabled(tmp_path):
         data={"cache_dir": tmp_path / "cache"},
         paths={
             "output_dir": tmp_path / "output",
-            "memory_db": tmp_path / "cache" / "memory.db",
-            "auth_db": tmp_path / "cache" / "users.db",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
         },
         auth=AuthSettings(allow_register=False),
     )
@@ -134,7 +134,7 @@ def test_login_with_a_wrong_password_is_a_401(tmp_path):
 
 
 def test_login_for_an_unknown_user_is_also_a_401(tmp_path):
-    """不得让未知用户与错误口令可区分，否则可枚举用户名。"""
+    """不得让未知用户与错误密码可区分，否则可枚举用户名。"""
     client = make_client(tmp_path)
 
     response = client.post(
@@ -224,7 +224,7 @@ def test_health_stays_open(tmp_path):
 
 
 def test_strong_hashes_are_stored_not_plaintext(tmp_path):
-    """库文件泄露时口令不能直接可读。"""
+    """库文件泄露时密码不能直接可读。"""
     client = make_client(tmp_path)
     register_and_login(client, "alice", password="secret-pass-1")
 

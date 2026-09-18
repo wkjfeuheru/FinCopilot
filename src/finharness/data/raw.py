@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from finharness.data.freshness import Freshness
+
 
 @dataclass(slots=True)
 class RawData:
@@ -25,6 +27,11 @@ class RawData:
     from_cache: bool = False
     cache_key: str | None = None
     parquet_path: str | None = None
+    # 数据被取回的时刻（缓存命中时为写缓存的时刻）。与 ``data_date`` 相对：后者是
+    # 数据自身的期数，前者是这份数据何时进入本地，两者一起才说清「多旧」。
+    fetched_at: str | None = None
+    # 各序列的最新数据期与来源属性；由数据工具在渲染前挂上（见 data/freshness.py）。
+    freshness: Freshness | None = None
     # 工具声明的可观测性载荷（例如审查结果），随结果一同携带
     # 供钩子使用。从不渲染，也从不发送给服务提供方。
     metadata: dict[str, Any] = field(default_factory=dict)

@@ -12,8 +12,6 @@ build/
 node_modules/
 frontend/dist/
 *.tsbuildinfo
-frontend/vite.config.js
-frontend/vite.config.d.ts
 .env
 .env.*
 !.env.example
@@ -24,6 +22,12 @@ data_cache/*
 # Settings is built without a file, so a stray data_cache can appear in any
 # subdirectory (e.g. frontend/). Ignore it wherever it lands.
 **/data_cache/
+# state/ holds the Fernet master key, the user/token database and the encrypted
+# provider-config store (docs 03.13). It must never be committed: it is the
+# agent-unreachable directory by design (see docs 生产环境隔离与多租户加固方案.md).
+state/*
+!state/.gitkeep
+**/state/
 logs/*
 !logs/.gitkeep
 output/*
@@ -36,4 +40,5 @@ evals/runs/
 .zcode/
 # Workflow-tool scratch output (task reports, cached runs); not project content.
 .superpowers/
+.superdesign/tmp/
 .workbuddy/

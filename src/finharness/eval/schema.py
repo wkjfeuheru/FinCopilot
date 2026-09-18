@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 
 class SchemaError(ValueError):
@@ -133,6 +133,18 @@ class TurnCase(_Model):
     expect: Expect = Field(default_factory=Expect)
 
 
+class ChatCase(_Model):
+    """多对话用例中的一个对话：一组轮次 + 可选的固定 conversation_id。
+
+    ``conversation_id`` 省略时由 runner 按用例 id 与序号生成。多个对话共享
+    同一 store 与 user_id，因此它们之间的长期记忆是可见的——这正是
+    "跨对话记忆"用例得以表达的方式。
+    """
+
+    conversation_id: str | None = None
+    turns: list[TurnCase] = Field(min_length=1)
+
+
 class EvalCase(_Model):
     id: str
     title: str = ""
@@ -142,8 +154,42 @@ class EvalCase(_Model):
     # 标记规则无法完全判定的标准（后续交由 LLM 裁判处理）。
     judge: Literal["none", "todo"] = "none"
     notes: str = ""
-    turns: list[TurnCase] = Field(min_length=1)
+    # 单对话用例的简写形式：等价于只有一个 chat。
+    turns: list[TurnCase] = Field(default_factory=list)
+    # 多对话用例（跨对话记忆）：各对话依次运行，共享 store 与 user_id。
+    chats: list[ChatCase] = Field(default_factory=list)
+    # 多对话用例中，每个对话结束后是否同步跑一次蒸馏，使后续对话能召回
+    # decision/excerpt 情节。task_result 情节每轮已由引擎写入，不依赖它；
+    # 因此即使蒸馏失败（如离线自检 provider 不产出 JSON），跨对话召回仍成立。
+    distill_between_chats: bool = True
     budget: Budget = Field(default_factory=Budget)
+
+    @model_validator(mode="after")
+    def _exactly_one_form(self) -> "EvalCase":
+        if self.turns and self.chats:
+            raise ValueError("turns 与 chats 只能提供其一")
+        if not self.turns and not self.chats:
+            raise ValueError("用例必须提供 turns 或 chats 之一")
+        return self
+
+    def conversation_groups(self) -> list[tuple[str | None, list[TurnCase]]]:
+        """规整为 ``[(conversation_id | None, turns), ...]``。
+
+        单对话形式返回 ``[(None, turns)]``：由 runner 决定用哪个 id（沿用
+        既有的"以用例 id 为键"行为，使旧用例的记忆表现完全不变）。
+        """
+        if self.chats:
+            return [(chat.conversation_id, list(chat.turns)) for chat in self.chats]
+        return [(None, list(self.turns))]
+
+    @property
+    def all_turns(self) -> list[TurnCase]:
+        """按执行顺序扁平化的全部轮次（断言与评分读它，两种形式通吃）。
+
+        多对话用例的断言写在 ``chats[*].turns`` 上，而评分器逐轮比对
+        ``run.turns``；扁平化后两者的索引一一对应。
+        """
+        return [turn for _cid, turns in self.conversation_groups() for turn in turns]
 
 
 def _as_list(payload: Any, *, where: str) -> list[dict]:
@@ -203,6 +249,7 @@ __all__ = [
     "AnswerExpect",
     "ArtifactExpect",
     "Budget",
+    "ChatCase",
     "CitationExpect",
     "EvalCase",
     "Expect",

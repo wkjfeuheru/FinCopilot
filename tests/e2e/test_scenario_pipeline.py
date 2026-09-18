@@ -26,7 +26,7 @@ from finharness.tools.fin.charting import FontUnavailableError, resolve_cjk_font
 from finharness.tools.fin.backtest import RunBacktestTool
 from finharness.tools.fin.chart import MakeChartTool
 from finharness.tools.fin.macro import GetMacroIndicatorsTool
-from finharness.tools.meta.skills import LoadSkillTool
+from finharness.tools.meta.skills import SkillRegistry
 from finharness.tools.registry import ToolRegistry
 
 
@@ -61,18 +61,24 @@ def _environment(tmp_path):
 
 
 def test_scenario_skill_loads_its_methodology_file(tmp_path):
-    """skill 的 references 可以按名称作为文件加载，而不仅是 flow。"""
-    settings, _cite, data, ctx = _environment(tmp_path)
-    tool = LoadSkillTool(data, ctx=ctx)
+    """skill 的 references 可以按名称作为文件加载，而不仅是 flow。
 
-    flow = asyncio.run(tool.run(name="quant-factor"))
-    ref = asyncio.run(
-        tool.run(name="quant-factor", file="references/single-series.md")
-    )
+    加载入口现在是路由层（引擎在请求构建前调用），而不是一个工具；被测的是同一份
+    ``SkillRegistry``，因此"按目标独立追踪"这一契约不变。
+    """
+    _settings, _cite, _data, ctx = _environment(tmp_path)
+    registry = SkillRegistry(Settings().paths.skills_dir)
 
-    assert flow.ok is True
-    assert ref.ok is True
-    assert "净值" in ref.content or "回测" in ref.content
+    async def run():
+        meta, flow, _ = registry.load("quant-factor")
+        _meta2, ref, _ = registry.load("quant-factor", file="references/single-series.md")
+        ctx.inject_methodology("quant-factor", flow)
+        ctx.inject_methodology("quant-factor/references/single-series.md", ref)
+        return flow, ref
+
+    flow, ref = asyncio.run(run())
+
+    assert "净值" in ref or "回测" in ref
     # 两个目标在会话中被独立追踪。
     assert ctx.loaded_skills == [
         "quant-factor",
@@ -174,5 +180,5 @@ def test_registry_exposes_the_new_tools_with_correct_tiers(tmp_path):
     assert "get_macro_indicators" in registry.resident_names()
     assert "get_industry_perf" in registry.resident_names()
     assert "get_industry_constituents" in registry.resident_names()
-    # backtest tool 只能通过懒加载激活路径解析。
+    # 懒加载工具同样可解析：激活只是何时注入 schema，不是能否触达。
     assert registry.resolve("run_backtest") is not None

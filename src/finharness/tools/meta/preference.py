@@ -9,25 +9,21 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
-
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 
-class RememberPreferenceInput(BaseModel):
-    key: str = Field(description="偏好名，简短稳定，如 report_style、preferred_period")
-    value: str = Field(description="偏好取值，如「简洁，少用表格」")
-
-
+@tool(
+    name="remember_preference",
+    description="记住用户在本次或以后对话中都适用的偏好（跨对话共享）。",
+    capability=Capability.META,
+    group=ToolGroup.META,
+    timeout=10,
+)
 class RememberPreferenceTool(BaseTool):
-    name = "remember_preference"
-    description = "记住用户在本次或以后对话中都适用的偏好（跨对话共享）。"
-    input_model = RememberPreferenceInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.META
-    timeout = 10
-
+    @param("key", desc="偏好名，简短稳定，如 report_style、preferred_period")
+    @param("value", desc="偏好取值，如「简洁，少用表格」")
     async def _dispatch(self, *, key: str, value: str) -> RawData:
         """把偏好写入全局存储；无存储时退化为仅当前会话生效。"""
         store = getattr(self.ctx, "store", None) if self.ctx is not None else None
@@ -44,6 +40,14 @@ class RememberPreferenceTool(BaseTool):
         user_id = getattr(self.ctx, "user_id", "") if self.ctx is not None else ""
         store.set_note(key, value, user_id=user_id, kind="preference")
         self.ctx.notes[key] = value
+        # 同步写入语义索引（docs 03.6.4 LTM）：偏好是可检索的语义记忆，
+        # 让它与蒸馏产出的事实共享同一套召回，而不是只活在注入区块里。
+        index = getattr(self.ctx, "semantic_index", None)
+        if index is not None and getattr(index, "enabled", False):
+            try:
+                index.index_fact(user_id=user_id, key=key)
+            except Exception:  # noqa: BLE001 - 向量写入失败不影响偏好本身
+                pass
         return RawData(
             kind="text",
             text=f"已记住偏好（对所有对话生效）：{key}={value}",

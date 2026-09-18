@@ -15,7 +15,7 @@ from finharness.data.access import DataAccess
 from finharness.data.citation import CitationRegistry
 from finharness.permissions.gate import PermissionGate
 from finharness.server.api import create_app
-from finharness.tools.fin.writer import ReportInput, WriteReportTool
+from finharness.tools.fin.writer import WriteReportTool
 from tests.server.conftest import authed_client
 
 
@@ -24,8 +24,8 @@ def _artifact_client(tmp_path):
     settings = Settings(
         paths={
             "output_dir": tmp_path / "output",
-            "memory_db": tmp_path / "cache" / "memory.db",
-            "auth_db": tmp_path / "cache" / "users.db",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
         },
         data={"cache_dir": tmp_path / "cache"},
     )
@@ -82,7 +82,7 @@ def test_artifact_endpoint_does_not_serve_another_users_artifacts(tmp_path):
 
 def test_write_report_takes_no_path_argument():
     """路径参数的缺失正是强制确认的原因；此处显式守护这一约束。"""
-    fields = set(ReportInput.model_fields)
+    fields = set(WriteReportTool.input_model.model_fields)
     assert "path" not in fields
     assert {"topic", "core_view", "sections", "risks"} <= fields
 
@@ -254,7 +254,9 @@ def test_write_report_runs_the_risk_review_and_returns_its_comments(tmp_path):
 
     assert result.ok is True, result.error
     assert len(coordinator.calls) == 1
-    assert "风险终审意见" in result.content
+    # 默认意见是 [高] 条目，因此首行是阻断式措辞，而非中性的“意见如下”。
+    assert "不得视为已完成" in result.content
+    assert "[高] 数字无来源" in result.content
     assert "数字无来源" in result.content
 
 
@@ -269,16 +271,19 @@ def test_review_receives_the_report_body_without_the_appendix(tmp_path):
     assert "## 附录" not in sent  # 引用表不属于复核材料
 
 
-def test_review_file_is_written_next_to_the_report(tmp_path):
+def test_review_file_is_written_next_to_the_report_but_is_not_an_artifact(tmp_path):
+    """终审 sidecar 是闩锁与取证，不是交付物：落盘，但不进 attachments（docs 03.10.7）。"""
     coordinator = FakeCoordinator()
     tool, cid = make_writer(tmp_path, coordinator=coordinator)
 
     result = run_write(tool, cid)
 
-    reviews = [p for p in result.attachments if p.endswith(".review.md")]
+    reviews = list(tmp_path.rglob("*.review.md"))
     assert len(reviews) == 1
-    assert Path(reviews[0]).is_file()
-    assert "数字无来源" in Path(reviews[0]).read_text(encoding="utf-8")
+    assert "数字无来源" in reviews[0].read_text(encoding="utf-8")
+    # 用户侧不该看到一份“第二报告”，因此它不出现在产出文件里。
+    assert not [p for p in result.attachments if p.endswith(".review.md")]
+    assert all(Path(p).is_file() for p in result.attachments)
 
 
 def test_write_report_survives_a_review_failure(tmp_path):

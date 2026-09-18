@@ -1,7 +1,14 @@
 {
   "compilerOptions": {
     "composite": true,
+    // vite.config.ts 只用于类型检查：不加 noEmit 时，tsc -b 会在它旁边
+    // 生成 vite.config.js，而 Vite 的配置查找顺序是 .js 优先于 .ts，
+    // 于是 npm run dev（不跑 tsc）会静默加载过期的 .js。
+    "noEmit": true,
     "skipLibCheck": true,
+    // vite.config.ts 里读取 process.env.FINHARNESS_API_ORIGIN，需要 Node 类型；
+    // 只在此处声明，避免把 Node 全局类型泄漏进前端源码的编译。
+    "types": ["node"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "allowSyntheticDefaultImports": true

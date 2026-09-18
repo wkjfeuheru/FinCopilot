@@ -72,6 +72,42 @@ def test_on_plan_round_reports_progress_without_drift():
     assert progress[0]["revision"] == 1
 
 
+def test_plan_progress_exposes_a_user_safe_step_ledger():
+    """客户端重放计划时需要步骤明细，但不能收到内部工具提示。"""
+    import asyncio
+
+    async def run():
+        sink = Sink()
+        tool = RecordingTool("get_quote", content="报价")
+        loop = build_loop(
+            ScriptedProvider(
+                [
+                    tool_round(ToolUse("call_1", "get_quote", {"symbol": "600519"})),
+                    text_round("答案"),
+                ]
+            ),
+            plan_steps=[
+                PlanStep(seq=1, action="核验估值口径", tool_hint=["get_quote"]),
+                PlanStep(seq=2, action="形成结论", dep=[1]),
+            ],
+            tools={"get_quote": tool},
+            sink=sink,
+        )
+        await loop.run("问题")
+        return sink.events, loop
+
+    events, loop = asyncio.run(run())
+    progress = plan_progress_events(events)[0]
+
+    assert progress["plan_id"] == loop.ctx.plan.plan_id
+    assert progress["goal"] == "研究任务"
+    assert progress["steps"] == [
+        {"seq": 1, "action": "核验估值口径", "status": "pending", "dep": []},
+        {"seq": 2, "action": "形成结论", "status": "pending", "dep": [1]},
+    ]
+    assert "tool_hint" not in progress["steps"][0]
+
+
 def test_a_tool_off_the_hint_list_is_not_a_deviation():
     """取数、读数据、画图——任何工具都是达成任务的手段。使用了
     计划恰好未提及的工具，并不是偏离目标。"""
@@ -301,7 +337,7 @@ def test_a_sibling_tool_of_the_same_capability_is_not_a_mismatch():
 
 
 def test_presentation_and_process_tools_never_mismatch():
-    """make_chart / load_skill 负责工作如何呈现与路由，而不是
+    """make_chart / search_tools 负责工作如何呈现与发现，而不是
     使用哪些证据——无论提示如何，它们都豁免。"""
     import asyncio
 
@@ -312,7 +348,7 @@ def test_presentation_and_process_tools_never_mismatch():
                 [
                     tool_round(
                         ToolUse("c1", "make_chart", {"title": "图"}),
-                        ToolUse("c2", "load_skill", {"name": "equity-research"}),
+                        ToolUse("c2", "search_tools", {"query": "公告"}),
                     ),
                     text_round("答案"),
                 ]
@@ -320,7 +356,7 @@ def test_presentation_and_process_tools_never_mismatch():
             plan_steps=[PlanStep(seq=1, action="查公告", tool_hint=["get_announcements"])],
             tools={
                 "make_chart": RecordingTool("make_chart"),
-                "load_skill": RecordingTool("load_skill"),
+                "search_tools": RecordingTool("search_tools"),
             },
             sink=sink,
         )
@@ -431,7 +467,16 @@ def test_done_payload_exposes_the_plan():
     events = asyncio.run(run())
     done = next(event for event in events if event.kind == "done")
 
-    assert done.data["plan"] == {"revision": 1, "done": 0, "total": 1}
+    assert done.data["plan"] == {
+        "plan_id": "plan_001",
+        "goal": "研究任务",
+        "revision": 1,
+        "done": 0,
+        "total": 1,
+        "steps": [
+            {"seq": 1, "action": "取行情", "status": "pending", "dep": []}
+        ],
+    }
 
 
 # --- 基于意图的范围判定（误报修复） -----------------------------------------

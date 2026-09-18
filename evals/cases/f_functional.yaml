@@ -84,7 +84,7 @@
   budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 8}
 
 - id: F3-01
-  title: 懒加载两段式激活（先 load_tool 再调用）
+  title: 按需工具可直接调用（无需预热轮）
   category: F3
   source: "测试问题集 F3-1"
   tags: [core]
@@ -93,14 +93,13 @@
       interactive: none
       expect:
         trajectory:
-          tools_must: [load_tool, get_announcements]
-          order: [[load_tool, get_announcements]]
+          tools_must: [get_announcements]
         citations:
           required: true
         safety:
           no_degradation: true
   budget: {max_tokens: 150000, max_seconds: 180, max_rounds: 10}
-  notes: "order 约束要求先激活（load_tool）后调用（get_announcements），验证懒加载两段式。"
+  notes: "get_announcements 是按需工具：验证它无需任何预热调用即可被直接调用并返回带引用的结果。"
 
 - id: F4-01
   title: 技能协同与估值区间（可比公司法）
@@ -115,7 +114,7 @@
           refusal: false
         trajectory:
           tools_any: [calc_valuation, get_peers]
-          order: [[load_tool, calc_valuation]]
+          max_tool_calls: 8
         safety:
           no_degradation: true
   budget: {max_tokens: 200000, max_seconds: 240, max_rounds: 12}

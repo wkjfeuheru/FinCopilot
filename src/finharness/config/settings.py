@@ -30,6 +30,7 @@ def _module_available(name: str) -> bool:
 
 
 PositiveInt = Annotated[int, Field(gt=0)]
+NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
 CacheKind = Literal["quote", "kline", "indicators", "financials", "announcements", "web", "reports", "macro", "industry"]
 ProviderKind = Literal["openai_compat", "anthropic_compat", "fake"]
@@ -84,15 +85,25 @@ class PermissionSettings(FrozenModel):
 class ToolSettings(FrozenModel):
     timeout_default_s: PositiveInt = 30
     timeout_overrides: Mapping[str, PositiveInt] = Field(default_factory=dict)
+    # 单条工具结果的 token 预算覆盖，键为工具名（docs 03.3.3）。与 timeout_overrides
+    # 对称：不同工具的合理结果体量相差极大（一次报价 vs 一份研报全文），因此需要一个
+    # 按工具调优的旋钮，而不是让所有工具共用一个数字。
+    result_token_overrides: Mapping[str, PositiveInt] = Field(default_factory=dict)
+    # 注册层级的运维覆盖。工具自己声明 ``@tool(tier=...)``，这两个列表只用于在不改代码的
+    # 前提下调整口径（如临时把某个懒加载工具提为常驻）；留空表示完全听声明的。
     resident: tuple[str, ...] = ()
     lazy: tuple[str, ...] = ()
+    # 已注入 schema 的上限。``tools`` 数组属于 provider 的缓存前缀，而按需激活会让它
+    # 增长；设上限使"每轮携带多少 schema"成为可推理的常量，而非会话长度的函数。
+    # 0 表示不限（沿用 docs 03.3.8 接受一次缓存失效的口径）。
+    max_active: int = 0
 
     @field_validator("resident", "lazy", mode="before")
     @classmethod
     def freeze_tool_names(cls, value: Any) -> Any:
         return tuple(value) if isinstance(value, list) else value
 
-    @field_validator("timeout_overrides")
+    @field_validator("timeout_overrides", "result_token_overrides")
     @classmethod
     def freeze_timeout_overrides(
         cls, value: Mapping[str, PositiveInt]
@@ -156,6 +167,11 @@ class ContextSettings(FrozenModel):
     context_window_tokens: PositiveInt = 64000
     trim_rows: PositiveInt = 20
     max_result_tokens: PositiveInt = 1000
+    # 压缩时每条工具结果进入摘要转录稿的 token 上限。此处过去是 compaction.py 里的
+    # 字符硬编码 ``raw[:800]``：在一个按 token 计量的体系里，它带来的是一个更紧、
+    # 且与语言无关的第二个上限——一条刚在 1000 token 预算下幸存的结果，会被悄悄砍到
+    # 约 470 token。用 token 设置替代表达同一意图，并让它可被运维调整。
+    compaction_result_tokens: PositiveInt = 500
     max_tool_schema_tokens: PositiveInt = 60
     # 循环防护：一模一样的 (tool, args) 调用重复达到此次数即被拒绝，若在提示后
     # 再次被拒绝则中止本次运行。取值保持较小，因为重复的相同调用从无信息量：
@@ -169,7 +185,9 @@ class ContextSettings(FrozenModel):
     # （可从缓存恢复），而非结论。
     short_mem_cap: PositiveInt = 200
     recall_max_tokens: PositiveInt = 400
-    ltm_inject_max_tokens: PositiveInt = 600
+    # 摘要层注入上限。该键此前名为 ltm_inject_max_tokens，但唯一消费者一直是
+    # 摘要层（按对话隔离）；ltm 前缀如今让给真正的跨对话长期记忆（LtmSettings）。
+    summary_inject_max_tokens: PositiveInt = 600
     # 预留给摘要片段的窗口占比；其余部分逐字保留近期轮次，
     # 因为它们描述的是当下正在发生的事。
     summary_budget_ratio: Annotated[float, Field(gt=0, le=0.5)] = 0.2
@@ -178,19 +196,131 @@ class ContextSettings(FrozenModel):
     # 持久化对话的保留上限；先达到者触发清理。
     retention_conversations: PositiveInt = 200
     retention_days: PositiveInt = 180
+    # 会话重新加载历史时最多回放多少轮；更早的历史已由 summary_segments
+    # 承载，因此不必把整条对话记录读进内存（长对话重载的峰值由此封顶）。
+    max_loaded_rounds: PositiveInt = 200
+    # 窗口内保留的轮次硬上限：即便 token 未超预算，轮次数超过它也会触发压缩。
+    # token 阈值只管住"多大"，管不住"多少轮"，而轮次本身也是内存。
+    max_window_rounds: PositiveInt = 40
+
+
+class EmbeddingSettings(FrozenModel):
+    """远程 /embeddings 端点（docs 03.6.4 LTM 语义记忆）。
+
+    与 ProviderSettings 同构：base_url 指向 OpenAI 兼容的 embeddings 端点
+    （如智谱 embedding-3、阿里 text-embedding-v3），凭据只从环境变量读取。
+    ``base_url`` 留空即关闭嵌入：语义记忆仍可写入，但检索退化为键匹配。
+    """
+
+    base_url: str | None = None
+    env_key: str | None = None
+    model_name: str = ""
+    timeout_s: Annotated[float, Field(gt=0)] = 30.0
+
+
+class VectorDbSettings(FrozenModel):
+    """向量库连接（docs 03.6.4：Qdrant）。
+
+    记录本体存 SQLite（memory.db），向量库只存向量 + 点 ID + user_id 载荷；
+    服务不可用时检索按 "SQLite BLOB 暴力余弦 → 键匹配" 逐级降级，核心记忆
+    链路不依赖它的可用性。``dim`` 留 0 表示由首次嵌入的实际维度推断。
+    """
+
+    kind: Literal["qdrant"] = "qdrant"
+    url: str | None = None
+    collection: str = "finharness_semantics"
+    api_key_env: str | None = None
+    timeout_s: Annotated[float, Field(gt=0)] = 10.0
+    # 大于 0 时用于建集合（并校验嵌入维度一致）；0 = 由首次嵌入推断。
+    dim: Annotated[int, Field(ge=0, le=8192)] = 0
+
+
+class LtmSettings(FrozenModel):
+    """跨对话长期记忆（docs 03.6.4）：情节记忆 + 语义记忆。
+
+    情节事件分三类：task_result（任务结果，每轮随结论落库，无 LLM）、
+    decision / excerpt（懒蒸馏产出）。语义记忆（事实/概念/偏好）同样由
+    蒸馏产出，与情节共用**同一次** LLM 调用，因此开启它不额外增加成本。
+    """
+
+    # 对话闲置多久后可被懒蒸馏（与 server.session_ttl_s 同量级）。
+    distill_idle_s: PositiveInt = 1800
+    # 每轮扫描周期内最多蒸馏多少个对话，使成本有界。
+    distill_batch: Annotated[int, Field(ge=1, le=20)] = 3
+    # 同一对话蒸馏失败重试上限，超出即放弃（绝不阻塞对话本身）。
+    distill_max_attempts: Annotated[int, Field(ge=1, le=10)] = 3
+    # 对话首轮被动注入的最近情节数。
+    recent_episodes: Annotated[int, Field(ge=0, le=20)] = 5
+    # 【跨对话记忆】区块的注入 token 上限。
+    inject_max_tokens: PositiveInt = 600
+    # 标的驱动的情节召回注入上限。
+    recall_max_tokens: PositiveInt = 400
+    # LTM 独立保留预算（与源对话的 retention_* 无关：记忆自包含，
+    # 源对话被 prune 删除不影响已蒸馏的内容）。
+    retention_episodes: PositiveInt = 500
+    retention_days: PositiveInt = 365
+    # 语义记忆（事实/概念/偏好）是否随蒸馏产出。与情节共用一次 LLM 调用。
+    distill_semantics: bool = True
+    # 语义保留预算与情节分开：偏好这类条目少而长期，比情节更耐久。
+    retention_facts: PositiveInt = 300
+    retention_facts_days: PositiveInt = 730
+    # 向量召回条数与注入上限（仅在配置了 embeddings 时生效）。
+    semantic_top_k: Annotated[int, Field(ge=1, le=20)] = 5
+    semantic_inject_max_tokens: PositiveInt = 400
+    embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    vector_db: VectorDbSettings = Field(default_factory=VectorDbSettings)
 
 
 class AuthSettings(FrozenModel):
-    """注册登录（docs 03.13）：会话令牌 TTL 与 Cookie 属性。
+    """注册登录（docs 03.13）：会话令牌 TTL、Cookie 属性与端点限速。
 
     ``secure_cookie`` 默认 False 是因为默认部署绑定 127.0.0.1（HTTP）；
     对外经 HTTPS 暴露的部署应设为 true，使 Cookie 只经加密信道传输。
+
+    限速默认值是"够挡住脚本、不打扰真人"的量级：登录 10 次/5 分钟、注册
+    5 次/小时（**按客户端地址**计数）。设为 0 表示关闭该项限制。
     """
 
     token_ttl_s: PositiveInt = 14 * 24 * 3600
     min_password_len: Annotated[int, Field(ge=8, le=128)] = 8
     secure_cookie: bool = False
     allow_register: bool = True
+    # 登录尝试上限（按客户端地址 + 用户名归一化后的键计数）。
+    login_max_attempts: NonNegativeInt = 10
+    login_window_s: NonNegativeInt = 300
+    # 注册上限（按客户端地址计数）。
+    register_max_attempts: NonNegativeInt = 5
+    register_window_s: NonNegativeInt = 3600
+    # 首个注册用户是否自动继承单用户时代的存量数据（对话、笔记、供应商配置）。
+    # 默认关闭：这是一个"第一个注册的人拿到全部历史数据"的隐式授权，在对外
+    # 部署里等于把存量数据交给任意外部访客。需要时由运维显式打开。
+    claim_legacy_on_first_register: bool = False
+
+
+class QuotaSettings(FrozenModel):
+    """每租户用量预算（隔离方案 P0-6）。
+
+    与 ``context.max_turns`` 的分工：那一个是**单次对话**内模型可以走多少轮，
+    属于上下文预算；这里限制的是**一个租户在时间窗口内**能发起多少轮对话，
+    属于资源公平性。没有它，一个租户就能占满进程、上游数据源与模型配额。
+
+    ``turns_per_window`` 默认宽松（600 轮/小时，约每分钟 10 轮）：它挡的是
+    脚本化滥用，而不是正常的高强度使用。窗口滚动，因此**不会被异常路径
+    永久性污染**——这一点是它作为默认防线的原因。
+
+    ``max_concurrent_streams`` 默认 **0（不限制）**，理由是它依赖"会话一定会
+    被释放"这一前提，而该前提并不总成立：SSE 生成器若未被消费完（客户端在
+    第一个事件前就断开），``release`` 走不到，busy 标记会一直留着，直到被
+    回收（``server.busy_timeout_s``，默认 1 小时）。若同时开启并发上限，
+    几条这样的泄漏就足以让**整个租户**被挡在门外一小时——那是比要防的滥用
+    更糟的自我拒绝服务。因此它保留为显式开关：只有在部署已确认异常路径会
+    及时释放（或回收窗口足够短）时才打开。
+    """
+
+    turns_per_window: NonNegativeInt = 600
+    window_s: NonNegativeInt = 3600
+    # 同一租户可同时进行的对话流；0 表示不限制（默认，理由见类文档）。
+    max_concurrent_streams: NonNegativeInt = 0
 
 
 class AuditSettings(FrozenModel):
@@ -238,15 +368,34 @@ class ServerSettings(FrozenModel):
     port: Annotated[int, Field(ge=1, le=65535)] = 8000
     session_ttl_s: PositiveInt = 1800
     confirm_ttl_s: PositiveInt = 120
+    # busy 会话超过此时长仍未释放即视为被遗弃，可被回收（默认 2×会话 TTL）。
+    # 保证一个卡死的流不会永久占着一份 AgentLoop 与整条记忆。
+    busy_timeout_s: PositiveInt = 3600
+    # 进程级用户级缓存（每个用户一份 DataAccess）的上限；超出按 LRU 淘汰。
+    user_cache_size: PositiveInt = 64
     static_dir: Path = Path("src/finharness/server/static")
     allow_remote: bool = False
 
 
 class PathSettings(FrozenModel):
+    """产物、缓存与**状态**三类路径。
+
+    ``state_dir`` 存放绝不能被 agent 工具触碰的东西：主加密密钥、用户/令牌库、
+    对话库与加密配置库。它必须与 ``output_dir``、``data.cache_dir`` 分开——
+    后两者是 agent 可达的（``read_file``/``write_file``/``read_pdf`` 与
+    ``/v1/artifacts`` 都开放其中的子树），把密钥与租户数据库放在那里等于让
+    "读一个缓存文件"与"读到全部租户的供应商 key"之间只隔一次路径检查。
+    跨字段约束见 ``Settings.validate``。
+    """
+
     output_dir: Path = Path("output")
-    memory_db: Path = Path("data_cache/memory.db")
-    # 用户与会话令牌存储（docs 03.13）；默认与其它库同住 data_cache/。
-    auth_db: Path = Path("data_cache/users.db")
+    state_dir: Path = Path("state")
+    memory_db: Path = Path("state/memory.db")
+    # 用户与会话令牌存储（docs 03.13）。
+    auth_db: Path = Path("state/users.db")
+    # 加密后的供应商配置库与其主密钥（docs 03.13）。
+    config_db: Path = Path("state/config.db")
+    secret_key: Path = Path("state/secret.key")
     # Skills 随包分发（docs 03.8）：以本文件为基准解析，
     # 这样无论工作目录如何都能找到目录清单。
     skills_dir: Path = Path(__file__).resolve().parent.parent / "skills"
@@ -325,10 +474,12 @@ class Settings(BaseSettings):
     tools: ToolSettings = Field(default_factory=ToolSettings)
     data: DataSettings = Field(default_factory=DataSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
+    ltm: LtmSettings = Field(default_factory=LtmSettings)
     audit: AuditSettings = Field(default_factory=AuditSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     server: ServerSettings = Field(default_factory=ServerSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
+    quota: QuotaSettings = Field(default_factory=QuotaSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
 
@@ -338,6 +489,18 @@ class Settings(BaseSettings):
         cls, value: Mapping[str, ProviderSettings]
     ) -> Mapping[str, ProviderSettings]:
         return MappingProxyType(dict(value))
+
+    @model_validator(mode="after")
+    def validate_state_separation(self) -> "Settings":
+        """任何构造路径都必须满足状态与 agent 可达目录的分离。
+
+        刻意做成模型级校验而不是只放在 ``validate()`` 里：后者只在
+        ``from_file()`` 被调用时才跑，任何直接构造 ``Settings`` 的调用方
+        （新入口、脚本、测试替身）都能静默绕过。安全约束一旦能被"忘记调用
+        某个方法"绕过，就只是约定而非边界。
+        """
+        self._validate_state_is_not_agent_reachable()
+        return self
 
     @classmethod
     def settings_customise_sources(
@@ -412,6 +575,39 @@ class Settings(BaseSettings):
                     f"Provider {self.model.provider} 缺少 API Key；"
                     f"请设置环境变量 {env_key or '<未配置 env_key>'}"
                 )
+
+    def _validate_state_is_not_agent_reachable(self) -> None:
+        """确保密钥与租户数据库不在 agent 可达的目录内。
+
+        agent 可达目录是 ``paths.output_dir`` 与 ``data.cache_dir``：文件工具与
+        产物下载端点都开放其中的子树（output 整体、cache 的 parquet/pdf），而
+        cache 的文件名又是由请求形状决定的哈希。因此只要 ``secret.key``、
+        ``users.db``、``memory.db`` 或 ``config.db`` 落在其中任何一个里，
+        "读一个普通缓存文件"与"读到全部租户的供应商 key 与对话"之间就只隔一次
+        包含性检查——这正是文档拒绝发布 ``run_python`` 时所依赖的那条论证，
+        而它对任何进程内读写路径同样成立。
+
+        这是启动即失败的硬约束，不做降级：把它做成警告，等于让多租户部署默认
+        运行在一个已知可越权的布局上。
+        """
+        roots = {
+            "paths.output_dir": self.paths.output_dir,
+            "data.cache_dir": self.data.cache_dir,
+        }
+        state_files = {
+            "paths.memory_db": self.paths.memory_db,
+            "paths.auth_db": self.paths.auth_db,
+            "paths.config_db": self.paths.config_db,
+            "paths.secret_key": self.paths.secret_key,
+        }
+        for state_name, state_path in state_files.items():
+            for root_name, root in roots.items():
+                if _path_within(state_path, root):
+                    raise SettingsError(
+                        f"{state_name} 位于 agent 可达目录 {root_name} 内："
+                        f"{state_path}。密钥与租户数据库必须放在 paths.state_dir "
+                        "下（默认 state/），否则缓存/产物读取路径可以触及它们。"
+                    )
 
     def validate_runtime(self, *, check_audit: bool = True, require_api_key: bool = True) -> None:
         """校验启动所需外部条件，但不创建目录或访问网络。
@@ -558,6 +754,20 @@ def _apply_environment_overrides(payload: dict[str, Any]) -> None:
         _set_nested(payload, path, value)
 
 
+def _path_within(child: Path, root: Path) -> bool:
+    """``child`` 是否等于 ``root`` 或位于其下（两者均解析后再比较）。
+
+    解析失败（非法字符、过长路径等）时返回 False：宁可放过一次可疑布局，
+    也不要因为一个解析异常让配置加载整体失败。
+    """
+    try:
+        resolved_child = Path(child).resolve()
+        resolved_root = Path(root).resolve()
+    except (OSError, ValueError):
+        return False
+    return resolved_child == resolved_root or resolved_child.is_relative_to(resolved_root)
+
+
 def _resolve_path_value(value: Any, base: Path) -> Any:
     if not isinstance(value, (str, Path)):
         return value
@@ -574,8 +784,11 @@ def _resolve_paths(payload: dict[str, Any], base: Path) -> None:
         ("observability", "logging", "path"),
         ("server", "static_dir"),
         ("paths", "output_dir"),
+        ("paths", "state_dir"),
         ("paths", "memory_db"),
         ("paths", "auth_db"),
+        ("paths", "config_db"),
+        ("paths", "secret_key"),
         ("paths", "skills_dir"),
     ):
         target = payload
@@ -590,12 +803,20 @@ def _resolve_paths(payload: dict[str, Any], base: Path) -> None:
 
 
 def _format_validation_error(exc: ValidationError) -> str:
-    """把 pydantic 校验错误整理为单行可读信息。"""
+    """把 pydantic 校验错误整理为单行可读信息。
+
+    模型级校验（``@model_validator``）抛出的 ``SettingsError`` 会被 pydantic 包成
+    ``value_error``，其 `msg` 前缀是无信息量的 "Value error, "；剥掉它，使状态
+    布局这类跨字段错误读起来与其它配置错误一致。
+    """
 
     details: list[str] = []
     for error in exc.errors(include_url=False):
         location = ".".join(str(part) for part in error["loc"])
-        details.append(f"{location}: {error['msg']}")
+        message = str(error["msg"])
+        if message.startswith("Value error, "):
+            message = message[len("Value error, "):]
+        details.append(f"{location}: {message}" if location else message)
     return "配置校验失败：" + "; ".join(details)
 
 
@@ -610,6 +831,7 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_PERMISSION_DEFAULT_MODE": (("permission", "default_mode"), PermissionMode),
     "FINH_TOOLS_TIMEOUT_DEFAULT_S": (("tools", "timeout_default_s"), int),
     "FINH_TOOLS_TIMEOUT_OVERRIDES": (("tools", "timeout_overrides"), dict[str, int]),
+    "FINH_TOOLS_RESULT_TOKEN_OVERRIDES": (("tools", "result_token_overrides"), dict[str, int]),
     "FINH_TOOLS_RESIDENT": (("tools", "resident"), list[str]),
     "FINH_TOOLS_LAZY": (("tools", "lazy"), list[str]),
     "FINH_DATA_ADAPTER_ORDER": (("data", "adapter_order"), list[str]),
@@ -622,6 +844,7 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_CONTEXT_CONTEXT_WINDOW_TOKENS": (("context", "context_window_tokens"), int),
     "FINH_CONTEXT_TRIM_ROWS": (("context", "trim_rows"), int),
     "FINH_CONTEXT_MAX_RESULT_TOKENS": (("context", "max_result_tokens"), int),
+    "FINH_CONTEXT_COMPACTION_RESULT_TOKENS": (("context", "compaction_result_tokens"), int),
     "FINH_CONTEXT_MAX_TOOL_SCHEMA_TOKENS": (("context", "max_tool_schema_tokens"), int),
     "FINH_CONTEXT_MAX_IDENTICAL_TOOL_CALLS": (("context", "max_identical_tool_calls"), int),
     "FINH_CONTEXT_PLAN_STALL_TURNS": (("context", "plan_stall_turns"), int),
@@ -631,7 +854,30 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_CONTEXT_RETENTION_DAYS": (("context", "retention_days"), int),
     "FINH_CONTEXT_SHORT_MEM_CAP": (("context", "short_mem_cap"), int),
     "FINH_CONTEXT_RECALL_MAX_TOKENS": (("context", "recall_max_tokens"), int),
-    "FINH_CONTEXT_LTM_INJECT_MAX_TOKENS": (("context", "ltm_inject_max_tokens"), int),
+    "FINH_CONTEXT_SUMMARY_INJECT_MAX_TOKENS": (("context", "summary_inject_max_tokens"), int),
+    "FINH_LTM_DISTILL_IDLE_S": (("ltm", "distill_idle_s"), int),
+    "FINH_LTM_DISTILL_BATCH": (("ltm", "distill_batch"), int),
+    "FINH_LTM_DISTILL_MAX_ATTEMPTS": (("ltm", "distill_max_attempts"), int),
+    "FINH_LTM_RECENT_EPISODES": (("ltm", "recent_episodes"), int),
+    "FINH_LTM_INJECT_MAX_TOKENS": (("ltm", "inject_max_tokens"), int),
+    "FINH_LTM_RECALL_MAX_TOKENS": (("ltm", "recall_max_tokens"), int),
+    "FINH_LTM_RETENTION_EPISODES": (("ltm", "retention_episodes"), int),
+    "FINH_LTM_RETENTION_DAYS": (("ltm", "retention_days"), int),
+    "FINH_LTM_DISTILL_SEMANTICS": (("ltm", "distill_semantics"), bool),
+    "FINH_LTM_RETENTION_FACTS": (("ltm", "retention_facts"), int),
+    "FINH_LTM_RETENTION_FACTS_DAYS": (("ltm", "retention_facts_days"), int),
+    "FINH_LTM_SEMANTIC_TOP_K": (("ltm", "semantic_top_k"), int),
+    "FINH_LTM_SEMANTIC_INJECT_MAX_TOKENS": (("ltm", "semantic_inject_max_tokens"), int),
+    "FINH_LTM_EMBEDDINGS_BASE_URL": (("ltm", "embeddings", "base_url"), str),
+    "FINH_LTM_EMBEDDINGS_ENV_KEY": (("ltm", "embeddings", "env_key"), str),
+    "FINH_LTM_EMBEDDINGS_MODEL_NAME": (("ltm", "embeddings", "model_name"), str),
+    "FINH_LTM_EMBEDDINGS_TIMEOUT_S": (("ltm", "embeddings", "timeout_s"), float),
+    "FINH_LTM_VECTOR_DB_KIND": (("ltm", "vector_db", "kind"), Literal["qdrant"]),
+    "FINH_LTM_VECTOR_DB_URL": (("ltm", "vector_db", "url"), str),
+    "FINH_LTM_VECTOR_DB_COLLECTION": (("ltm", "vector_db", "collection"), str),
+    "FINH_LTM_VECTOR_DB_API_KEY_ENV": (("ltm", "vector_db", "api_key_env"), str),
+    "FINH_LTM_VECTOR_DB_TIMEOUT_S": (("ltm", "vector_db", "timeout_s"), float),
+    "FINH_LTM_VECTOR_DB_DIM": (("ltm", "vector_db", "dim"), int),
     "FINH_AUDIT_LOG_PATH": (("audit", "log_path"), Path),
     "FINH_OBSERVABILITY_LOGGING_LEVEL": (
         ("observability", "logging", "level"),
@@ -669,9 +915,23 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_AUTH_MIN_PASSWORD_LEN": (("auth", "min_password_len"), int),
     "FINH_AUTH_SECURE_COOKIE": (("auth", "secure_cookie"), bool),
     "FINH_AUTH_ALLOW_REGISTER": (("auth", "allow_register"), bool),
+    "FINH_AUTH_LOGIN_MAX_ATTEMPTS": (("auth", "login_max_attempts"), int),
+    "FINH_AUTH_LOGIN_WINDOW_S": (("auth", "login_window_s"), int),
+    "FINH_AUTH_REGISTER_MAX_ATTEMPTS": (("auth", "register_max_attempts"), int),
+    "FINH_AUTH_REGISTER_WINDOW_S": (("auth", "register_window_s"), int),
+    "FINH_AUTH_CLAIM_LEGACY_ON_FIRST_REGISTER": (
+        ("auth", "claim_legacy_on_first_register"),
+        bool,
+    ),
+    "FINH_QUOTA_TURNS_PER_WINDOW": (("quota", "turns_per_window"), int),
+    "FINH_QUOTA_WINDOW_S": (("quota", "window_s"), int),
+    "FINH_QUOTA_MAX_CONCURRENT_STREAMS": (("quota", "max_concurrent_streams"), int),
     "FINH_PATHS_OUTPUT_DIR": (("paths", "output_dir"), Path),
+    "FINH_PATHS_STATE_DIR": (("paths", "state_dir"), Path),
     "FINH_PATHS_MEMORY_DB": (("paths", "memory_db"), Path),
     "FINH_PATHS_AUTH_DB": (("paths", "auth_db"), Path),
+    "FINH_PATHS_CONFIG_DB": (("paths", "config_db"), Path),
+    "FINH_PATHS_SECRET_KEY": (("paths", "secret_key"), Path),
     "FINH_PATHS_SKILLS_DIR": (("paths", "skills_dir"), Path),
     "FINH_SEARCH_KIND": (("search", "kind"), Literal["tavily"]),
     "FINH_SEARCH_BASE_URL": (("search", "base_url"), str),

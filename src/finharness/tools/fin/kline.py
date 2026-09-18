@@ -3,32 +3,30 @@
 from __future__ import annotations
 
 import pandas as pd
-from pydantic import Field
 
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool, DataInput, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 # 窗口长度比请求的短这么多，说明数据源已无更多数据（次新股、停牌），
 # 而非序列只是“时间尚短”。
 _SHORT_WINDOW_RATIO = 0.8
 
 
-class KlineInput(DataInput):
-    symbol: str = Field(description="6位A股代码")
-    period: str = Field(default="day", description="周期：day/week/month")
-    adjust: str | None = Field(default=None, description="复权：qfq前复权/hfq后复权/None不复权")
-    years: int = Field(default=1, description="回溯年数，如 1 表示近一年")
-
-
+@tool(
+    name="get_kline",
+    description="查询A股历史K线（日/周/月），输出区间摘要与近期明细。",
+    capability=Capability.MARKET,
+    group=ToolGroup.FIN_DATA,
+    timeout=30,
+    data_tool=True,
+    output_schema_note="返回区间涨跌、极值、均线与近期明细（markdown）。",
+)
 class GetKlineTool(BaseTool):
-    name = "get_kline"
-    description = "查询A股历史K线（日/周/月），输出区间摘要与近期明细。"
-    input_model = KlineInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.FIN_DATA
-    timeout = 30
-    output_schema_note = "返回区间涨跌、极值、均线与近期明细（markdown）。"
-
+    @param("symbol", desc="6位A股代码")
+    @param("period", desc="周期：day/week/month")
+    @param("adjust", desc="复权：qfq前复权/hfq后复权/None不复权")
+    @param("years", desc="回溯年数，如 1 表示近一年")
     async def _dispatch(
         self, *, symbol: str, period: str = "day", adjust: str | None = None, years: int = 1
     ) -> RawData:

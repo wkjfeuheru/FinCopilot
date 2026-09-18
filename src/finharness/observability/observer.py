@@ -38,7 +38,7 @@ _RUN_STACK: ContextVar[tuple[Any, ...]] = ContextVar("finharness_run_stack", def
 
 
 # 治理拦截状态：出现在 agent_tool_calls_total 里，但不是工具失败。
-_GOVERNED_STATUSES = frozenset({"ok", "denied", "blocked", "loop_guard", "not_activated"})
+_GOVERNED_STATUSES = frozenset({"ok", "denied", "blocked", "loop_guard"})
 
 
 @runtime_checkable
@@ -187,7 +187,7 @@ class NullObserver:
     enabled = False
 
     def bind_request(
-        self, *, session_id: str = "", conversation_id: str = "", mode: str = ""
+        self, *, session_id: str = "", conversation_id: str = ""
     ) -> str:
         return ""
 
@@ -246,14 +246,13 @@ class Observer:
         *,
         session_id: str = "",
         conversation_id: str = "",
-        mode: str = "",
         trace_id: str | None = None,
     ) -> TraceContext:
         """绑定本次请求的追踪身份，返回新上下文。"""
         context = bind_trace(
             session_id=session_id, conversation_id=conversation_id, trace_id=trace_id
         )
-        self._log("info", "request_start", mode=mode)
+        self._log("info", "request_start", session_id=session_id)
         return context
 
     @contextmanager
@@ -351,8 +350,8 @@ class Observer:
     def tool_finished(self, *, tool: str, status: str, span: Span | None = None) -> None:
         """工具结束后上报调用量与耗时；真正的失败才计入错误总数。
 
-        ``denied``/``blocked``/``loop_guard``/``not_activated`` 是治理拦截，
-        不是工具脆弱——把它们计成错误会让"哪个工具最脆弱"失真。
+        ``denied``/``blocked``/``loop_guard`` 是治理拦截，不是工具脆弱——把它们
+        计成错误会让"哪个工具最脆弱"失真。
         """
         duration_s = span.duration_s() if span is not None else 0.0
         self._emit("tool_finished", tool=tool, status=status, duration_s=duration_s)

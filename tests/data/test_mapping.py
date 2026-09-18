@@ -109,3 +109,17 @@ def test_select_indicator_columns_falls_back_to_all_when_nothing_matches():
 
     assert kept == columns
     assert unmatched == ["毛利率"]
+
+
+def test_every_macro_indicator_declares_its_publisher_and_cadence():
+    """时效披露依赖这些静态事实：缺了它们，工具只能报出一个裸数据期。
+
+    发布机构与节奏是关于「该指标如何发布」的事实，与本次取到的数值无关，因此集中
+    声明在映射表里，避免分散到各工具或提示词中重复维护。
+    """
+    from finharness.data.mapping import MACRO_INDICATORS
+
+    for slug, spec in MACRO_INDICATORS.items():
+        assert spec.publisher, f"{slug} 缺少发布机构"
+        assert spec.cadence, f"{slug} 缺少发布节奏"
+        assert spec.frequency in {"daily", "weekly", "monthly", "quarterly", "yearly"}

@@ -604,9 +604,10 @@ def test_tool_result_content_is_truncated_to_the_configured_token_limit():
     messages, provider, loop = asyncio.run(run())
 
     content = json.loads(messages[2].tool_results[0][1])["content"]
-    # 截断标记会追加在预算内的前缀之后。
-    assert content.endswith(loop.TRUNCATION_MARKER)
-    body = content[: -len(loop.TRUNCATION_MARKER)]
+    # 截断标记会追加在预算内的前缀之后，并说明被省略的规模。
+    assert loop.TRUNCATION_MARKER in content
+    assert "已省略约" in content
+    body = content.split(loop.TRUNCATION_MARKER, 1)[0]
     assert loop.memory.counter.count(body).tokens <= 40
     # 未被截断的 payload 绝不能已被转发。
     assert "茅" * 400 not in json.dumps(
@@ -1203,9 +1204,12 @@ class LazyRegistry:
         return True
 
 
-def test_unactivated_lazy_tool_is_refused_with_a_load_tool_hint():
-    """lazy 工具的 schema 从未被注入，因此调用它必须被
-    结构性地拒绝——而且拒绝信息必须指出修复方式 (load_tool)。"""
+def test_a_direct_call_to_a_lazy_tool_activates_it_and_runs():
+    """按需注入是省 token 的手段，不是权限。
+
+    模型一旦点名调用某个按需工具，就说明它已经知道要什么；此时拒绝只会白费一轮。
+    循环就地激活并放行，同时留下 ``tool_activated`` 事件使这次激活可归因。
+    """
     async def run():
         sink = Sink()
         tool = RecordingTool("calc_valuation", content="估值")
@@ -1213,19 +1217,20 @@ def test_unactivated_lazy_tool_is_refused_with_a_load_tool_hint():
         provider = ScriptedProvider(
             [
                 tool_round(ToolUse("c1", "calc_valuation", {"symbol": "600519"})),
-                text_round("改用其他方式"),
+                text_round("完成"),
             ]
         )
         loop = make_loop(provider, registry=registry, output=sink)
         await loop.run("估值")
-        return tool, sink.events
+        return tool, registry, sink.events
 
-    tool, events = asyncio.run(run())
+    tool, registry, events = asyncio.run(run())
 
-    # 从未执行，并且模型被告知如何继续。
-    assert tool.calls == []
-    errors = [str(e.data.get("error", "")) for e in events if e.kind == "tool_status"]
-    assert any("load_tool" in err for err in errors), errors
+    # 本次就执行了，且注册表记住了这次激活。
+    assert len(tool.calls) == 1
+    assert registry.is_active("calc_valuation") is True
+    activated = [e.data.get("name") for e in events if e.kind == "tool_activated"]
+    assert activated == ["calc_valuation"]
 
 
 def test_activated_lazy_tool_runs_normally():
@@ -1247,3 +1252,88 @@ def test_activated_lazy_tool_runs_normally():
     tool = asyncio.run(run())
 
     assert len(tool.calls) == 1
+
+
+class ProgressTool:
+    """声明 ``needs_progress`` 的工具替身：执行期间上报一次进展。"""
+
+    permission = PermissionLevel.READ
+    timeout = None
+    needs_progress = True
+    progress = None
+
+    def __init__(self, name: str = "slow_tool"):
+        self.name = name
+        self.reported = False
+
+    async def run(self, **kwargs) -> ToolResult:
+        # 工具只描述进展内容，调用标识由循环补齐——否则每个长任务工具都得
+        # 自己维护 call_id，并把对话层概念泄漏进工具实现。
+        if self.progress is not None:
+            await self.progress({"phase": "panel", "fetched": 10, "total": 20})
+            self.reported = True
+        return ToolResult(content="done", ok=True)
+
+
+def test_progress_tool_reports_through_the_loop():
+    """长任务工具的上报必须变成引擎事件。
+
+    服务端心跳是 SSE 注释帧，客户端的空闲看门狗只在真实事件到达时重置；因此
+    静默数分钟的工具若不产生事件，界面会在"运行中"被看门狗掐断（docs 03.12）。
+    """
+    async def run():
+        sink = Sink()
+        tool = ProgressTool()
+        provider = ScriptedProvider(
+            [
+                tool_round(ToolUse("c1", "slow_tool", {})),
+                text_round("完成"),
+            ]
+        )
+        loop = make_loop(provider, registry=StubRegistry({"slow_tool": tool}), output=sink)
+        await loop.run("长任务")
+        return tool, sink.events
+
+    tool, events = asyncio.run(run())
+
+    assert tool.reported is True
+    progress = [e for e in events if e.kind == "tool_progress"]
+    assert len(progress) == 1
+    # 循环补齐了调用标识，工具自身的载荷原样保留。
+    assert progress[0].data["call_id"] == "c1"
+    assert progress[0].data["name"] == "slow_tool"
+    assert progress[0].data["fetched"] == 10
+
+
+def test_progress_failure_does_not_break_the_tool():
+    """进展通道断掉不得连累正在进行的计算：上报失败只记日志，工具照常完成。"""
+    class FlakySink(Sink):
+        async def emit(self, event: EngineEvent) -> None:
+            if event.kind == "tool_progress":
+                raise RuntimeError("progress transport gone")
+            await super().emit(event)
+
+    async def run():
+        tool = ProgressTool()
+        sink = FlakySink()
+        provider = ScriptedProvider(
+            [
+                tool_round(ToolUse("c1", "slow_tool", {})),
+                text_round("完成"),
+            ]
+        )
+        loop = make_loop(provider, registry=StubRegistry({"slow_tool": tool}), output=sink)
+        outcome = await loop.run("长任务")
+        return outcome, sink.events
+
+    outcome, events = asyncio.run(run())
+
+    assert outcome.answer == "完成"
+    # 关键判别点：工具以成功收尾。若上报异常逸出，循环会把它当作工具失败
+    # （completed/failed + ok=false），即使最终答案仍然能凑出来。
+    completed = [
+        e for e in events
+        if e.kind == "tool_status" and e.data.get("name") == "slow_tool"
+        and e.data.get("status") != "started"
+    ]
+    assert completed and completed[0].data["ok"] is True

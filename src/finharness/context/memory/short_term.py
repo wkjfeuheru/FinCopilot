@@ -110,12 +110,21 @@ class ShortTermMemory:
         return found
 
     def render(
-        self, episodes: list[Episode], *, counter: TokenCounter, max_tokens: int = 0
+        self,
+        episodes: list[Episode],
+        *,
+        counter: TokenCounter,
+        max_tokens: int = 0,
+        header: str | None = "【相关历史事件】",
     ) -> str:
-        """渲染召回的事件以供注入；未召回任何事件时返回空字符串。"""
+        """渲染召回的事件以供注入；未召回任何事件时返回空字符串。
+
+        ``header`` 为 ``None`` 时只输出条目，让调用方（如会话状态块）使用自己的
+        小节标题，避免同一段落里出现两个标题。
+        """
         if not episodes:
             return ""
-        lines = ["【相关历史事件】"]
+        lines = [header] if header else []
         for episode in episodes:
             marker = "数据" if episode.kind == "data" else "结论"
             lines.append(f"- [{marker}] {episode.subject}：{episode.summary}")

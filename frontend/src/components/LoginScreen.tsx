@@ -74,16 +74,16 @@ export function LoginScreen({ onSuccess }: Props) {
           </Form.Item>
           <Form.Item
             name="password"
-            label="口令"
+            label="密码"
             rules={[
-              { required: true, message: "请输入口令" },
+              { required: true, message: "请输入密码" },
               ...(mode === "register"
-                ? [{ min: 8, message: "口令至少需要 8 个字符" } as const]
+                ? [{ min: 8, message: "密码至少需要 8 个字符" } as const]
                 : []),
             ]}
           >
             <Input.Password
-              placeholder={mode === "register" ? "至少 8 个字符" : "口令"}
+              placeholder={mode === "register" ? "至少 8 个字符" : "密码"}
               autoComplete={mode === "register" ? "new-password" : "current-password"}
             />
           </Form.Item>

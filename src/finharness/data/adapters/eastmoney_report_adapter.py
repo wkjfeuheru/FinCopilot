@@ -19,13 +19,18 @@ from __future__ import annotations
 import json
 import re
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Callable
 
 import httpx
 import pandas as pd
 
 from finharness.data.adapters.base import AdapterError, DataAdapter, FetchResult
-from finharness.data.adapters.pdf_fetch import fetch_pdf_text
+from finharness.data.adapters.pdf_fetch import (
+    extract_pdf_pages,
+    fetch_pdf_bytes,
+    save_pdf_bytes,
+)
 from finharness.data.adapters.tavily_adapter import system_proxy
 
 REPORTS_INTERFACE = "reports"
@@ -51,6 +56,10 @@ _MAX_SCAN_PAGES = 5
 # ratingChange 以一个小整数形式返回；该映射来自站点自身。
 _RATING_CHANGE = {"0": "调高", "1": "调低", "2": "首次", "3": "维持", "4": "无"}
 
+# 首页预览的字符上限。预览的职责是让调用方判断"这篇讲什么、要不要深读"，因此一小段
+# 就够；完整正文在落盘文件里，不占上下文。
+_PREVIEW_CHARS = 600
+
 _COLUMNS = (
     "title",
     "stock_name",
@@ -62,6 +71,7 @@ _COLUMNS = (
     "pdf_pages",
     "detail_url",
     "pdf_url",
+    "pdf_path",
     "content",
 )
 
@@ -124,6 +134,7 @@ def _row(item: dict[str, Any], report_type: str) -> dict[str, Any]:
         "pdf_pages": item.get("attachPages") or "",
         "detail_url": _detail_url(report_type, info_code) if info_code else "",
         "pdf_url": _pdf_url(info_code) if info_code else "",
+        "pdf_path": "",
         "content": "",
     }
 
@@ -138,16 +149,34 @@ class EastmoneyReportAdapter(DataAdapter):
         *,
         timeout_s: float = 30.0,
         http_get: HttpGet | None = None,
-        text_fetcher: Callable[[str], str] | None = None,
+        pdf_fetcher: Callable[[str], bytes] | None = None,
+        pdf_dir: str | Path | None = None,
         with_text_allowed: bool = True,
     ) -> None:
         self.timeout_s = timeout_s
         # 可注入，以便测试在不联网的情况下验证解析逻辑。
         self._http_get = http_get or self._network_get
-        self._text_fetcher = text_fetcher or (lambda url: fetch_pdf_text(url))
+        # 抓取的是 **PDF 字节**而非抽取后的文本：正文要落盘，好让上下文之外的读者
+        # （read_pdf / summarize_document）还能取回它。只留文本就没有可寻址的原文。
+        self._pdf_fetcher = pdf_fetcher or (lambda url: fetch_pdf_bytes(url))
+        self.pdf_dir = Path(pdf_dir) if pdf_dir is not None else Path("data_cache") / "pdf"
         # 全文需要从本主机访问文档 CDN，因此运维方可以禁止；一旦禁止，适配器会
         # 显式报错，而不是悄悄省略。
         self.with_text_allowed = with_text_allowed
+
+    def with_pdf_dir(self, pdf_dir: str | Path) -> "EastmoneyReportAdapter":
+        """返回一个仅落盘目录不同的副本。
+
+        多租户下每个用户必须有各自的 PDF 目录：全文句柄会经 ``read_pdf`` 读回，
+        而 ``read_pdf`` 的允许根来自该用户自己的 settings。共享同一个目录会让
+        用户的 PDF 落在自己读不到的树里。
+        网络层（含测试注入的 ``http_get``/``pdf_fetcher``）与其余配置整体沿用，
+        只更换目录，因此本方法既不改动共享实例，也不丢弃注入的替身。
+        """
+        clone = object.__new__(type(self))
+        clone.__dict__.update(self.__dict__)
+        clone.pdf_dir = Path(pdf_dir)
+        return clone
 
     # -- 传输层 ---------------------------------------------------------------
     def _network_get(self, url: str) -> str:
@@ -279,7 +308,10 @@ class EastmoneyReportAdapter(DataAdapter):
         if with_text and len(frame):
             if not self.with_text_allowed:
                 raise AdapterError("研报全文抓取已被配置禁用（search.local_pdf_fallback=false）")
-            frame["content"] = [self._report_text(row["pdf_url"]) for row in rows]
+            for index, row in enumerate(rows):
+                path, preview = self._report_pdf(row["pdf_url"])
+                frame.at[index, "pdf_path"] = path
+                frame.at[index, "content"] = preview
         return FetchResult(df=frame, interface=REPORTS_INTERFACE)
 
     def _collect(
@@ -333,10 +365,33 @@ class EastmoneyReportAdapter(DataAdapter):
             page += 1
         return collected
 
-    def _report_text(self, pdf_url: str) -> str:
+    def _report_pdf(self, pdf_url: str) -> tuple[str, str]:
+        """抓取一份研报 PDF：落盘并返回 ``(本地路径, 首页预览)``。
+
+        落盘而非只留文本，是为了让正文在上下文之外仍然可用：上下文只承载一段有界
+        预览与这个句柄，读者要细节时按路径精读或摘要，而不必再抓一次。
+
+        页数上限只作用于 **预览**（首页足以让模型判断该篇讲什么），完整内容留在
+        文件里，不受上下文预算约束。
+        """
         try:
-            return self._text_fetcher(pdf_url)
+            data = self._pdf_fetcher(pdf_url)
+            path = save_pdf_bytes(data, self.pdf_dir)
+            preview = self._preview(data)
+            return str(path), preview
         except AdapterError as exc:
             # 一份不可读的 PDF 不应让整个列表丢失；元数据仍然有用，缺口会直接
             # 在单元格中说明。
+            return "", f"（正文获取失败：{exc}）"
+
+    @staticmethod
+    def _preview(data: bytes) -> str:
+        """首页文本，作为"这篇讲了什么"的有界提示。"""
+        try:
+            pages = extract_pdf_pages(data)
+        except AdapterError as exc:
             return f"（正文获取失败：{exc}）"
+        first = pages[0].strip() if pages else ""
+        if not first:
+            return "（首页无可抽取文本，可能是扫描页；全文已落盘，可用 read_pdf 查看）"
+        return first[:_PREVIEW_CHARS]

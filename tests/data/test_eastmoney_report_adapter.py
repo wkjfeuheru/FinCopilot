@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -60,8 +61,6 @@ def adapter_returning(pages: list[dict], *, orgs: dict | None = None, **kwargs):
     adapter = EastmoneyReportAdapter(http_get=http_get, **kwargs)
     adapter._test_calls = calls  # type: ignore[attr-defined]
     return adapter
-
-
 # -- 解析 ------------------------------------------------------------------
 
 
@@ -236,36 +235,80 @@ def test_an_empty_result_is_an_empty_frame_not_an_error():
 # -- 全文 ----------------------------------------------------------------
 
 
-def test_with_text_fills_the_content_column():
+def test_with_text_saves_the_pdf_and_returns_a_bounded_preview(tmp_path):
+    """正文落盘并只回一段有界预览：完整内容供 read_pdf/summarize_document 取用。"""
+    from tests.data.pdf_fixtures import make_multi_page_pdf
+
+    # PDF 文本对象按单字节编码，故 fixture 用 ASCII；这里验证的边界是"每页内容不同"。
+    pdf = make_multi_page_pdf(["FIRST-PAGE-SUMMARY", "SECOND-PAGE-DETAIL"])
     page = {"hits": 1, "TotalPage": 1, "data": [item()]}
     adapter = adapter_returning(
-        [page], text_fetcher=lambda url: "这是研报正文"
+        [page], pdf_fetcher=lambda url: pdf, pdf_dir=tmp_path / "pdf"
     )
     result = adapter.fetch_research_reports(top_n=1, with_text=True)
 
-    assert result.df.iloc[0]["content"] == "这是研报正文"
+    row = result.df.iloc[0]
+    # 路径落在注入的目录里，且文件确实存在、内容就是那份 PDF。
+    assert row["pdf_path"]
+    saved = Path(row["pdf_path"])
+    assert saved.is_file()
+    assert saved.read_bytes() == pdf
+    # 预览只来自首页，且不包含后续页的内容。
+    assert "FIRST-PAGE-SUMMARY" in row["content"]
+    assert "SECOND-PAGE-DETAIL" not in row["content"]
+
+
+def test_identical_pdfs_are_stored_once(tmp_path):
+    """内容寻址：同一份 PDF 抓两次只落一个文件，不因重复抓取而膨胀。"""
+    from tests.data.pdf_fixtures import make_pdf
+
+    pdf = make_pdf("SAME-REPORT")
+    page = {"hits": 2, "TotalPage": 1, "data": [item(), item(title="B")]}
+    adapter = adapter_returning(
+        [page], pdf_fetcher=lambda url: pdf, pdf_dir=tmp_path / "pdf"
+    )
+    result = adapter.fetch_research_reports(top_n=2, with_text=True)
+
+    paths = {row["pdf_path"] for row in result.df.to_dict("records")}
+    assert len(paths) == 1
+    assert len(list((tmp_path / "pdf").glob("*.pdf"))) == 1
 
 
 def test_one_unreadable_pdf_does_not_lose_the_metadata():
     """正文抓取失败时只能降级该单元格，而不是整个列表。"""
     page = {"hits": 2, "TotalPage": 1, "data": [item(title="A"), item(title="B")]}
 
-    def flaky(url: str) -> str:
-        if "hits" in url:  # pragma: no cover - 防止误用
-            return ""
+    def flaky(url: str) -> bytes:
         raise AdapterError("反爬校验未通过")
 
-    adapter = adapter_returning([page], text_fetcher=flaky)
+    adapter = adapter_returning([page], pdf_fetcher=flaky)
     result = adapter.fetch_research_reports(top_n=2, with_text=True)
 
     assert len(result.df) == 2
     assert "正文获取失败" in result.df.iloc[0]["content"]
+    # 失败时没有句柄，而不是一个指向不存在文件的路径。
+    assert result.df.iloc[0]["pdf_path"] == ""
+
+
+def test_a_scanned_pdf_reports_no_preview_but_keeps_the_handle(tmp_path):
+    """扫描件抽不出文本，但文件已落盘：预览说明情况，路径仍然给出。"""
+    from tests.data.pdf_fixtures import make_pdf
+
+    blank = make_pdf("")
+    page = {"hits": 1, "TotalPage": 1, "data": [item()]}
+    adapter = adapter_returning(
+        [page], pdf_fetcher=lambda url: blank, pdf_dir=tmp_path / "pdf"
+    )
+    result = adapter.fetch_research_reports(top_n=1, with_text=True)
+
+    assert Path(result.df.iloc[0]["pdf_path"]).is_file()
+    assert "扫描页" in result.df.iloc[0]["content"]
 
 
 def test_with_text_is_refused_when_the_operator_disabled_local_fetch():
     page = {"hits": 1, "TotalPage": 1, "data": [item()]}
     adapter = adapter_returning(
-        [page], text_fetcher=lambda url: "正文", with_text_allowed=False
+        [page], pdf_fetcher=lambda url: b"%PDF-1.4", with_text_allowed=False
     )
 
     with pytest.raises(AdapterError) as exc:

@@ -21,10 +21,10 @@ v1.1 中工具数量存在几处不精确（架构图"12 金融+5 通用" vs 工
 
 | # | 裁定 | 依据 |
 |---|---|---|
-| 1 | **工具总集 = 24**：金融 14（数据 8 + 计算 4 + 输出 2）+ 通用 4 + 元工具 6 | 统一口径 |
-| 2 | **新增 `load_tool` 元工具**：懒加载为"两段式"——`search_tools` 发现 → `load_tool(name)` 把完整 schema 注册进下一轮请求。v1.1 缺激活入口，补齐 | 模型只能调用"本轮请求已注入 schema"的工具，必须显式激活 |
-| 3 | **元工具 = 6**：`research_plan / search_tools / list_skills / load_skill / load_tool / ask_user` | 上一条 |
-| 4 | **常驻 = 20，懒加载 = 4**：懒加载池 = `get_announcements / read_pdf / calc_valuation / run_backtest`（低频或重 IO/重计算） | token 预算（见 §9） |
+| 1 | **工具总集 = 32**：金融-数据 12 + 金融-计算 3 + 金融-输出 2 + 通用 4 + 元 11（后续新增见 §3.4.1 权威表） | 统一口径 |
+| 2 | **元工具 = 11**：`research_plan / update_plan_step / record_conclusion / search_tools / spawn_agent / summarize_document / ask_user / remember_preference / search_memory / update_memory / forget_memory`（后三个是 LTM 跨对话记忆的检索与治理，见 §3.6.4「4.1」）。原 `load_tool` / `load_skill` / `list_skills` 已删除——加载不是模型该问的问题（见 ADR-11） | §3.4.1 |
+| 3 | **常驻 = 21，按需 = 8**：按需池 = `get_announcements / calc_valuation / web_search / get_research_reports / spawn_agent / read_pdf / summarize_document / run_backtest`（低频或重 IO/重计算）。层级由 `@tool(tier=...)` 声明 | token 预算（见 §9） |
+| 4 | **工具元数据与参数由 `@tool`/`@param` 声明**：能力、层级、分组、权限、参数描述同处一地；参数的类型与默认值取自 `_dispatch` 签名，故声明与实现不可能漂移 | 消灭三份手工映射（能力表/懒加载清单/settings 名单） |
 | 5 | **`make_chart` 归 read 级**（自动放行）：其产物写入隔离目录 `output/`，不触碰用户数据；`write_file`（非 output 目录）/`write_report` 归 write 级 | 统一 §3.3 与 §3.6 的冲突 |
 | 6 | **`run_python` 归 write 级 + 沙箱白名单**：Default/Plan 需确认，Auto 放行，但代码一律经 import 白名单与 deny 扫描 | 任代码即危险面 |
 
@@ -53,10 +53,10 @@ v1.1 中工具数量存在几处不精确（架构图"12 金融+5 通用" vs 工
 │   · HookChain：PreToolUse → Tool → PostToolUse（审计强制落盘）           │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ L3 能力层  tools/ + skills/                                              │
-│   · BaseTool 子类注册进 ToolRegistry（resident/lazy 两级）               │
-│   · 元工具族：research_plan / search_tools / list_skills /              │
-│                load_skill / load_tool / ask_user                        │
+│   · @tool/@param 声明 → ToolRegistry（常驻 / 按需两级）                  │
+│   · 元工具族：research_plan / search_tools / ask_user / …               │
 │   · Skills：4 个投研场景包（SKILL.md 流程 + references 方法论 + assets 报告模板）│
+│     由路由层按意图注入（不提供加载工具，见 ADR-11）                      │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ L4 核心层  engine/ + context/                                            │
 │   · AgentLoop（流式 turn / 并行工具 / 治理执行链 / 成本累计）             │
@@ -118,14 +118,15 @@ AgentLoop 内部事件(文本增量/工具状态/计划/结论/确认请求)统�
 |---|---|---|---|
 | ADR-1 | 单进程 asyncio，子智能体同进程独立上下文 | 多进程/微服务 | 轻量、可演示、无部署负担；多智能体仅阶段二演示级 |
 | ADR-2 | plan-and-execute 实现为"单一 `research_plan` 工具 + 系统提示意图路由" | LangGraph 状态机 / 单独 planner 进程 | v1.1 §3.2 的核心理由：不改 Loop，模型自主决策，简洁可讲 |
-| ADR-3 | 懒加载工具"两段式激活"（search→load_tool），Skills 经 load_skill 注入 | 预注入全部 schema | 模型只能调用已注入 schema 的工具，必须显式激活；控 token |
+| ADR-3 | ~~懒加载工具"两段式激活"（search→load_tool），Skills 经 load_skill 注入~~ **已被 ADR-11 取代** | 预注入全部 schema | 模型只能调用已注入 schema 的工具，必须显式激活；控 token |
 | ADR-4 | 结果裁剪发生在**入上下文前**，完整数据落 parquet 供 `read_file` 精读 | 全量入上下文 | v1.1 §3.5：~50K token → ~1K |
 | ADR-5 | 审计为"强制 hook + JSONL 追加"，无开关 | 可关闭审计 | 投研留痕是产品卖点，永不关闭 |
 | ADR-6 | 数据访问收敛到 DataAdapter，akshare 失败字段级降级 tushare | 直接调用 ak | akshare 上游频繁改版，防腐层是工程亮点 |
 | ADR-7 | Provider 直连 HTTP（httpx + SSE），不依赖 anthropic/openai 官方 SDK | 官方 SDK | 便于兼容 Kimi/GLM/DeepSeek 多端点，体现代码功底 |
-| ADR-8 | 记忆三层（§3.6.4）：L1 工作/L2 短期在内存（`list[Msg]`/事件环），L3 长期=SQLite `data_cache/memory.db` 跨会话落盘，MEMORY.md 降级为只读渲染视图 | JSONL 事件库 / 向量检索 / 纯 markdown 单文件 | L1/L2 进程即会话无需回放；L3 需幂等去重 + 按 subject/recency 查询注入，stdlib 零依赖；人工约定区仍以视图承载 |
+| ADR-8 | 记忆分层（§3.6.4）：L1 工作/L2 短期在内存（`list[Msg]`/事件环）；对话内持久化为 SQLite `memory.db`；**跨对话长期记忆 = `ltm_episodes` 情节表 + `ltm_facts` 语义表（按 `user_id` 作用域；情节 task_result 每轮结构化写入 + decision/excerpt 懒蒸馏，语义与偏好同一次调用产出）**；`MEMORY.md` 不做（改只读端点）；语义检索走向量召回（远程 embedding + Qdrant，三级降级到本地 BLOB 余弦/键匹配） | JSONL 事件库 / 纯 markdown 单文件 / 语义也只做键匹配 | L1/L2 进程即会话无需回放；情节需幂等去重（内容哈希）、语义需 UPSERT 覆盖（同键只能有一个版本的真相）；语义条目无稳定键，键匹配召回太弱，故护栏由"跨会话语义召回"真实需求触发（2026-09 已触发） |
 | ADR-9 | 流式输出走 **FastAPI SSE 接口层**，与 CLI 双入口并存 | 仅 CLI / 用 WebSocket 替代 | REPL 保证本地演示与脚本化验收；HTTP 让任意前端接入；SSE 语义贴合"流式文本+工具状态"，实现与调试成本最低（选 WebSocket 则前端与代理复杂度更高，收益不足） |
 | ADR-10 | 可观测性为**尽力而为的三层**（JSON 日志 / Prometheus 指标 / LangSmith 追踪），后端缺失即降级 no-op，追踪不引入 LangChain | 可观测性失败即中断 / 引入 LangChain 自动埋点 | 观测绝不该破坏一次回合（同 ADR-5 的审计原则）；prometheus-client/langsmith 走可选 extra，核心安装保持精简；用 RunTree 低层 API 表达 Span 树，避免为一个后端引入整套框架 |
+| ADR-11 | **加载不由模型发起**：`load_tool`/`load_skill`/`list_skills` 三个工具删除。激活改为引擎发起（检索即激活 + 直接调用即激活），方法论由路由层按能力注入；工具元数据与参数改由 `@tool`/`@param` 声明（`tools/declare.py`） | 保留两段式加载（ADR-3）/ 预注入全部 schema | ① 注册层本就知道全部工具，"该不该给"是引擎能判断的事，做成工具只换来一次纯往返；② 模型不该管理自己的提示词里放什么，而"要不要加载方法"在模型发出调用前就已可从文本判定；③ 删除两个加载入口后子代理沙箱更严——ADR-3 时代"受限目录无 META 组"主要是为了堵住 `load_tool` 这条自我扩权的路，现在这条路不存在了；④ 声明集中后，能力表/懒加载清单/settings 名单三份手工映射随之退役，漏改只在运行期暴露的问题一并消失 |
 
 ### 1.5 模块依赖规则
 
@@ -236,7 +237,7 @@ class OutputSink(Protocol):
 | **config/ —— 配置中心** | [03.1-config.md](docs/modules/03.1-config.md) | settings.json + 环境变量覆盖（FINH_*）；启动校验一次；运行期只读。含 server 与 context（三层记忆）新参数 |
 | **provider/ —— 模型提供层** | [03.2-provider.md](docs/modules/03.2-provider.md) | 厂商差异归一化：anthropic/openai 兼容端点映射为 §2 StreamChunk / Msg；SSE 事件解析、错误分级、重试与超时 |
 | **engine/ —— Agent Loop 核心** | [03.3-engine.md](docs/modules/03.3-engine.md) | 模型-工具闭环（AgentLoop.run / _execute_one 治理执行链）；并行 gather、重试、成本记账与四条不变量 |
-| **tools/ —— 金融工具集** | [03.4-tools.md](docs/modules/03.4-tools.md) | 24 工具权威表（resident=20 / lazy=4）；BaseTool/RawData 契约；ToolRegistry 两段式激活；重点工具实现设计 |
+| **tools/ —— 金融工具集** | [03.4-tools.md](docs/modules/03.4-tools.md) | 32 工具权威表（resident=24 / lazy=8）；BaseTool/RawData 契约；ToolRegistry 两段式激活；重点工具实现设计 |
 | **data/ —— 数据适配、缓存与溯源** | [03.5-data.md](docs/modules/03.5-data.md) | DataAccess 门面、DataAdapter 防腐层与降级、LocalCache（SQLite 索引+parquet）、CitationRegistry。附存储设计 §4.1/§4.2 |
 | **context/ —— 上下文工程** | [03.6-context.md](docs/modules/03.6-context.md) | trim 裁剪器、ResearchContext、Auto-Compaction、L1/L2/L3 三层记忆机制。附存储设计 §4.4（memory.db + MEMORY.md 只读视图） |
 | **permissions/ + hooks/ —— 治理层** | [03.7-governance.md](docs/modules/03.7-governance.md) | PermissionGate 判定、deny/sandbox 规则、Hook 链与 AuditHook 审计。附存储设计 §4.3（audit.jsonl schema） |
@@ -292,12 +293,15 @@ sequenceDiagram
     T->>C: register ×2 → cit_000001/2
     T-->>L: ToolResult(裁剪后markdown)
     L->>P: stream(继续)
-    P-->>L: load_skill(dupont) → calc_metrics → 终答文本
+    Note over L: 路由已按意图注入盈利能力方法论（无模型调用）
+    P-->>L: calc_metrics → 终答文本
     L-->>R: 结论+[数据:cit_000001..] 流式
     R-->>U: 回答渲染（含结论/cid）
 ```
 
-### 5.2 懒加载工具激活（两段式）
+### 5.2 按需激活（注册 → 发现 → 路由）
+
+激活由引擎发起。两条来源都汇入注册层，都使 schema 在**下一次**请求中出现。
 
 ```mermaid
 sequenceDiagram
@@ -305,16 +309,30 @@ sequenceDiagram
     participant L as AgentLoop
     participant P as Provider
     participant R as ToolRegistry
-    Note over L,R: 会话启动：registry.active = 20个常驻schema
-    L->>P: stream(本轮仅注入 resident schemas)
-    P-->>L: search_tools("回测")
-    L->>R: search 索引命中 run_backtest(brief)
-    L->>P: stream(继续)
-    P-->>L: load_tool("run_backtest")
-    L->>R: activate_lazy("run_backtest") → 加入 active
-    L->>P: stream(下一轮 tools=active 已含 run_backtest schema)
-    P-->>L: run_backtest(...)  ← 此刻才可被模型调用
+    participant S as SkillRegistry
+
+    Note over L,S: 请求构建前：路由按能力注入方法论（无模型参与）
+    L->>S: route(capabilities_in_text(用户问题))
+    S-->>L: 盈利能力方法论正文 → ctx.methodology（状态块渲染）
+
+    Note over L,R: 会话启动：registry.active = 21 个常驻 schema
+    L->>P: stream(tools = 常驻 schema；方法论在末尾状态块)
+
+    alt 模型直接调用按需工具
+        P-->>L: run_backtest(...)   ← 未激活
+        L->>R: activate("run_backtest") → 就地激活
+        L->>R: 执行并返回结果（不再拒绝）
+        Note over L,P: 下一次请求起 run_backtest 的 schema 才随 tools 携带
+    else 模型先检索
+        P-->>L: search_tools("回测")
+        L->>R: search 命中 → activate_many([...])（检索即激活）
+        L-->>P: 返回工具与方法论，附参数清单
+        P-->>L: run_backtest(...)   ← 下一次请求已携带其完整 schema
+    end
 ```
+
+两条路径都发射事件使激活可归因：直接调用记 `tool_activated`，检索激活记在
+`search_tools` 的结果与 `params.activated` 里。
 
 ### 5.3 `/report` 会话转研报
 
@@ -402,7 +420,8 @@ sequenceDiagram
 | write 被拒 | verdict=denied/confirm_denied | 回填"用户拒绝"结果 | 模型调整或终止 |
 | docx 导出失败 | python-docx 异常 | 返回错误+保留 markdown 兜底 | 提示路径可手工转 |
 | REPL 断行/中断 | KeyboardInterrupt | 中断本轮，返回提示符 | 无感知（上下文不丢） |
-| SSE 连接中断 | 客户端断连/杀请求 | 取消本轮 task，审计 action=aborted；会话保留 | 重发可续上下文 |
+| SSE 连接中断 | 客户端断连/杀请求 | 取消本轮 task，**先落库再抛出**（`_run_once` 兜住 `CancelledError`）；断点记 `stopped/interrupted`；会话保留 | 重发可续上下文，本轮提问与已有成果不丢 |
+| 用户主动停止 | `POST /v1/chat/stop`（或前端宽限期后硬断兜底） | 协作式收尾：不发 `error`，回传部分成果 + `done(reason=user_stopped, resumable=true)`；审计 `action=generation_stopped`；计划存入断点供续做 | 界面显示"已停止"，可点"继续研究"在同一计划上接着做 |
 | confirm 未响应 | Future TTL 超时 | 按拒绝回填，审计 confirm_denied | 客户端弹"已超时拒绝" |
 | 同会话并发请求 | 重复 POST /v1/chat/stream | 409 busy（单飞，不排队） | 客户端提示上轮未结束 |
 | session 不存在/已回收 | GET/POST 带过期 id | 404 + 提示新开会话（返回新 session_id 由客户端决定） | 前端自动重开 |
@@ -436,16 +455,18 @@ sequenceDiagram
 | 单元·engine | ① tool_use↔tool_result 配对 ② 裁剪后 ≤max_result_tokens ③ 工具异常不击穿 ④ 权限裁决表驱动 ⑤ 重试触发条件 | FakeProvider（脚本化事件）、StubTool |
 | 单元·provider | Anthropic/OpenAI SSE 事件→StreamChunk 映射、tool_use 增量 JSON 归并、错误分级 | 本地 SSE 文件回放 |
 | 单元·trim/compaction | 20行/摘要块 token 预算；压缩保留优先级断言 | FakeSummarizer |
-| 单元·registry | 懒加载：激活前不可调、激活后第二轮才注入 schema | — |
+| 单元·registry | 按需工具：激活后下一次请求才注入 schema；检索即激活；受限目录无按需层级 | — |
+| 单元·declare | `@param` 描述/约束/默认值与 `_dispatch` 签名一致；参数名笔误在导入期失败 | — |
+| 单元·routing | 单能力只注入方法论、跨门槛才注入流程、成稿注入模板；注入幂等 | — |
 | 数据·offline | cache 命中/TTL/降级编排/指纹一致；SQLite 幂等写 | fixture parquet + FakeAdapter(可注入抛错) |
 | 数据·integration | akshare 真接口冒烟（CI 每日，标记 `@smoke`）；tushare 降级真跑（有 token 才跑，`skipif`） | — |
 | 渲染·report | {cite}/{chart}/{table} 注入、无引用数字校验告警、docx 导出 golden 文件对比 | 固定 outline |
 | 治理·audit | 各 action 落盘字段断言；hook 不可卸载；deny 命中样例 | StubTool |
 | E2E（标记 `@e2e`，可选） | Demo A/B 真模型跑通，断言产物存在+citation 数 | 真模型（成本预算内） |
 | REPL | 命令路由、/report 接线、Ctrl+C 保上下文 | 伪输入流 |
-| 服务·server（v1.1） | SSE 帧编组（event/data 顺序）、会话新建/复用/单飞 409、ConfirmBus 确认与 TTL、断线 aborted 审计、静态页可访问 | httpx.AsyncClient + ASGITransport + FakeProvider；curl 冒烟 |
+| 服务·server（v1.1） | SSE 帧编组（event/data 顺序）、会话新建/复用/单飞 409、ConfirmBus 确认与 TTL、**用户主动停止 + 断线落库/断点**、静态页可访问 | httpx.AsyncClient + ASGITransport + FakeProvider；curl 冒烟 |
 
-- 关键验收用例（写进 M0/M2 验收）："断网重跑同问题走缓存"、"拔掉 akshare 自动降级"、"审计一行不落"、"懒加载第二轮才可调"。
+- 关键验收用例（写进 M0/M2 验收）："断网重跑同问题走缓存"、"拔掉 akshare 自动降级"、"审计一行不落"、"按需工具检索后下一轮才携带 schema"。
 
 ---
 
@@ -456,9 +477,9 @@ sequenceDiagram
 | 组成 | token 预算 |
 |---|---|
 | system prompt（意图路由+纪律+memory 片段） | ~1.2K |
-| 常驻工具 schema（20 × ~60 token，经 trim_schema） | ~1.2K |
+| 常驻工具 schema（21 × ~60 token，经 trim_schema） | ~1.3K |
 | ResearchContext 序列化（symbols/plan 摘要/conclusions） | ~0.3K |
-| 已加载 skill 正文（会话累积） | ≤2K（load_skill 前提示模型控制数量） |
+| 路由注入的方法论正文（会话累积） | ≤2K（两道门槛 + 按目标幂等；单点提问通常只注入一份） |
 | 单轮 tool_result（裁剪后 ≤max_result_tokens=1K） | ≤1K×并行数 |
 | 历史轮次 | compaction 阈值 80% 窗口内控制 |
 
@@ -473,7 +494,7 @@ sequenceDiagram
 |---|---|---|
 | M0 最小闭环 | ① config+types 骨架 ② FakeProvider+loop ③ AnthropicCompat 直连（kimi）④ get_quote/kline/indicators（直连 ak，无缓存）⑤ trim v1 ⑥ REPL 雏形（/quit） | "茅台最新PE"多轮对话取数正确；流式回显；单测全绿 |
 | M1 数据层完备 | ① adapter 抽象+akshare+tushare 降级 ② mapping.py ③ cache(SQLite+parquet) ④ citation 注册表+8 数据工具补齐 ⑤ /cache /citations | 断网重跑走缓存；ak 拔线降级 tushare；endpoint 溯源正确 |
-| M2 规划与治理 | ① research_plan+ctx.plan+步骤回显 ② 元工具 search_tools/list_skills/load_skill/load_tool/ask_user ③ registry 两级+懒加载激活 ④ calc_metrics/calc_valuation ⑤ PermissionGate+deny+SandboxScanner+AuditHook | 复杂先规划/简单直答；懒加载第二轮可调；deny 实测拦截；audit 完整 |
+| M2 规划与治理 | ① research_plan+ctx.plan+步骤回显 ② 元工具 search_tools/ask_user ③ registry 两级+按需激活 ④ calc_metrics/calc_valuation ⑤ PermissionGate+deny+SandboxScanner+AuditHook | 复杂先规划/简单直答；按需工具检索后下一轮可调；deny 实测拦截；audit 完整 |
 | M3 研报管道 | ① make_chart ② ReportPipeline+占位符+无引用校验 ③ docx 导出 ④ 场景技能（研报模板） ⑤ /report 会话转研报 | 一句话出带图带附录 docx；问答积累直接成稿 |
 | M4 上下文工程 | ① ResearchContext 全字段+复用提示 ② compaction ③ 三层记忆（L1 WorkingMemory+L2 事件环+L3 memory.db/视图） ④ skill 补齐(8) ⑤ 追问增量成本验证 | 10 轮不爆窗；追问只增量取数（L2 召回命中既有 cid）；缓存命中日志可查 |
 | M5 演示打磨 | ① coordinator+risk 终审（可裁）② E2E+README ③ 成本/耗时压测 ④ Demo 脚本化 | Demo B <3 分钟、<$0.5；审计/成本/缓存演示顺畅 |
@@ -510,8 +531,8 @@ finharness/
 │   │   │                          # announcements peers news calc_metrics
 │   │   │                          # calc_valuation backtest pdf chart report
 │   │   ├── generic/                # read_file write_file run_python web_search
-│   │   └── meta/                   # research_plan search_tools list_skills
-│   │                              # load_skill load_tool ask_user
+│   │   └── meta/                   # research_plan search_tools ask_user
+│   │                              # spawn_agent summarize_document preference
 │   ├── data/
 │   │   ├── access.py               # DataAccess 门面（降级编排）
 │   │   ├── adapters/akshare_adapter.py tushare_adapter.py base.py
@@ -548,10 +569,10 @@ finharness/
 
 | 项 | v1.1 | 本文档裁定 |
 |---|---|---|
-| 工具总数 | "12 金融+5 通用"/"23 能力"口径不一 | **24 个**（金融14+通用4+元6） |
-| 懒加载激活 | 仅描述 search 后按需注册 | 明确 `load_tool` 两段式（search→load_tool→下轮生效） |
-| 元工具 | 5 个 | **6 个**（+load_tool） |
-| 常驻/懒加载 | ~15 常驻 | **20 常驻 / 4 懒加载**（get_announcements, read_pdf, calc_valuation, run_backtest） |
+| 工具总数 | "12 金融+5 通用"/"23 能力"口径不一 | **32 个**（金融-数据12 + 金融-计算3 + 金融-输出2 + 通用4 + 元11） |
+| 按需激活 | 仅描述 search 后按需注册 | 引擎发起：检索即激活 + 直接调用即激活，schema 下一次请求生效（ADR-11） |
+| 元工具 | 5 个 | **8 个**（含 `search_tools`、`summarize_document`；`load_tool`/`load_skill`/`list_skills` 已删） |
+| 常驻/按需 | ~15 常驻 | **21 常驻 / 8 按需**（get_announcements, calc_valuation, web_search, get_research_reports, spawn_agent, read_pdf, summarize_document, run_backtest），层级由 `@tool(tier=...)` 声明 |
 | make_chart 权限 | §3.3 输出类需确认 vs §3.6 图表 read 矛盾 | **read**（产物隔离 output/） |
 | run_python | 未细述 | **write+沙箱**（白名单 import + deny + 受限内建） |
 | 模型层 | Provider 抽象 | 细化 AnthropicCompat/OpenAICompat 事件映射、Msg 协议、错误分级 |
@@ -565,7 +586,8 @@ finharness/
 | 输出端抽象 | AgentLoop 事件统一走 OutputSink：rich(CLI) / SSE(FastAPI)，§1.3 |
 | ConfirmBus | write 工具经 SSE `confirm_request`→`POST /v1/chat/confirm` 异步确认（含 TTL/超时拒绝），§3.12.4 |
 | 简易 Web 聊天页 | `server/static/` 无框架原生页走 fetch+SSE，§3.12.6 |
-| 服务端会话生命周期 | SessionRegistry：复用/单飞 409/idle 回收/断线 aborted 审计，§3.12.2、§6 |
+| 服务端会话生命周期 | SessionRegistry：复用/单飞 409/idle 回收/停止信号，§3.12.2、§6 |
+| 用户主动停止与断点恢复 | `POST /v1/chat/stop` + 协作式检查点 + `turn_checkpoints` 计划恢复，§3.12.8、§3.3.11、§3.6.4「4.2」 |
 | 里程碑 | 新增 M6（服务层 Web 化，与 M3+ 并行），§10 |
 
 ---

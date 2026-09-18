@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Alert, Button, Form, Input, Modal, Select, Space, Switch, Table, Tag, Typography } from "antd";
+import { useEffect, useState } from "react";
+import { Alert, Button, Form, Input, Modal, Select, Space, Switch, Tag, Typography } from "antd";
 import {
   activateConfig,
   createConfig,
@@ -170,63 +170,12 @@ export function SettingsModal({ open, onClose, refreshConfig }: Props) {
     }
   }
 
-  const columns = useMemo(
-    () => [
-      { title: "名称", dataIndex: "name", key: "name" },
-      {
-        title: "模型",
-        dataIndex: "model",
-        key: "model",
-        render: (value: string) => <Typography.Text code>{value}</Typography.Text>,
-      },
-      {
-        title: "协议",
-        dataIndex: "kind",
-        key: "kind",
-        render: (value: string) => KIND_LABELS[value] ?? value,
-      },
-      {
-        title: "密钥",
-        dataIndex: "has_key",
-        key: "has_key",
-        render: (value: boolean) => (value ? <Tag color="green">已配置</Tag> : <Tag>未配置</Tag>),
-      },
-      {
-        title: "状态",
-        dataIndex: "is_active",
-        key: "is_active",
-        render: (value: boolean) => (value ? <Tag color="blue">使用中</Tag> : null),
-      },
-      {
-        title: "操作",
-        key: "actions",
-        render: (_: unknown, record: ProviderConfig) => (
-          <Space size="small">
-            {!record.is_active && (
-              <Button size="small" type="link" disabled={busy} onClick={() => void handleActivate(record)}>
-                启用
-              </Button>
-            )}
-            <Button size="small" type="link" disabled={busy} onClick={() => startEdit(record)}>
-              编辑
-            </Button>
-            <Button size="small" type="link" danger disabled={busy} onClick={() => void handleDelete(record)}>
-              删除
-            </Button>
-          </Space>
-        ),
-      },
-    ],
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [busy, editing],
-  );
-
   return (
     <Modal
       title="模型供应商配置"
       open={open}
       onCancel={() => onClose(false)}
-      width={860}
+      width={960}
       footer={null}
       destroyOnHidden
     >
@@ -236,24 +185,48 @@ export function SettingsModal({ open, onClose, refreshConfig }: Props) {
           <Alert type="warning" message="尚未配置供应商，配置并启用后即可开始对话。" showIcon />
         )}
 
-        <Table<ProviderConfig>
-          rowKey="id"
-          size="small"
-          pagination={false}
-          dataSource={snapshot.configs}
-          columns={columns}
-          locale={{ emptyText: "暂无配置" }}
-        />
+        <div className="settings-layout">
+          <aside className="settings-config-list" aria-label="模型配置列表">
+            <div className="settings-config-list-head">
+              <div>
+                <span className="settings-kicker">MODEL CONFIGURATIONS</span>
+                <Typography.Title level={5}>已保存配置</Typography.Title>
+              </div>
+              <Button size="small" onClick={resetForm} disabled={busy}>新增</Button>
+            </div>
+            {snapshot.configs.length === 0 ? (
+              <p className="settings-empty">尚无模型配置</p>
+            ) : snapshot.configs.map((record) => (
+              <article className={`settings-config-card ${editing?.id === record.id ? "active" : ""}`} key={record.id}>
+                <button type="button" onClick={() => startEdit(record)}>
+                  <strong>{record.name}</strong>
+                  <span>{record.model}</span>
+                  <small>{KIND_LABELS[record.kind] ?? record.kind}</small>
+                </button>
+                <div className="settings-config-tags">
+                  {record.is_active && <Tag color="blue">使用中</Tag>}
+                  <Tag color={record.has_key ? "green" : "default"}>{record.has_key ? "密钥已配置" : "缺少密钥"}</Tag>
+                </div>
+                <Space size="small" wrap>
+                  {!record.is_active && <Button size="small" type="link" disabled={busy} onClick={() => void handleActivate(record)}>启用</Button>}
+                  <Button size="small" type="link" disabled={busy} onClick={() => startEdit(record)}>编辑</Button>
+                  <Button size="small" type="link" danger disabled={busy} onClick={() => void handleDelete(record)}>删除</Button>
+                </Space>
+              </article>
+            ))}
+          </aside>
 
-        <Typography.Title level={5} style={{ margin: 0 }}>
-          {editing ? `编辑：${editing.name}` : "新增配置"}
-        </Typography.Title>
-
-        <Form<FormValues>
-          form={form}
-          layout="vertical"
-          initialValues={{ kind: "openai_compat", activate: true }}
-        >
+          <div className="settings-form-panel">
+            <div className="settings-form-head">
+              <span className="settings-kicker">{editing ? "EDIT CONFIGURATION" : "NEW CONFIGURATION"}</span>
+              <Typography.Title level={5}>{editing ? `编辑：${editing.name}` : "新增模型配置"}</Typography.Title>
+              <p>密钥仅写入加密存储，页面不会回显。</p>
+            </div>
+            <Form<FormValues>
+              form={form}
+              layout="vertical"
+              initialValues={{ kind: "openai_compat", activate: true }}
+            >
           <Space align="start" wrap size="middle" style={{ width: "100%" }}>
             <Form.Item
               name="name"
@@ -331,7 +304,9 @@ export function SettingsModal({ open, onClose, refreshConfig }: Props) {
               </Button>
             )}
           </Space>
-        </Form>
+            </Form>
+          </div>
+        </div>
       </Space>
     </Modal>
   );

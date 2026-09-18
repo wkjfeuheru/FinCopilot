@@ -160,7 +160,6 @@ class DemoClient:
                     f"{self.base_url}/v1/chat/stream",
                     json={
                         "message": prompt,
-                        "mode": "default",
                         "conversation_id": self.conversation_id,
                     },
                     headers=self.headers,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
@@ -35,6 +36,12 @@ class Msg:
     @classmethod
     def user(cls, content: str) -> "Msg":
         return cls(role="user", content=content)
+
+
+# 会话研究状态块作为**尾部 user 消息**随请求发送（docs 3.3）：它是本请求的一个视图，
+# 从不是用户输入、也从不持久化。``role`` 无法把它与真实提问区分开，因此用元数据标记，
+# 使「最后一条用户消息」这一读法（脚本化 provider、测试替身）不会把状态块当成问题。
+STATE_VIEW_META = "state_view"
 
 
 class StreamEvent(str, Enum):
@@ -146,3 +153,34 @@ class OutputSink(Protocol):
     """引擎事件的输出汇点；服务层借此接收流式事件并推送给客户端。"""
 
     async def emit(self, event: EngineEvent) -> None: ...
+
+
+class StopSignal:
+    """一次挂起请求的协作式中断信号（docs 03.3）。
+
+    放在共享契约里，因为它的两端分属不同层：服务层创建并置位它，引擎在等待点
+    检查它。引擎不依赖服务层，因此这个原语不能住在任何一侧。
+
+    它是一个事件而非布尔量：引擎只需 ``requested`` 一次判断即可，无需轮询也
+    无需 await，因此检查点本身不会成为新的挂起点，也不会改变没有停止请求时
+    的执行时序。
+    """
+
+    __slots__ = ("_event", "reason")
+
+    def __init__(self, reason: str = "user_stopped") -> None:
+        self._event = asyncio.Event()
+        self.reason = reason
+
+    def request(self, reason: str | None = None) -> None:
+        """置位；重复置位幂等（用户可能连点两次停止）。"""
+        if reason:
+            self.reason = reason
+        self._event.set()
+
+    @property
+    def requested(self) -> bool:
+        return self._event.is_set()
+
+    def reset(self) -> None:
+        self._event.clear()

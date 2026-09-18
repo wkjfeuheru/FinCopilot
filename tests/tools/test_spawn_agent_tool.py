@@ -11,8 +11,8 @@ import asyncio
 
 from finharness.coordinator import SubAgentResult
 from finharness.tools.base import PermissionLevel, ToolGroup
+from finharness.tools.declare import Tier
 from finharness.tools.meta.spawn import SpawnAgentTool
-from finharness.tools.registry import DEFAULT_LAZY_TOOLS
 
 
 class StubCoordinator:
@@ -116,4 +116,4 @@ def test_the_tool_is_lazy_read_only_meta():
     assert SpawnAgentTool.permission is PermissionLevel.READ
     assert SpawnAgentTool.group is ToolGroup.META
     assert SpawnAgentTool.needs_coordinator is True
-    assert "spawn_agent" in DEFAULT_LAZY_TOOLS
+    assert SpawnAgentTool.tier is Tier.LAZY

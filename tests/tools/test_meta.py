@@ -10,12 +10,7 @@ from finharness.data.access import DataAccess
 from finharness.data.citation import CitationRegistry
 from finharness.server.confirm import ConfirmBus
 from finharness.tools.meta.plan import RecordConclusionTool, UpdatePlanStepTool
-from finharness.tools.meta.skills import (
-    ListSkillsTool,
-    LoadSkillTool,
-    SkillError,
-    SkillRegistry,
-)
+from finharness.tools.meta.skills import SkillError, SkillRegistry
 
 
 def packaged_skills() -> SkillRegistry:
@@ -27,7 +22,7 @@ def test_packaged_catalogue_lists_the_scenarios():
     assert {"equity-research", "industry-research", "macro-research", "quant-factor"} <= names
 
 
-def test_list_skills_reads_frontmatter_only():
+def test_the_catalogue_reads_frontmatter_only():
     metas = packaged_skills().list_skills()
 
     equity = next(m for m in metas if m.name == "equity-research")
@@ -59,36 +54,16 @@ def test_missing_directory_yields_an_empty_catalogue(tmp_path):
     assert "为空" in library.describe()
 
 
-def test_list_skills_tool_renders_the_catalogue():
-    async def run():
-        data = DataAccess([])
-        data.settings = Settings()
-        return await ListSkillsTool(data).run()
+def test_the_catalogue_is_readable_as_a_description():
+    """``describe`` 保留了 ``list_skills`` 曾经提供的能力。
 
-    result = asyncio.run(run())
+    目录展示不再是一个工具——模型不通过工具调用去了解自己有哪些方法——但用于
+    展示与排障的描述文本仍然需要，因此它留在 ``SkillRegistry`` 上。
+    """
+    text = packaged_skills().describe()
 
-    assert result.ok is True
-    assert "equity-research" in result.content
-
-
-def test_load_skill_tool_marks_the_context_and_reports_reuse():
-    ctx = ResearchContext(cite=CitationRegistry(), settings=Settings())
-    data = DataAccess([])
-    data.settings = Settings()
-
-    async def run():
-        tool = LoadSkillTool(data, ctx=ctx)
-        first = await tool.run(name="equity-research")
-        second = await tool.run(name="equity-research")
-        return first, second
-
-    first, second = asyncio.run(run())
-
-    assert first.ok is True
-    assert "技能：" in first.content
-    assert second.ok is True
-    assert "复用" in second.content
-    assert ctx.loaded_skills == ["equity-research"]
+    assert "equity-research" in text
+    assert "references/valuation.md" in text
 
 
 # --- 计划回写工具（文档 03.3.9）----------------------------------------------

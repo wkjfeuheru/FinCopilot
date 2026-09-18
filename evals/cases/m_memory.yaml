@@ -1,0 +1,146 @@
+# M 系列：跨对话长期记忆（LTM，docs 03.6.4）
+#
+# 与其它用例不同，这组用例用 chats 声明**多个对话**：它们共享同一 store 与
+# user_id，因此前一个对话写入的长期记忆对后续对话可见——这正是"跨对话记忆"
+# 的观测方式。task_result 情节由引擎每轮写入（无 LLM），故离线自检也能验证；
+# decision/excerpt 依赖蒸馏，judge 留给真实模型运行。
+
+- id: M1-01
+  title: 新对话召回上一对话形成的任务结果
+  category: M1
+  source: "跨对话记忆-LTM"
+  tags: [core]
+  chats:
+    # 对话一：形成一条带 cid 的结论（→ task_result 情节）
+    - conversation_id: M1-01-a
+      turns:
+        - user: 分析贵州茅台(600519)的盈利能力，给出明确结论
+          interactive: none
+          expect:
+            trajectory:
+              tools_must: [get_financials]
+              max_tool_calls: 8
+            safety:
+              no_degradation: true
+    # 对话二：全新对话，不得重取数据即可复述上一对话的结论
+    - conversation_id: M1-01-b
+      turns:
+        - user: 之前我们分析过茅台(600519)的盈利能力，结论是什么？
+          interactive: none
+          expect:
+            answer:
+              contains_any: ["茅台", "600519", "盈利能力", "ROE", "净利率"]
+              refusal: false
+            safety:
+              no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 180, max_rounds: 12}
+  notes: "验证 task_result 情节的跨对话被动注入（首轮加载最近情节）。"
+
+- id: M1-02
+  title: 主动检索记忆（search_memory 轨迹）
+  category: M1
+  source: "跨对话记忆-LTM"
+  tags: [core]
+  chats:
+    - conversation_id: M1-02-a
+      turns:
+        - user: 记录一下：五粮液(000858)对比茅台，我们重点关注毛利率与渠道结构
+          interactive: none
+          expect:
+            safety:
+              no_degradation: true
+    - conversation_id: M1-02-b
+      turns:
+        - user: 用 search_memory 查一下我们之前对五粮液(000858)关注过哪些维度
+          interactive: none
+          expect:
+            trajectory:
+              tools_must: [search_memory]
+            answer:
+              contains_any: ["五粮液", "000858", "毛利率", "渠道"]
+            safety:
+              no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 10}
+  notes: "验证主动召回工具可达，且检索结果被用于作答。"
+
+- id: M1-03
+  title: 用户可要求遗忘某条跨对话记忆
+  category: M1
+  source: "跨对话记忆-LTM"
+  tags: [core]
+  chats:
+    - conversation_id: M1-03-a
+      turns:
+        - user: 记住这条研究方向：我们暂时不再跟踪宁德时代(300750)
+          interactive: none
+          expect:
+            safety:
+              no_degradation: true
+    - conversation_id: M1-03-b
+      turns:
+        - user: search_memory 查一下宁德时代(300750)的记忆，然后用 forget_memory 删掉它
+          interactive: none
+          expect:
+            trajectory:
+              tools_must: [search_memory]
+              tools_any: [forget_memory]
+            safety:
+              no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 180, max_rounds: 12}
+  notes: "检索 + 遗忘构成记忆治理闭环；forget_memory 为 WRITE 权限，需确认。"
+
+- id: M2-01
+  title: 跨对话复用用户偏好（语义记忆 preference）
+  category: M2
+  source: "跨对话记忆-LTM"
+  tags: [core]
+  chats:
+    # 对话一：用户表达产出偏好，由 remember_preference 或蒸馏写入
+    - conversation_id: M2-01-a
+      turns:
+        - user: 以后所有报告都写得简洁一点，少用表格
+          interactive: none
+          expect:
+            trajectory:
+              tools_any: [remember_preference]
+            safety:
+              no_degradation: true
+    # 对话二：全新对话，偏好必须生效
+    - conversation_id: M2-01-b
+      turns:
+        - user: 帮我写一份茅台(600519)的简要研究报告
+          interactive: none
+          expect:
+            answer:
+              refusal: false
+            safety:
+              no_degradation: true
+  budget: {max_tokens: 150000, max_seconds: 240, max_rounds: 15}
+  notes: "偏好由 notes/ltm_facts 承载并注入状态块；验证跨对话生效。"
+
+- id: M2-02
+  title: 跨对话复用积累的事实与概念
+  category: M2
+  source: "跨对话记忆-LTM"
+  tags: [core]
+  chats:
+    - conversation_id: M2-02-a
+      turns:
+        - user: 记住：我们分析白酒行业固定用 ROE 和毛利率两个指标，不看过多的短期波动
+          interactive: none
+          expect:
+            safety:
+              no_degradation: true
+    - conversation_id: M2-02-b
+      turns:
+        - user: 按我们一贯的口径分析一下五粮液(000858)的盈利质量
+          interactive: none
+          expect:
+            answer:
+              contains_any: ["ROE", "毛利率", "净资产收益率"]
+            safety:
+              no_degradation: true
+  budget: {max_tokens: 150000, max_seconds: 240, max_rounds: 15}
+  notes: "概念/口径类语义记忆的跨对话复用；需真实模型 + 蒸馏（离线不判分）。"
+
+

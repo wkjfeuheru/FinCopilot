@@ -49,7 +49,7 @@ def score_trajectory(case: EvalCase, run: CaseRun) -> DimensionScore:
     max_tool_calls: int | None = None
     plan_required: bool | None = None
 
-    for turn in case.turns:
+    for turn in case.all_turns:
         trajectory = turn.expect.trajectory
         must.extend(trajectory.tools_must)
         any_of.extend(trajectory.tools_any)

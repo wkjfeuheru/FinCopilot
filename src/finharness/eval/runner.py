@@ -139,16 +139,18 @@ class CaseRun:
         return max(revisions, default=0)
 
     def loaded_skills(self) -> list[str]:
-        """模型加载的技能名，从 load_skill 调用中解析得到。"""
+        """本次运行注入的方法论，从 ``context_routed`` 事件中读取。
+
+        加载不再是工具调用，而是引擎的路由动作，因此观测点随之从工具轨迹移到事件流。
+        方法名保持不变，使按"这次拿到了哪些方法"编写的用例断言无需改写。
+        """
         skills: list[str] = []
         for turn in self.turns:
-            for round_trace in turn.trace:
-                for action in round_trace.actions:
-                    if action.name != "load_skill":
-                        continue
-                    name = str((action.args or {}).get("name") or "")
-                    if name:
-                        skills.append(name)
+            for event in turn.events:
+                if event.kind != "context_routed":
+                    continue
+                for name in event.data.get("skills") or []:
+                    skills.append(str(name))
         return skills
 
     def degraded(self) -> bool:
@@ -187,13 +189,22 @@ class CaseRun:
 
 
 def isolate_settings(base: Settings, case_dir: Path) -> Settings:
-    """返回 ``base`` 的副本，其可变路径均指向 ``case_dir`` 内部。"""
+    """返回 ``base`` 的副本，其可变路径均指向 ``case_dir`` 内部。
+
+    状态文件（密钥、用户库、配置库）也一并落到用例目录：评测会反复重建应用，
+    复用工作目录下的真实 ``state/`` 会让用例读到上一次运行留下的密钥与配置。
+    """
     case_dir.mkdir(parents=True, exist_ok=True)
     data = base.data.model_copy(update={"cache_dir": case_dir / "cache"})
+    state_dir = case_dir / "state"
     paths = base.paths.model_copy(
         update={
             "output_dir": case_dir / "output",
-            "memory_db": case_dir / "memory.db",
+            "state_dir": state_dir,
+            "memory_db": state_dir / "memory.db",
+            "auth_db": state_dir / "users.db",
+            "config_db": state_dir / "config.db",
+            "secret_key": state_dir / "secret.key",
         }
     )
     audit = base.audit.model_copy(update={"log_path": case_dir / "audit.jsonl"})
@@ -201,6 +212,7 @@ def isolate_settings(base: Settings, case_dir: Path) -> Settings:
     (case_dir / "cache").mkdir(parents=True, exist_ok=True)
     (case_dir / "output").mkdir(parents=True, exist_ok=True)
     (case_dir / "logs").mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
     return isolated
 
 
@@ -237,6 +249,7 @@ def build_data_access(settings: Settings, *, offline: bool) -> DataAccess:
             EastmoneyReportAdapter(
                 timeout_s=settings.search.timeout_s,
                 with_text_allowed=settings.search.local_pdf_fallback,
+                pdf_dir=Path(settings.data.cache_dir) / "pdf",
             )
         )
     return DataAccess(
@@ -308,6 +321,10 @@ class EvalRunner:
     async def run_case(self, case: EvalCase) -> CaseRun:
         """运行单个用例：隔离设置、组装引擎、逐轮执行并采集结果。
 
+        多对话用例（``chats``）依次运行，共享同一 store 与 user_id，因此
+        前一个对话写入的跨对话情节（LTM）对后续对话可见——这正是
+        "跨对话记忆"用例的观测方式。
+
         返回记录该用例全程的 CaseRun。
         """
         case_dir = self.run_dir / "cases" / case.id
@@ -325,50 +342,78 @@ class EvalRunner:
         sink = RecordingSink()
         channel = InteractionChannel()
         data = build_data_access(settings, offline=self.offline)
-        cite = CitationRegistry()
-        ctx = ResearchContext(cite=cite, settings=settings)
-        registry = ToolRegistry(data, ctx=ctx, settings=settings)
         store = MemoryStore(settings.paths.memory_db)
-        audit = AuditHook(AuditLogWriter(settings.audit.log_path), session_id=case.id)
-        gate = PermissionGate(settings=settings, confirm=channel.confirm)
-        loop = AgentLoop(
-            provider=self.provider,
-            registry=registry,
-            settings=settings,
-            system=system_prompt(),
-            cite=cite,
-            session_id=case.id,
-            ctx=ctx,
-            gate=gate,
-            hooks=HookChain([audit]),
-            conversation_id=case.id,
-            store=store,
-        )
-        loop.interactive = channel.ask
 
         started = time.monotonic()
+        turn_index = 0
         try:
-            for index, turn in enumerate(case.turns):
-                channel.reset(turn.interactive, turn.interactive_answer)
-                sink.events = []
-                turn_started = time.monotonic()
-                outcome = await asyncio.wait_for(
-                    loop.run(turn.user), self.turn_timeout_s
+            for group_index, (fixed_id, turns) in enumerate(case.conversation_groups()):
+                # 单对话形式沿用既有行为（以用例 id 为键）；多对话形式下
+                # 没写 id 的对话按序号生成，避免与其它对话冲突。
+                conversation_id = fixed_id or (
+                    case.id if not case.chats else f"{case.id}#{group_index + 1}"
                 )
-                captured = CapturedTurn(
-                    index=index,
-                    user=turn.user,
-                    outcome=outcome,
-                    events=list(sink.events),
-                    interactions=list(channel.log),
-                    duration_ms=round((time.monotonic() - turn_started) * 1000),
+                cite = CitationRegistry()
+                ctx = ResearchContext(cite=cite, settings=settings)
+                registry = ToolRegistry(data, ctx=ctx, settings=settings)
+                audit = AuditHook(
+                    AuditLogWriter(settings.audit.log_path),
+                    session_id=conversation_id,
                 )
-                record.turns.append(captured)
-                self._log(
-                    f"  [{case.id}] turn {index + 1}: succeeded={outcome.succeeded} "
-                    f"tools={outcome.tool_calls} tokens="
-                    f"{outcome.usage.input_tokens + outcome.usage.output_tokens}"
+                gate = PermissionGate(settings=settings, confirm=channel.confirm)
+                loop = AgentLoop(
+                    provider=self.provider,
+                    registry=registry,
+                    settings=settings,
+                    system=system_prompt(),
+                    cite=cite,
+                    session_id=conversation_id,
+                    ctx=ctx,
+                    gate=gate,
+                    hooks=HookChain([audit]),
+                    conversation_id=conversation_id,
+                    store=store,
                 )
+                loop.interactive = channel.ask
+                for turn in turns:
+                    channel.reset(turn.interactive, turn.interactive_answer)
+                    sink.events = []
+                    turn_started = time.monotonic()
+                    outcome = await asyncio.wait_for(
+                        loop.run(turn.user), self.turn_timeout_s
+                    )
+                    captured = CapturedTurn(
+                        index=turn_index,
+                        user=turn.user,
+                        outcome=outcome,
+                        events=list(sink.events),
+                        interactions=list(channel.log),
+                        duration_ms=round((time.monotonic() - turn_started) * 1000),
+                    )
+                    record.turns.append(captured)
+                    turn_index += 1
+                    self._log(
+                        f"  [{case.id}] turn {turn_index} ({conversation_id}): "
+                        f"succeeded={outcome.succeeded} "
+                        f"tools={outcome.tool_calls} tokens="
+                        f"{outcome.usage.input_tokens + outcome.usage.output_tokens}"
+                    )
+                # 跨对话记忆用例：对话结束后蒸馏一次，使 decision/excerpt
+                # 情节对后续对话可见。task_result 情节每轮已写入，不依赖这里；
+                # 蒸馏失败（离线自检 provider 不产出 JSON 即属此列）也不影响
+                # 用例成立，因此吞掉异常。
+                if case.distill_between_chats and case.chats:
+                    try:
+                        from finharness.context.memory.distill import EpisodeDistiller
+
+                        distiller = EpisodeDistiller(
+                            provider=self.provider, store=store, settings=settings
+                        )
+                        await distiller.distill_conversation(
+                            conversation_id, user_id=""
+                        )
+                    except Exception:  # noqa: BLE001 - 蒸馏失败不影响用例
+                        pass
         except Exception as exc:  # noqa: BLE001 - 失败的用例是数据，而非崩溃
             record.error = f"{type(exc).__name__}: {exc}"
             self._log(f"  [{case.id}] error: {record.error}")

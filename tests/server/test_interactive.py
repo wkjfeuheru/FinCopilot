@@ -22,8 +22,8 @@ def _settings(tmp_path) -> Settings:
         data={"cache_dir": tmp_path / "cache"},
         paths={
             "output_dir": tmp_path / "output",
-            "memory_db": tmp_path / "cache" / "memory.db",
-            "auth_db": tmp_path / "cache" / "users.db",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
         },
     )
 
@@ -139,3 +139,87 @@ def test_respond_endpoint_resolves_the_apps_pending_request(tmp_path):
         return answer
 
     assert asyncio.run(scenario()) == "y"
+
+
+# -- 网络外发确认（docs 03.7.1）------------------------------------------------
+
+
+def test_egress_confirmation_offers_remember_option(tmp_path):
+    """网络外发确认必须给用户"本对话不再询问"，而不是只有一次性的 y/n。"""
+    from finharness.permissions.gate import PermissionGate
+    from tests.permissions.test_gate import FakeTool, make_settings
+
+    bus = ConfirmBus(ttl_s=2.0)
+    settings = make_settings(tmp_path)
+    confirmed: set[str] = set()
+    announced: list[dict] = []
+
+    async def confirm_egress(name, args):
+        async def announce(payload):
+            announced.append(payload)
+            await _answer_latest(bus, "y_remember")
+
+        _, answer = await bus.request(
+            session_id="s",
+            kind="confirm",
+            prompt=f"{name} 将访问外部网络",
+            options=["y", "y_remember", "n"],
+            announce=announce,
+        )
+        if answer == "y_remember":
+            confirmed.add("egress")
+            return True
+        return answer == "y"
+
+    gate = PermissionGate(
+        settings=settings,
+        confirm_egress=confirm_egress,
+        conversation_id="conv-1",
+        confirmed_categories=confirmed,
+    )
+
+    async def scenario():
+        return await gate.check(FakeTool(name="web_search"), {"query": "政策"})
+
+    decision = asyncio.run(scenario())
+
+    assert decision.verdict.value == "allow"
+    assert announced[0]["options"] == ["y", "y_remember", "n"]
+    assert "egress" in confirmed
+
+
+def test_egress_remember_suppresses_the_next_prompt(tmp_path):
+    """记住之后，同一对话的第二次外发不再宣告确认请求。"""
+    from finharness.permissions.gate import PermissionGate
+    from tests.permissions.test_gate import FakeTool, make_settings
+
+    bus = ConfirmBus(ttl_s=1.0)
+    settings = make_settings(tmp_path)
+    confirmed: set[str] = set()
+    prompts = 0
+
+    async def confirm_egress(name, args):
+        nonlocal prompts
+        prompts += 1
+        return True
+
+    gate = PermissionGate(
+        settings=settings,
+        confirm_egress=confirm_egress,
+        conversation_id="conv-1",
+        confirmed_categories=confirmed,
+    )
+
+    async def scenario():
+        # 首次确认（模拟"允许并本对话不再询问"）
+        first = await gate.check(FakeTool(name="web_search"), {"query": "a"})
+        confirmed.add("egress")
+        second = await gate.check(FakeTool(name="web_search"), {"query": "b"})
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first.verdict.value == "allow"
+    assert second.verdict.value == "allow"
+    assert "本对话已确认" in second.reason
+    assert prompts == 1  # 第二次没有再次询问

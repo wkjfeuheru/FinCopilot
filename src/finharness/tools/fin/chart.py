@@ -16,12 +16,12 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from pydantic import BaseModel, Field
 
 from finharness.data.raw import RawData
 from finharness.tools.fin.charting import FontUnavailableError, apply_style, resolve_cjk_font
 from finharness.utils.markdown import image_markdown
-from finharness.tools.base import BaseTool, PermissionLevel, ToolGroup
+from finharness.tools.base import BaseTool
+from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 CHART_TYPES = ("line", "bar", "candlestick")
 DEFAULT_TITLE = "数据图表"
@@ -31,34 +31,31 @@ _X_CANDIDATES = ("date", "日期", "报告期", "公告日期", "月份", "季�
 _Y_CANDIDATES = ("close", "value", "nav", "收盘", "最新价", "净值")
 
 
-class ChartInput(BaseModel):
-    type: str = Field(default="line", description="图表类型：line/bar/candlestick")
-    title: str = Field(default=DEFAULT_TITLE, description="图表标题")
-    symbol: str | None = Field(default=None, description="6位A股代码；与 cids 二选一")
-    cids: list[str] = Field(
-        default_factory=list,
-        description="复用的数据引用 id；传多个时按 X 轴对齐叠加为多条序列（零重复取数）",
-    )
-    x: str | None = Field(default=None, description="X 轴列名，默认自动推断（date/日期）")
-    y: str | None = Field(default=None, description="Y 轴列名（单序列），默认自动推断（close/value）")
-    series: list[str] = Field(
-        default_factory=list,
-        description="要绘制的数值列（多序列）；优先级高于 y。如回测净值传 [nav, benchmark_nav]",
-    )
-
-
-class MakeChartTool(BaseTool):
-    name = "make_chart"
-    description = (
+@tool(
+    name="make_chart",
+    description=(
         "根据会话数据或指定标的生成图表（走势/多序列对比/分组柱/K线），产出 PNG 并返回引用路径。"
         "支持多序列叠加（如回测净值与基准同图）。"
+    ),
+    capability=Capability.OUTPUT,
+    group=ToolGroup.FIN_OUTPUT,
+    timeout=60,
+    output_schema_note="返回 ![title](path) 形式的图片引用。",
+)
+class MakeChartTool(BaseTool):
+    @param("type", desc="图表类型：line/bar/candlestick")
+    @param("title", desc="图表标题")
+    @param("symbol", desc="6位A股代码；与 cids 二选一")
+    @param(
+        "cids",
+        desc="复用的数据引用 id；传多个时按 X 轴对齐叠加为多条序列（零重复取数）",
     )
-    input_model = ChartInput
-    permission = PermissionLevel.READ
-    group = ToolGroup.FIN_OUTPUT
-    timeout = 60
-    output_schema_note = "返回 ![title](path) 形式的图片引用。"
-
+    @param("x", desc="X 轴列名，默认自动推断（date/日期）")
+    @param("y", desc="Y 轴列名（单序列），默认自动推断（close/value）")
+    @param(
+        "series",
+        desc="要绘制的数值列（多序列）；优先级高于 y。如回测净值传 [nav, benchmark_nav]",
+    )
     async def _dispatch(
         self,
         *,

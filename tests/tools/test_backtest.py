@@ -204,3 +204,120 @@ def test_explicit_code_list_is_accepted_as_a_pool(tmp_path):
 
 def test_pool_size_is_capped():
     assert MAX_POOL_SIZE == 300
+
+
+# --- 长任务进展上报 ----------------------------------------------------
+# 面板取数是横截面回测里最慢的一段。客户端只在收到真实事件时才重置空闲看门狗，
+# 而服务端心跳是 SSE 注释帧、喂不到它；因此这段取数必须上报进展，否则会话会在
+# 静默中被误判为卡死而掐断（docs 03.12）。
+
+def _collect_progress(tool):
+    events: list[dict] = []
+
+    async def report(payload):
+        events.append(payload)
+
+    tool.progress = report
+    return events
+
+
+def test_cross_section_reports_pool_and_panel_progress(tmp_path):
+    tool = RunBacktestTool(make_access(tmp_path))
+    events = _collect_progress(tool)
+
+    result = run(
+        tool,
+        pool="000300",
+        factor_expr="rank(ts_std(close/ts_delay(close,1)-1,20))",
+        params={"groups": 3, "rebalance": 5},
+        years=2,
+    )
+
+    assert result.ok is True
+    phases = [event["phase"] for event in events]
+    # 池规模先于取数进度发出：用户最快能得到的反馈是"池有多大"。
+    assert phases[0] == "pool"
+    assert "panel" in phases
+
+    panel = [event for event in events if event["phase"] == "panel"]
+    fetched = [event["fetched"] for event in panel]
+    assert fetched == sorted(fetched)          # 单调递增
+    assert fetched[-1] == panel[-1]["total"]   # 收尾必达总数
+    assert all(event["total"] > 0 for event in panel)
+    assert all(event["elapsed_s"] >= 0 for event in panel)
+
+
+def test_progress_interval_keeps_the_silence_bounded(tmp_path):
+    """上报节奏必须足够密：冷缓存下每次取数约受 1s 节流约束，
+    若只在结束时上报一次，取数期间就会出现长达数分钟的静默，客户端看门狗
+    会在 90s 处掐断一个仍在正常推进的会话（docs 03.12）。
+    """
+    class WideAdapter(DataAdapter):
+        name = "wide"
+
+        def fetch_kline(self, symbol, period, adjust, years):
+            return FetchResult(df=_prices(symbol), interface="fake_kline")
+
+        def fetch_index_constituents(self, index):
+            symbols = [f"{600000 + i:06d}" for i in range(25)]
+            return FetchResult(
+                df=pd.DataFrame({"symbol": symbols, "name": symbols}), interface="fake_cons"
+            )
+
+    data = DataAccess(
+        [WideAdapter()],
+        cache=LocalCache(tmp_path / "cache"),
+        settings=Settings(data={"cache_dir": tmp_path / "cache"}, paths={"output_dir": tmp_path / "out"}),
+    )
+    tool = RunBacktestTool(data)
+    events = _collect_progress(tool)
+
+    result = run(tool, pool="000300", factor_expr="rank(close)",
+                 params={"groups": 2, "rebalance": 5}, years=2)
+
+    assert result.ok is True
+    panel = [event["fetched"] for event in events if event["phase"] == "panel"]
+    # 25 只标的：第 10、20 只各上报一次，收尾的第 25 只再上报一次。
+    assert panel == [10, 20, 25]
+
+
+def test_progress_is_optional_so_direct_calls_still_work(tmp_path):
+    # 未注入回调（如单测直接调用）时不得报错，也不能依赖进度通道存在。
+    result = run(
+        RunBacktestTool(make_access(tmp_path)),
+        pool="000300",
+        factor_expr="rank(close)",
+        params={"groups": 2},
+        years=2,
+    )
+
+    assert result.ok is True
+
+
+def test_capped_pool_is_disclosed_in_the_result(tmp_path):
+    # 指数成分股多于上限时被截断，结果必须写明——否则用户会把结论误当作
+    # 对完整成分股池的检验（中证500 的 500 只被静默截到 300 只是原本的隐患）。
+    result = run(
+        RunBacktestTool(make_access(tmp_path)),
+        pool="000300",
+        factor_expr="rank(close)",
+        params={"groups": 2, "max_symbols": 3},
+        years=2,
+    )
+
+    assert result.ok is True
+    assert "截断" in result.content
+    assert "max_symbols" in result.content
+
+
+def test_uncapped_pool_carries_no_truncation_notice(tmp_path):
+    result = run(
+        RunBacktestTool(make_access(tmp_path)),
+        pool="000300",
+        factor_expr="rank(close)",
+        params={"groups": 2},
+        years=2,
+    )
+
+    assert result.ok is True
+    assert "截断" not in result.content

@@ -21,7 +21,12 @@ import {
   listConversations,
   loadConversationMessages,
 } from "./api/client";
-import type { Citation, ConversationSummary, HistoryMessage } from "./api/client";
+import type {
+  Citation,
+  ConversationSummary,
+  HistoryMessage,
+  ResumableTurn,
+} from "./api/client";
 
 const EMPTY_CONFIG: ConfigSnapshot = { configured: false, active_id: null, configs: [] };
 // 在本地记住对话，才能让页面刷新后恢复它：服务端的对话存储
@@ -68,6 +73,9 @@ function App() {
   // 的记录会在新选中的对话自身历史仍在加载时
   // 被误填入其中。
   const [historyConversationId, setHistoryConversationId] = useState<string | null>(null);
+  // 上一轮被停止后服务端留下的可继续断点（键为对话 id，与 history 同源）。
+  // 刷新页面后它让"继续研究"入口仍在，而实时流结束时由 ChatPanel 请求刷新。
+  const [resumable, setResumable] = useState<ResumableTurn | null>(null);
   const [loadingConversations, setLoadingConversations] = useState(false);
   const [citations, setCitations] = useState<Citation[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
@@ -136,6 +144,25 @@ function App() {
     viewCacheRef.current.clear();
   }
 
+  // 只读取指定对话的可继续状态；用于一轮结束后刷新（服务端才是准绳）。
+  //
+  // 对话 id 由调用方传入而不是取自 state：这个回调由流事件触发，而流回调
+  // 闭包住的是"发送那一刻"的渲染——新对话的 id 要到 `session` 事件之后才存在，
+  // 从 state 读会在新对话上永远拿到 null，从而查不到刚写好的断点。
+  const refreshResumable = useCallback(async (target: string | null) => {
+    if (!target) {
+      setResumable(null);
+      return;
+    }
+    try {
+      const data = await loadConversationMessages(target);
+      setResumable(data.resumable);
+    } catch {
+      // 取不到就按"没有可继续"处理；它只是一个便利入口，不该报错。
+      setResumable(null);
+    }
+  }, []);
+
   // 恢复已存储对话的记录，让读者看到上次读到的地方，
   // 并延续同一记忆作用域。
   useEffect(() => {
@@ -143,20 +170,23 @@ function App() {
       setHistory([]);
       setHistoryConversationId(null);
       setCitations([]);
+      setResumable(null);
       return;
     }
     // 如果用户已切换到另一个对话，则忽略迟到的响应：
     // 只有当前选中 id 对应的 effect 才能生效。
     let cancelled = false;
     void loadConversationMessages(conversationId)
-      .then((messages) => {
+      .then((data) => {
         if (cancelled) return;
-        setHistory(messages);
+        setHistory(data.messages);
+        setResumable(data.resumable);
         setHistoryConversationId(conversationId);
       })
       .catch(() => {
         if (cancelled) return;
         setHistory([]);
+        setResumable(null);
         setHistoryConversationId(conversationId);
       });
     // 数据来源也一并从存储中恢复，因此恢复（或重启）的
@@ -195,6 +225,7 @@ function App() {
     setHistory([]);
     setCitations([]);
     setActivities([]);
+    setResumable(null);
     setSessionVersion((version) => version + 1);
   }
 
@@ -289,14 +320,15 @@ function App() {
         <header className="app-header">
           <div>
             <p className="eyebrow">FINANCIAL RESEARCH COPILOT</p>
-            <h1>FinHarness</h1>
+            <h1>FinHarness｜投研工作台</h1>
+            <p className="app-positioning">覆盖个股、行业、宏观与量化因子研究；从问题到可回溯结论 <span>不构成投资建议</span></p>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <button
               type="button"
               className="status-pill provider-chip"
               onClick={() => setSettingsOpen(true)}
-              title="点击配置模型供应商"
+              title="打开模型设置"
             >
               {active ? (
                 <>
@@ -306,7 +338,7 @@ function App() {
                   {active.model}
                 </>
               ) : (
-                "未配置供应商"
+                "完成模型设置"
               )}
             </button>
             <span className="status-pill" title={`当前用户：${user.username}`}>
@@ -348,6 +380,8 @@ function App() {
                 onCitations={setCitations}
                 activities={activities}
                 onActivities={setActivities}
+                resumable={historyConversationId === conversationId ? resumable : null}
+                onRefreshResumable={(target) => void refreshResumable(target)}
               />
             </div>
             <SourceSidebar activities={activities} citations={citations} />

@@ -43,6 +43,8 @@ h1, h2, p { margin-top: 0; }
 .eyebrow { margin: 0 0 5px; color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: .16em; line-height: 1.5; }
 .app-header .eyebrow { color: #acbdcb; }
 h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px; line-height: 1.15; }
+.app-positioning { max-width: 760px; margin: 8px 0 0; color: #acbdcb; font-size: 12px; line-height: 1.6; }
+.app-positioning span { margin-left: 8px; color: #dce9e7; font-weight: 650; }
 .status-pill { padding: 9px 12px; border: 1px solid #486071; border-radius: 6px; font-size: 12px; }
 .provider-chip { cursor: pointer; background: #203649; color: #e2ebf1; display: inline-flex; align-items: center; flex-wrap: wrap; gap: 5px; max-width: 50%; text-align: left; overflow-wrap: anywhere; }
 .provider-chip:hover { background: #294357; border-color: #84b9b0; }
@@ -75,6 +77,30 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 .session-bar button:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .session-bar button:disabled, .composer button:disabled { cursor: not-allowed; opacity: .5; }
 .chat-panel { display: grid; gap: 18px; padding: 24px; }
+.research-welcome { display: grid; gap: 22px; }
+.research-mandate { border: 1px solid #cfdae2; background: #f8fafb; }
+.research-mandate-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 16px 18px; border-bottom: 1px solid #dce5ea; }
+.research-kicker, .settings-kicker { display: block; color: #718394; font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .11em; line-height: 1.5; }
+.research-mandate h2, .scenario-heading h2 { margin: 3px 0 0; color: #263e50; font-size: 18px; font-weight: 650; letter-spacing: -.2px; }
+.evidence-badge { flex: none; padding: 4px 8px; border: 1px solid #9ec5ba; background: var(--accent-soft); color: var(--accent); font-family: var(--mono); font-size: 10px; }
+.research-mandate > p { max-width: 820px; margin: 0; padding: 14px 18px 2px; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.research-chain { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; margin: 16px 18px 18px; padding: 0; list-style: none; }
+.research-chain li { position: relative; display: grid; align-items: center; min-width: 0; }
+.research-chain li > span { z-index: 1; display: grid; place-items: center; min-height: 34px; border: 1px solid #aebdc7; background: #fff; color: #536a7b; font-family: var(--mono); font-size: 11px; font-weight: 650; }
+.research-chain li.active > span { border-color: var(--accent); color: var(--accent); }
+.research-chain i { position: absolute; z-index: 0; top: 50%; left: calc(50% + 17px); width: 100%; height: 1px; background: #aebdc7; }
+.scenario-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.scenario-heading > span { color: var(--muted); font-size: 11px; }
+.research-scenarios { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.research-scenario { display: grid; gap: 10px; min-width: 0; padding: 15px; border: 1px solid var(--line); background: #fff; }
+.research-scenario:hover { border-color: #92bcb4; background: #fbfdfc; }
+.research-scenario-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 9px; border-bottom: 1px solid #e5ebef; }
+.research-scenario h3 { margin: 0; color: #263e50; font-size: 14px; font-weight: 650; }
+.research-scenario-head span { color: var(--accent); font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+.research-scenario p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.research-scenario button { display: grid; gap: 3px; padding: 0 0 0 9px; border: 0; border-left: 2px solid #80aea0; background: transparent; color: #4b6273; cursor: pointer; text-align: left; font-size: 12px; line-height: 1.65; }
+.research-scenario button span { color: var(--accent); font-size: 10px; font-weight: 700; }
+.research-scenario button:hover { color: #123f3b; }
 .message-list { min-width: 0; min-height: clamp(340px, calc(100vh - 360px), 720px); display: grid; align-content: start; gap: 24px; }
 .message { min-width: 0; max-width: 100%; padding: 20px; border: 1px solid #e1e7ec; border-radius: 6px; background: #fff; }
 .message-assistant { border-top: 2px solid #91b8ae; }
@@ -122,6 +148,9 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 .turn-trace-running .trace-pulse { animation: trace-pulse 1.6s ease-out infinite; }
 .turn-trace-done .trace-pulse { border-color: #247552; background: #247552; }
 .turn-trace-error .trace-pulse { border-color: #b64444; background: #b64444; }
+/* 用户主动停止：用中性灰而非错误红。停止不是失败，配色必须与 error 区分，
+   否则一次"我不想等了"会被读成"系统出错了"。 */
+.turn-trace-stopped .trace-pulse { border-color: #5b6b7a; background: #dfe5ea; }
 @keyframes trace-pulse {
   0% { box-shadow: 0 0 0 0 #176b6345; }
   70%, 100% { box-shadow: 0 0 0 7px #176b6300; }
@@ -131,6 +160,25 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
   .plan-progress-track span { transition: none; }
 }
 .trace-content { padding: 2px 14px 14px; border-top: 1px solid #e3e9ed; }
+.research-plan-ledger { margin: 12px 0 14px; border: 1px solid #cfdae2; background: #fff; }
+.research-plan-ledger-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 14px; border-bottom: 1px solid #dce5ea; background: #f8fafb; }
+.research-plan-ledger h3 { margin: 2px 0 0; color: #2a4356; font-size: 13px; line-height: 1.55; }
+.research-plan-ledger-meta { display: grid; gap: 3px; flex: none; color: #718394; font-family: var(--mono); font-size: 10px; text-align: right; }
+.research-plan-ledger-meta strong { color: #2a4356; font-weight: 650; }
+.research-plan-steps { display: grid; gap: 0; margin: 0; padding: 4px 14px; list-style: none; }
+.research-plan-step { display: grid; grid-template-columns: 20px 28px minmax(0, 1fr) auto; gap: 8px; align-items: center; min-width: 0; padding: 10px 0; border-bottom: 1px solid #edf1f3; }
+.research-plan-step:last-child { border-bottom: 0; }
+.research-plan-mark { display: grid; place-items: center; width: 18px; height: 18px; border: 3px solid #b64444; border-radius: 50%; background: #fff; color: #fff; font-size: 10px; font-weight: 800; line-height: 1; }
+.research-plan-seq { color: #718394; font-family: var(--mono); font-size: 10px; }
+.research-plan-step-body { display: grid; gap: 2px; min-width: 0; }
+.research-plan-step-body strong { color: #2a3e50; font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+.research-plan-step-body small { color: #718394; font-size: 10px; line-height: 1.5; }
+.research-plan-status { color: #a53c3c; font-size: 11px; white-space: nowrap; }
+.research-plan-step-done .research-plan-mark { border-color: #247552; background: #247552; }
+.research-plan-step-done .research-plan-status { color: #247552; }
+.research-plan-step-fail .research-plan-mark { border-color: #b64444; background: #b64444; }
+.research-plan-step-skipped .research-plan-mark { border: 1px solid #becbd3; border-radius: 1px; background: #eef2f5; color: #65788a; }
+.research-plan-step-skipped .research-plan-step-body strong, .research-plan-step-skipped .research-plan-status { color: #718394; }
 .trace-steps { position: relative; display: grid; gap: 0; margin: 0; padding: 5px 0 0; list-style: none; }
 .trace-steps::before { content: ""; position: absolute; top: 20px; bottom: 20px; left: 9px; width: 1px; background: #d6e0e6; }
 .trace-step { position: relative; display: grid; grid-template-columns: 20px 52px minmax(0, 1fr) auto; align-items: start; gap: 9px; padding: 10px 0; min-width: 0; }
@@ -138,6 +186,7 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 .trace-step-mark-running { border-color: #2a8278; border-width: 5px; box-shadow: 0 0 0 3px #dceeea; }
 .trace-step-mark-done { border-color: #247552; background: #247552; }
 .trace-step-mark-error { border-color: #b64444; background: #b64444; font-weight: 800; }
+.trace-step-mark-stopped { border-color: #5b6b7a; background: #e3e9ee; color: #4b5b69; }
 .trace-step-mark-info { color: #65788a; background: #eef2f5; }
 .trace-step-kind { padding-top: 2px; color: #718394; font-family: var(--mono); font-size: 10px; line-height: 1.6; }
 .trace-step-body { display: grid; gap: 3px; min-width: 0; }
@@ -236,6 +285,10 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 .artifact-link { color: var(--accent); font-size: 13px; text-decoration: underline; text-underline-offset: 3px; overflow-wrap: anywhere; }
 .artifact-link:hover { color: #103f3a; }
 
+/* 上一轮被停止后的续做入口。与 engine-notice 同一语汇（中性、非错误），
+   但多一个动作按钮，因此用 flex 把说明与按钮分列两端。 */
+.resume-banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border: 1px solid #cdd9e3; border-left: 3px solid #5b7a99; border-radius: 5px; background: #f5f8fb; color: #3d566e; font-size: 12px; line-height: 1.6; }
+
 .composer { display: flex; gap: 12px; align-items: flex-end; padding: 12px; border: 1px solid #afc4cb; border-radius: 7px; background: #fbfcfd; box-shadow: 0 2px 6px #16384b05; }
 .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px #176b6310; }
 .composer textarea { flex: 1; resize: vertical; min-width: 0; min-height: 80px; max-height: 360px; border: 0; border-radius: 3px; padding: 6px; background: transparent; color: var(--ink); line-height: 1.75; }
@@ -243,8 +296,28 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 .composer textarea:focus-visible { outline: 1px solid #a8c9c1; outline-offset: 0; }
 .composer button { min-height: 36px; padding: 8px 20px; background: var(--accent); color: #fff; font-size: 13px; }
 .composer button:hover:not(:disabled) { background: #11564f; }
+/* 停止按钮刻意不用发送的青绿 accent：它是中断而非提交，用中性灰避免
+   与"发送"混淆，同时保持与主按钮相同的尺寸与权重。 */
+.composer .stop-button { background: #5b6b7a; }
+.composer .stop-button:hover:not(:disabled) { background: #44515d; }
 .composer textarea:disabled { color: var(--muted); cursor: not-allowed; }
 .config-empty-state { padding: 28px 12px; margin: 0; border: 1px dashed var(--line); border-radius: 6px; background: #f8fafb; }
+.settings-layout { display: grid; grid-template-columns: minmax(230px, .75fr) minmax(0, 1.35fr); gap: 20px; align-items: start; }
+.settings-config-list, .settings-form-panel { min-width: 0; border: 1px solid var(--line); background: #fbfcfd; }
+.settings-config-list { display: grid; gap: 10px; padding: 13px; }
+.settings-config-list-head { display: flex; align-items: start; justify-content: space-between; gap: 10px; padding-bottom: 11px; border-bottom: 1px solid var(--line); }
+.settings-config-list h5, .settings-form-head h5 { margin: 3px 0 0 !important; color: var(--ink); }
+.settings-empty { margin: 0; padding: 16px 4px; color: var(--muted); font-size: 12px; text-align: center; }
+.settings-config-card { display: grid; gap: 8px; padding: 11px; border: 1px solid transparent; background: #fff; }
+.settings-config-card.active { border-color: #9ec5ba; background: var(--accent-soft); }
+.settings-config-card > button { display: grid; gap: 3px; padding: 0; border: 0; background: transparent; color: inherit; cursor: pointer; text-align: left; }
+.settings-config-card strong { color: var(--ink); font-size: 12px; }
+.settings-config-card button span, .settings-config-card button small { color: var(--muted); font-family: var(--mono); font-size: 10px; overflow-wrap: anywhere; }
+.settings-config-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.settings-config-tags .ant-tag { margin: 0; font-size: 10px; }
+.settings-form-panel { padding: 18px; background: #fff; }
+.settings-form-head { margin-bottom: 14px; padding-bottom: 13px; border-bottom: 1px solid var(--line); }
+.settings-form-head p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
 .empty-state { max-width: 560px; padding: 32px 0; }
 .empty-state h2 { margin-bottom: 12px; font-size: 28px; }
 .empty-state p:last-child { color: var(--muted); line-height: 1.7; }
@@ -258,6 +331,7 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
   .workspace-body { grid-template-columns: 200px minmax(0, 1fr); gap: 16px; }
   .source-sidebar { grid-column: 1 / -1; position: static; max-height: none; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .sidebar-section + .sidebar-section { padding-top: 0; padding-left: 20px; border-top: 0; border-left: 1px solid var(--line); }
+  .settings-layout { grid-template-columns: minmax(210px, .7fr) minmax(0, 1.3fr); }
 }
 @media (max-width: 700px) {
   .app-header { padding: 18px 16px; gap: 12px; }
@@ -274,6 +348,19 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
   .message-list { min-height: 280px; gap: 16px; }
   .message { padding: 14px; }
   .message-user { max-width: 95%; }
+  .app-positioning { max-width: 330px; font-size: 10px; }
+  .app-positioning span { display: block; margin: 2px 0 0; }
+  .research-mandate-head { padding: 14px; }
+  .research-mandate > p { padding: 12px 14px 0; }
+  .research-chain { margin: 14px; }
+  .research-chain li > span { min-height: 30px; font-size: 10px; }
+  .research-chain i { left: calc(50% + 15px); }
+  .research-scenarios { grid-template-columns: minmax(0, 1fr); }
+  .scenario-heading { align-items: start; }
+  .research-plan-ledger-head { align-items: start; }
+  .research-plan-ledger-meta { text-align: left; }
+  .research-plan-step { grid-template-columns: 20px 24px minmax(0, 1fr); }
+  .research-plan-status { grid-column: 3; }
   .turn-trace > summary { align-items: flex-start; gap: 8px; padding: 10px 11px; }
   .trace-summary-meta { display: none; }
   .trace-content { padding: 2px 11px 11px; }
@@ -292,6 +379,7 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
   .ant-modal .ant-form-item { min-width: 0 !important; max-width: 100%; }
   .ant-modal .ant-space-item { min-width: 0; max-width: 100%; }
   .ant-modal .ant-input, .ant-modal .ant-input-affix-wrapper, .ant-modal .ant-select { min-width: 0 !important; max-width: 100%; }
+  .settings-layout { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* 登录/注册门：与工作区同族的纸面卡片，居中占据首屏。 */

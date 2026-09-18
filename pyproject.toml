@@ -36,6 +36,11 @@ observability = [
     "prometheus-client>=0.21",
     "langsmith>=0.1.100",
 ]
+# 向量库（docs 03.6.4 语义记忆）：未安装或服务不可用时，检索按
+# "SQLite BLOB 暴力余弦 → 键匹配" 逐级降级，记忆链路不受影响。
+vector = [
+    "qdrant-client>=1.7",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

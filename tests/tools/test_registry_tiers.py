@@ -92,10 +92,11 @@ def test_registry_covers_the_documented_catalogue(tmp_path):
         "get_research_reports",
         "get_macro_indicators", "get_industry_perf", "get_industry_constituents",
         "calc_metrics", "calc_valuation", "run_backtest", "make_chart", "write_report",
-        "read_file", "write_file", "web_search", "research_plan",
-        "update_plan_step", "record_conclusion",
-        "search_tools", "list_skills", "load_skill", "load_tool", "spawn_agent",
+        "read_file", "read_pdf", "write_file", "web_search", "research_plan",
+        "update_plan_step", "record_conclusion", "search_tools",
+        "spawn_agent", "summarize_document",
         "ask_user", "remember_preference",
+        "search_memory", "update_memory", "forget_memory",
     }
     assert set(registry.names()) == expected
     assert set(registry.names()) == {cls.name for cls in ALL_TOOL_CLASSES}
@@ -106,25 +107,26 @@ def test_the_general_sub_agent_gets_local_material_tools_only(tmp_path):
 
     reviewer 合理地拥有数据 tool（它要复核数字）；普通 worker 则不然，
     因为任务语句不指定任何 symbol 或 period，若赋予它数据 tool，
-    会招致猜测而非隔离。
+    会招致猜测而非隔离。它确实拥有 read_pdf：那是**读取交给它的材料**的能力，
+    不是取数能力——长文档分片前先精读某一页，正属于 worker 的职责。
     """
     from finharness.tools.registry import review_tool_names, worker_tool_names
 
     worker = set(worker_tool_names())
     reviewer = set(review_tool_names())
 
-    assert worker == {"read_file"}
+    assert worker == {"read_file", "read_pdf"}
     assert "get_quote" not in worker and "get_research_reports" not in worker
     # reviewer 保留其数据 tool——这正是它的全部价值所在。
     assert "get_quote" in reviewer
     # 且两个子 agent 都不得再 spawn 或触达 META/写 tool。
-    for name in ("spawn_agent", "write_report", "write_file", "load_tool", "ask_user"):
+    for name in ("spawn_agent", "write_report", "write_file", "search_tools", "ask_user"):
         assert name not in worker
         assert name not in reviewer
 
 
 def test_meta_tools_can_reach_the_catalogue(tmp_path):
-    """search_tools 与 load_tool 操作它们自身所在的 registry。"""
+    """search_tools 操作它自身所在的 registry（检索并激活）。"""
     registry = make_registry(tmp_path)
     tool = registry.resolve("search_tools")
 

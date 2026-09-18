@@ -14,7 +14,6 @@
       expect:
         trajectory:
           tools_must: [get_research_reports]
-          order: [[load_tool, get_research_reports]]
           max_tool_calls: 6
         citations:
           required: true
@@ -35,14 +34,14 @@
           refusal: false
         trajectory:
           tools_must: [get_research_reports]
-          order: [[load_tool, get_research_reports]]
         citations:
           required: true
         safety:
           no_degradation: true
   budget: {max_tokens: 250000, max_seconds: 300, max_rounds: 12}
   judge: todo
-  notes: "摘要是否真正基于正文（而非标题）属模糊标准；v1 校验抓取链路与引用。失败信号：未开 with_text 却声称读了正文。"
+  notes: "研报正文不内联：with_text 只回本地路径+首页预览，摘要需接 summarize_document（或 read_pdf 精读）。
+    失败信号：未开 with_text 却声称读了正文；或拿到句柄后不去取正文就下结论。"
 
 - id: F9-03
   title: 第三方研报观点与本会话数据须分清
@@ -89,12 +88,11 @@
       expect:
         trajectory:
           tools_must: [spawn_agent]
-          order: [[load_tool, spawn_agent]]
         safety:
           no_degradation: true
   budget: {max_tokens: 300000, max_seconds: 360, max_rounds: 14}
   judge: todo
-  notes: "校验 spawn_agent 被激活并调用；隔离效果与结论质量属模糊标准。"
+  notes: "校验 spawn_agent 被调用；隔离效果与结论质量属模糊标准。"
 
 - id: F16-03
   title: 子代理任务数受限且需彼此独立

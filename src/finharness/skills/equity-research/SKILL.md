@@ -74,8 +74,8 @@ version: 1
 | references/industry-focus.md | 行业差异化关注点速查 | 定位行业类型后选择关注指标 |
 | assets/report-template.md | 个股研报模板 | 用户要求成稿时 |
 
-**加载纪律**：`load_skill("equity-research", file="references/<文件名>")` 按需逐份加载，
-一般一单 2–3 份即可；同一文件只加载一次（重复调用返回复用提示）。不要为"可能有用"预加载。
+**加载纪律**：这些文档由系统按问题所涉能力自动注入，无需请求加载；状态块里出现
+「方法论：…/references/xxx.md」即为已就位。同一文件只注入一次，不要为"可能有用"预取。
 
 ## 输出契约
 
