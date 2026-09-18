@@ -619,6 +619,12 @@ class Settings(BaseSettings):
 
         self.validate(require_api_key=require_api_key)
         self._validate_observability()
+        # 旧布局（data_cache/）里的账号与历史若还在，而当前位置为空，必须当场
+        # 失败：继续运行会得到一个看起来正常的空实例，"搬家中断"与"全新安装"
+        # 在外部完全一样，运维方很难联想到原因（P0-3 的配套迁移）。
+        from finharness.config.state_migration import check_for_unmigrated_state
+
+        check_for_unmigrated_state(self)
         if not check_audit:
             return
         parent = self.audit.log_path.parent

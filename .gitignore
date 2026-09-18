@@ -28,6 +28,11 @@ data_cache/*
 state/*
 !state/.gitkeep
 **/state/
+# 状态目录搬迁时保留的旧数据备份：含主密钥、密码哈希与全部对话，
+# 与上面同一条理由，绝不能入库（含自造的 .bak 名字，避免误 add -A）。
+data_cache.bak/
+state.bak/
+*.bak/
 logs/*
 !logs/.gitkeep
 output/*
