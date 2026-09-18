@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import threading
 
-import pytest
 
 from finharness.config.settings import ContextSettings, Settings
 from finharness.data.access import DataAccess

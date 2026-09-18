@@ -3,11 +3,9 @@
 import asyncio
 from dataclasses import dataclass
 
-import pytest
-
 from finharness.config.settings import PermissionSettings, Settings
 from finharness.permissions.gate import PermissionGate, ReadOnlyGate
-from finharness.permissions.modes import PermissionMode, Verdict
+from finharness.permissions.modes import Verdict
 from finharness.tools.base import PermissionLevel
 
 
