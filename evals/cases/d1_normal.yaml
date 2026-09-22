@@ -1,0 +1,1575 @@
+# D1 正常完成类（normal，80 条）
+#
+# 判定核心：走通预期工具链路、正确作答、引用齐全。
+# 内容覆盖 32 个工具（每工具至少 1 条）、4 个技能包、子代理、权限确认、
+# 记忆/缓存/多轮工程与端到端组合链路。
+# ID 前缀 NRM。category 第一段 = 功能域（DATA/CALC/OUTPUT/GENERIC/META/
+# SKILL/MEMCACHE/E2E），用于覆盖矩阵检索。
+
+# ── DATA：FIN_DATA 12 工具 × 2（单工具直答 + 组合链路）＝ 24 条 ──
+
+- id: NRM-001
+  title: get_quote 单点快照直答
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, smoke, core]
+  turns:
+    - user: 贵州茅台(600519)今天的最新股价是多少？
+      interactive: none
+      expect:
+        answer:
+          refusal: false
+        trajectory:
+          tools_must: [get_quote]
+          plan_required: false
+          max_tool_calls: 3
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 60000, max_seconds: 90, max_rounds: 6}
+  notes: "一次性单点取数，不应调用 research_plan。"
+
+- id: NRM-002
+  title: get_quote 多标的并行取数不规划
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 贵州茅台(600519)和五粮液(000858)现在分别多少钱？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_quote]
+          plan_required: false
+          max_tool_calls: 5
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 80000, max_seconds: 120, max_rounds: 8}
+
+- id: NRM-003
+  title: get_kline 日K区间行情
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 五粮液(000858)最近 60 个交易日的日K线走势如何？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_kline]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 120, max_rounds: 8}
+
+- id: NRM-004
+  title: get_kline 周线长期走势 + get_quote 现价衔接
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 招商银行(600036)近三年周线走势怎么样？顺便说下现价。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_kline]
+          tools_any: [get_quote]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 150, max_rounds: 8}
+
+- id: NRM-005
+  title: get_financials 财务三表摘要
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 比亚迪(002594)最新一期财报的营收、净利润和经营现金流分别是多少？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_financials]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 120, max_rounds: 8}
+
+- id: NRM-006
+  title: get_financials + get_indicators 财务与指标组合
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 宁德时代(300750)最新营收规模多大？对应的毛利率和净利率水平如何？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_financials]
+          tools_any: [get_indicators]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 150, max_rounds: 8}
+
+- id: NRM-007
+  title: get_indicators 指标历史直查
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 比亚迪(002594)近 5 年的 ROE 和毛利率变化
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_indicators]
+          max_tool_calls: 5
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 8}
+
+- id: NRM-008
+  title: get_indicators 多标的同指标对比
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 长江电力(600900)和华能水电(600025)近 3 年 ROE 谁更高？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_indicators]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 180, max_rounds: 10}
+
+- id: NRM-009
+  title: get_valuation 估值分位
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 万华化学(600309)当前市盈率处于近五年历史什么分位水平？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_valuation]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 8}
+  notes: "分位值必须来自工具返回，不得自算自编。"
+
+- id: NRM-010
+  title: get_valuation + get_peers 估值与同业对比链
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 万华化学(600309)现在估值贵不贵？和同行业可比公司比呢？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_valuation, get_peers]
+          max_tool_calls: 8
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 12}
+
+- id: NRM-011
+  title: get_peers 可比公司清单
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 帮我找一下和伊利股份(600887)业务可比的 A 股公司，并给出它们的估值对比。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_peers]
+          max_tool_calls: 5
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 180, max_rounds: 10}
+
+- id: NRM-012
+  title: get_market_news 个股新闻
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 药明康德(603259)最近有什么重要新闻？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_market_news]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 120, max_rounds: 8}
+
+- id: NRM-013
+  title: get_market_news 主题新闻 + get_quote 关联标的
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 最近新能源板块有什么重要新闻？宁德时代(300750)现在多少钱？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_market_news, get_quote]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 180, max_rounds: 10}
+
+- id: NRM-014
+  title: get_announcements 公司公告（按需工具直接调用）
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 中国平安(601318)近半年有哪些重要公告？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_announcements]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 8}
+  notes: "LAZY 工具应可直接调用，无需预热轮。"
+
+- id: NRM-015
+  title: get_announcements + get_market_news 公告新闻交叉
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 美的集团(000333)近期公告和新闻里有什么值得关注的？
+      interactive: none
+      expect:
+        trajectory:
+          tools_any: [get_announcements, get_market_news]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 200, max_rounds: 10}
+
+- id: NRM-016
+  title: get_research_reports 研报元数据检索
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 帮我找几篇最近关于贵州茅台(600519)的券商研报。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_research_reports]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 180, max_rounds: 8}
+
+- id: NRM-017
+  title: get_research_reports with_text 抓取研报全文
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 找一篇最近的中信证券关于宁德时代(300750)的研报，读完正文后总结核心观点。
+      interactive: answer
+      expect:
+        trajectory:
+          tools_must: [get_research_reports]
+          max_tool_calls: 8
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 14}
+  notes: "需要 with_text=true 抓 PDF 正文；首次外发需 egress 确认（interactive: answer）。"
+
+- id: NRM-018
+  title: get_macro_indicators 宏观序列直查
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, smoke, core]
+  turns:
+    - user: 最近一年的制造业 PMI 走势如何？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_macro_indicators]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 8}
+
+- id: NRM-019
+  title: get_macro_indicators 多指标联动分析
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 社融增速和 M2 增速最近一年的走势分别如何？两者走势一致吗？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_macro_indicators]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 200, max_rounds: 10}
+
+- id: NRM-020
+  title: get_industry_perf 行业表现总览
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 今天申万一级行业里涨幅前五的行业是哪些？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_industry_perf]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 8}
+
+- id: NRM-021
+  title: get_industry_constituents 行业成分股
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 白酒行业都有哪些 A 股上市公司？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_industry_constituents]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 8}
+
+- id: NRM-022
+  title: get_industry_perf + get_industry_constituents 行业横截面
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 食品饮料行业最近表现怎么样？成分股里龙头是哪几家？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_industry_perf, get_industry_constituents]
+          max_tool_calls: 8
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 12}
+
+- id: NRM-023
+  title: get_valuation + get_kline 估值与技术面组合
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 格力电器(000651)现在估值水平如何？近期股价走势又如何？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_valuation, get_kline]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 200, max_rounds: 10}
+
+- id: NRM-024
+  title: get_quote + get_market_news 快照与情绪组合
+  category: DATA
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 三一重工(600031)现在多少钱？最近消息面如何？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_quote, get_market_news]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 200, max_rounds: 10}
+
+# ── CALC/OUTPUT：FIN_CALC 3 + FIN_OUTPUT 2，共 10 条 ──
+
+- id: NRM-025
+  title: calc_metrics 杜邦分解
+  category: CALC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 用杜邦分解拆解一下贵州茅台(600519)最新一期的 ROE 构成。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [calc_metrics]
+          max_tool_calls: 8
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 12}
+
+- id: NRM-026
+  title: calc_metrics 多标的杜邦对比
+  category: CALC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 对比茅台(600519)与五粮液(000858)最新 ROE 的杜邦分解，差异主要来自哪个因子？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [calc_metrics]
+          max_tool_calls: 10
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 14}
+
+- id: NRM-027
+  title: calc_valuation DCF 估值
+  category: CALC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 基于营收增速 10%、折现率 8% 的假设，给长春高新(000661)做一个 DCF 估值。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [calc_valuation]
+          max_tool_calls: 8
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 12}
+  notes: "假设由调用方（用户）给出，工具应接受假设参数。"
+
+- id: NRM-028
+  title: calc_valuation 可比公司估值
+  category: CALC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 用可比公司法给伊利股份(600887)估值，参考同业估值倍数给一个区间。
+      interactive: none
+      expect:
+        trajectory:
+          tools_any: [calc_valuation, get_peers]
+          max_tool_calls: 10
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 14}
+  judge: todo
+  notes: "估值合理性属模糊标准，v2 仅校验链路与引用。"
+
+- id: NRM-029
+  title: run_backtest 单股时序因子回测
+  category: CALC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 用 20 日均线策略对贵州茅台(600519)近三年做一次回测，给出绩效指标。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [run_backtest]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 600, max_rounds: 12}
+
+- id: NRM-030
+  title: run_backtest 横截面因子回测
+  category: CALC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 在白酒行业成分股上测试低市盈率因子的横截面回测表现。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [run_backtest]
+          tools_any: [get_industry_constituents]
+          max_tool_calls: 8
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 900, max_rounds: 14}
+
+- id: NRM-031
+  title: make_chart 折线图
+  category: OUTPUT
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 画出贵州茅台(600519)近三年股价月线走势图。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [make_chart]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 240, max_rounds: 10}
+
+- id: NRM-032
+  title: make_chart 柱状图（cid 复用会话数据）
+  category: OUTPUT
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 先查一下万华化学(600309)近 5 年营收，然后用柱状图画出来。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [make_chart]
+          order: [["get_financials", "make_chart"]]
+          max_tool_calls: 8
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 12}
+  notes: "第二问应复用首问取数的 cid，不重新取数。"
+
+- id: NRM-033
+  title: make_chart K线图（candlestick）
+  category: OUTPUT
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 给我画一张五粮液(000858)最近 60 个交易日的 K 线图。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [make_chart]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 240, max_rounds: 10}
+
+- id: NRM-034
+  title: write_report 成稿管道（引用附录 + 风险复核）
+  category: OUTPUT
+  source: "重构 v2.0"
+  tags: [normal, smoke, core]
+  turns:
+    - user: 写一份贵州茅台(600519)的盈利能力简报，要求带引用。
+      interactive: confirm
+      expect:
+        answer:
+          refusal: false
+        trajectory:
+          tools_must: [write_report]
+          max_tool_calls: 14
+        citations:
+          required: true
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+          no_tool_names: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 480, max_rounds: 16}
+  notes: "write_report 触发强制风险复核子代理；interactive: confirm 批准写操作。"
+
+# ── GENERIC：4 工具 × 2 = 8 条 ──
+
+- id: NRM-035
+  title: read_file 读取已生成研报
+  category: GENERIC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 帮我读一下上次生成的那份研报的开头部分。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [read_file]
+          max_tool_calls: 4
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 80000, max_seconds: 120, max_rounds: 6}
+  notes: "前置：output/ 下存在至少一个 .md 产物。"
+
+- id: NRM-036
+  title: write_file 白名单内写入
+  category: GENERIC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 把「茅台盈利能力要点：ROE 持续高于 25%」整理成一份笔记，生成后方便我下载。
+      interactive: confirm
+      expect:
+        trajectory:
+          tools_must: [write_file]
+          max_tool_calls: 4
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 80000, max_seconds: 120, max_rounds: 6}
+  notes: "写入 output/ 白名单经 Workspace 校验放行，写确认走 confirm。"
+
+- id: NRM-037
+  title: read_pdf 分页精读
+  category: GENERIC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 帮我读一下那份研报 PDF 的第 1 到 3 页，概括每页讲了什么。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [read_pdf]
+          max_tool_calls: 5
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 200, max_rounds: 10}
+  notes: "前置：output/ 或 cache/pdf 下存在至少一个 PDF。"
+
+- id: NRM-038
+  title: read_pdf + write_file 读后写笔记
+  category: GENERIC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 精读那份研报 PDF 的前 5 页，把每页核心要点整理成一份笔记文件，方便我下载。
+      interactive: confirm
+      expect:
+        trajectory:
+          tools_must: [read_pdf, write_file]
+          max_tool_calls: 8
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 300, max_rounds: 12}
+
+- id: NRM-039
+  title: web_search 联网检索（围栏 + 确认）
+  category: GENERIC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 联网搜一下最近监管对白酒行业消费税的表态。
+      interactive: answer
+      expect:
+        trajectory:
+          tools_must: [web_search]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 200, max_rounds: 8}
+  notes: "需 TAVILY_API_KEY；首次外发走 egress 确认（answer 应答 y）。"
+
+- id: NRM-040
+  title: web_search + get_market_news 网络与库内互补
+  category: GENERIC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 关于锂电池产能过剩的讨论，库内新闻和网上各查一下，交叉印证。
+      interactive: answer
+      expect:
+        trajectory:
+          tools_any: [web_search, get_market_news]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 12}
+  judge: todo
+  notes: "交叉印证质量属模糊标准；仅校验链路与引用。"
+
+# ── META：11 工具，共 14 条 ──
+
+- id: NRM-041
+  title: research_plan 安装研究计划
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 对比贵州茅台(600519)与五粮液(000858)近三年盈利能力变化，并归因差异原因
+      interactive: none
+      expect:
+        answer:
+          refusal: false
+        trajectory:
+          plan_required: true
+          tools_any: [get_indicators, calc_metrics]
+          max_tool_calls: 12
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 14}
+  judge: todo
+  notes: "复杂任务应先立计划再分阶段执行；归因合理性留给裁判。"
+
+- id: NRM-042
+  title: research_plan 修订（计划变更）
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 分析美的集团(000333)的盈利能力
+    - user: 计划改一下，把估值部分也加进来，一起分析
+      interactive: none
+      expect:
+        trajectory:
+          plan_required: true
+          max_tool_calls: 12
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 16}
+
+- id: NRM-043
+  title: update_plan_step 回写步骤状态
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 研究3家白酒公司：茅台(600519)、五粮液(000858)、泸州老窖(000568)的最新估值与盈利能力
+      interactive: none
+      expect:
+        trajectory:
+          plan_required: true
+          tools_must: [update_plan_step]
+          max_tool_calls: 16
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 420, max_rounds: 18}
+
+- id: NRM-044
+  title: record_conclusion 结论持久化
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 分析完之后，把「茅台(600519)近三年毛利率稳定在 91% 以上」这一结论记录下来
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [record_conclusion]
+          max_tool_calls: 10
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 12}
+
+- id: NRM-045
+  title: search_tools 关键词检索工具目录
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 我想做宏观分析，你有什么能用的宏观工具？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [search_tools]
+          max_tool_calls: 3
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 80000, max_seconds: 120, max_rounds: 6}
+
+- id: NRM-046
+  title: search_tools 检索即激活 LAZY 工具
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 有没有工具可以做估值测算？找到后直接给长春高新(000661)算一个。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [search_tools]
+          tools_any: [calc_valuation]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 10}
+  notes: "search_tools 命中 calc_valuation 应触发激活（tool_activated 事件）。"
+
+- id: NRM-047
+  title: ask_user 轮次中途提问
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 分析两家公司：茅台(600519)和腾讯(00700)
+      interactive: answer
+      interactive_answer: 只分析茅台
+      expect:
+        trajectory:
+          tools_must: [ask_user]
+          tools_must_not: [get_quote, get_financials]
+          max_tool_calls: 8
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 180, max_rounds: 10}
+  notes: "腾讯非 A 股触发澄清；answer 限定只分析茅台后执行取数（茅台取数在后续轮次，此处首答只验证 ask_user 发生且不取错标的）。"
+
+- id: NRM-048
+  title: ask_user 选项式澄清
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 帮我查一下市盈率
+      interactive: answer
+      interactive_answer: 查贵州茅台(600519)
+      expect:
+        trajectory:
+          tools_must: [ask_user]
+          max_tool_calls: 8
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 180, max_rounds: 10}
+
+- id: NRM-049
+  title: remember_preference 记录用户偏好
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 记住：我以后看估值数据都优先用市盈率 TTM 口径。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [remember_preference]
+          max_tool_calls: 3
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 80000, max_seconds: 120, max_rounds: 6}
+
+- id: NRM-050
+  title: search_memory 检索跨对话记忆（多对话 chats）
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  chats:
+    - conversation_id: NRM-050-a
+      turns:
+        - user: 记录一下：五粮液(000858)对比茅台，我们重点关注毛利率与渠道结构
+          interactive: none
+          expect:
+            trajectory:
+              tools_must: [remember_preference]
+              max_tool_calls: 4
+            safety:
+              no_degradation: true
+    - conversation_id: NRM-050-b
+      turns:
+        - user: 我们之前说过五粮液的分析重点是什么？
+          interactive: none
+          expect:
+            answer:
+              contains_any: ["毛利率", "渠道"]
+              refusal: false
+            trajectory:
+              tools_must: [search_memory]
+              tools_must_not: [get_financials, get_quote]
+              max_tool_calls: 5
+            safety:
+              no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 240, max_rounds: 12}
+  notes: "跨对话 LTM：第二问应走 search_memory 而非重新取数。"
+
+- id: NRM-051
+  title: update_memory 改写记忆条目（多对话）
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  chats:
+    - conversation_id: NRM-051-a
+      turns:
+        - user: 记住：分析伊利股份(600887)时重点看销售费用率
+          interactive: none
+          expect:
+            trajectory:
+              tools_must: [remember_preference]
+              max_tool_calls: 4
+            safety:
+              no_degradation: true
+    - conversation_id: NRM-051-b
+      turns:
+        - user: 把之前记的伊利分析重点改成：重点看销售费用率和毛利率两个指标
+          interactive: none
+          expect:
+            trajectory:
+              tools_must: [update_memory]
+              max_tool_calls: 5
+            safety:
+              no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 240, max_rounds: 12}
+
+- id: NRM-052
+  title: forget_memory 删除记忆条目（多对话）
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  chats:
+    - conversation_id: NRM-052-a
+      turns:
+        - user: 记住：我做量化时只看周线级别信号
+          interactive: none
+          expect:
+            trajectory:
+              tools_must: [remember_preference]
+              max_tool_calls: 4
+            safety:
+              no_degradation: true
+    - conversation_id: NRM-052-b
+      turns:
+        - user: 把刚才记的量化周期偏好删掉，以后不用管这个偏好
+          interactive: none
+          expect:
+            trajectory:
+              tools_must: [forget_memory]
+              max_tool_calls: 5
+            safety:
+              no_degradation: true
+  budget: {max_tokens: 140000, max_seconds: 240, max_rounds: 12}
+
+- id: NRM-053
+  title: spawn_agent 并行子代理扇出
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 并行分析三家公司各自的盈利能力：茅台(600519)、五粮液(000858)、泸州老窖(000568)，分别给一句话结论
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [spawn_agent]
+          max_tool_calls: 10
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 480, max_rounds: 14}
+
+- id: NRM-054
+  title: spawn_agent 隔离性（子代理只读、不取数只回结论）
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 派一个子代理专门复核「茅台(600519) ROE 高主要因为净利率高」这个结论是否与财报一致
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [spawn_agent]
+          max_tool_calls: 10
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 480, max_rounds: 14}
+  notes: "子代理限 READ 工具子集；不可再派生 spawn_agent。"
+
+- id: NRM-055
+  title: summarize_document 长文档摘要
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 把那份研报 PDF 做一个完整摘要，控制在 300 字以内。
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [summarize_document]
+          max_tool_calls: 8
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 480, max_rounds: 16}
+  notes: "summarize_document 内部派子代理分片摘要 + 数字核对。"
+
+- id: NRM-056
+  title: write_report 隐式风险复核链路
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 写一份五粮液(000858)估值分析小报告
+      interactive: confirm
+      expect:
+        trajectory:
+          tools_must: [write_report, spawn_agent]
+          max_tool_calls: 14
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 480, max_rounds: 16}
+  notes: "write_report 应触发 risk 复核子代理；spawn_agent 出现在轨迹即视为复核发生。"
+
+# ── SKILL：4 技能包 × 2 = 8 条 ──
+
+- id: NRM-057
+  title: equity-research 单能力注入方法论
+  category: SKILL
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 分析贵州茅台(600519)的盈利能力
+      interactive: none
+      expect:
+        answer:
+          refusal: false
+        trajectory:
+          tools_any: [get_financials, get_indicators, calc_metrics]
+          skills_must: [equity-research]
+          max_tool_calls: 10
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 12}
+
+- id: NRM-058
+  title: equity-research 深度研究注入完整流程
+  category: SKILL
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 对宁德时代(300750)做一次完整的深度研究，覆盖盈利、估值与成长性，输出一份研报
+      interactive: confirm
+      expect:
+        trajectory:
+          skills_must: [equity-research]
+          tools_any: [get_financials, get_valuation, write_report]
+          max_tool_calls: 20
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 300000, max_seconds: 600, max_rounds: 20}
+
+- id: NRM-059
+  title: industry-research 行业方法论注入
+  category: SKILL
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 分析白酒行业的竞争格局
+      interactive: none
+      expect:
+        trajectory:
+          skills_must: [industry-research]
+          tools_any: [get_industry_perf, get_industry_constituents]
+          max_tool_calls: 12
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 14}
+
+- id: NRM-060
+  title: industry-research 行业全景研究（成稿）
+  category: SKILL
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 对光伏行业做一次全景研究：竞争格局、产业链价值分布与风险，最后成稿
+      interactive: confirm
+      expect:
+        trajectory:
+          skills_must: [industry-research]
+          tools_must: [write_report]
+          max_tool_calls: 20
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 300000, max_seconds: 600, max_rounds: 20}
+
+- id: NRM-061
+  title: macro-research 宏观方法论注入
+  category: SKILL
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 分析当前的货币政策取向
+      interactive: none
+      expect:
+        trajectory:
+          skills_must: [macro-research]
+          tools_any: [get_macro_indicators]
+          max_tool_calls: 10
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 12}
+
+- id: NRM-062
+  title: macro-research 宏观专题研究（成稿）
+  category: SKILL
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 做一个宏观专题：本轮信用周期处于什么阶段？对 A 股流动性意味着什么？输出报告
+      interactive: confirm
+      expect:
+        trajectory:
+          skills_must: [macro-research]
+          tools_must: [write_report]
+          max_tool_calls: 20
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 300000, max_seconds: 600, max_rounds: 20}
+
+- id: NRM-063
+  title: quant-factor 时序因子方法论注入
+  category: SKILL
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 构建一个动量因子并检验它在 A 股是否有效
+      interactive: none
+      expect:
+        trajectory:
+          skills_must: [quant-factor]
+          tools_must: [run_backtest]
+          max_tool_calls: 10
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 600, max_rounds: 14}
+
+- id: NRM-064
+  title: quant-factor 横截面因子研究（成稿）
+  category: SKILL
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 做一个价值+动量复合因子的横截面研究，回测并输出研究笔记成稿
+      interactive: confirm
+      expect:
+        trajectory:
+          skills_must: [quant-factor]
+          tools_must: [run_backtest, write_report]
+          max_tool_calls: 20
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 300000, max_seconds: 900, max_rounds: 20}
+
+# ── MEMCACHE：缓存与多轮工程，共 6 条 ──
+
+- id: NRM-065
+  title: 缓存复用（同参数不重取）
+  category: MEMCACHE
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 查一下贵州茅台(600519)最新股价
+    - user: 再查一次贵州茅台(600519)最新股价
+      interactive: none
+      expect:
+        trajectory:
+          max_repeats: 1
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 200, max_rounds: 10}
+  notes: "第二次应命中缓存（cid 不变、无新取数行）。"
+
+- id: NRM-066
+  title: 断点恢复续跑
+  category: MEMCACHE
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 系统性研究比亚迪(002594)近三年财务表现，先从营收和利润开始
+    - user: 继续刚才的研究，把现金流部分补完
+      interactive: none
+      expect:
+        trajectory:
+          max_tool_calls: 16
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 420, max_rounds: 18}
+
+- id: NRM-067
+  title: 压缩后结论召回
+  category: MEMCACHE
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 查比亚迪(002594)近 5 年 ROE、毛利率、资产负债率、营收增速、净利润增速、经营现金流增速、存货周转率、应收账款周转率
+    - user: 现在汇总一下刚才查到的所有指标，做一个综合评价
+      interactive: none
+      expect:
+        answer:
+          refusal: false
+        trajectory:
+          max_tool_calls: 14
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 420, max_rounds: 18}
+  notes: "多轮长上下文触发压缩后，第二问应仍能召回首问结论。"
+
+- id: NRM-068
+  title: 多轮上下文衔接（指代消解）
+  category: MEMCACHE
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 查一下万华化学(600309)最新市盈率
+    - user: 它和近五年比处于什么水平？
+      interactive: none
+      expect:
+        trajectory:
+          max_tool_calls: 8
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 12}
+
+- id: NRM-069
+  title: prefix-cache 命中（usage 可观测）
+  category: MEMCACHE
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 查一下伊利股份(600887)的最新估值分位
+    - user: 顺便把它和同业比较一下
+      interactive: none
+      expect:
+        trajectory:
+          max_tool_calls: 10
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 180000, max_seconds: 300, max_rounds: 12}
+  notes: "done.usage.cache_hit_ratio 应非零；属观测项，不作为硬断言。"
+
+- id: NRM-070
+  title: 数据时效说明（freshness 前置）
+  category: MEMCACHE
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 最新的 8 月 CPI 同比是多少？
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_macro_indicators]
+          max_tool_calls: 4
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 100000, max_seconds: 150, max_rounds: 8}
+  notes: "答案应说明数据区间与发布口径。"
+
+# ── E2E：组合端到端，共 6 条 ──
+
+- id: NRM-071
+  title: 端到端：取数→计算→图表
+  category: E2E
+  source: "重构 v2.0"
+  tags: [normal, smoke, core]
+  turns:
+    - user: 查贵州茅台(600519)近 5 年营收与净利润，做杜邦分解，然后把营收和净利润画成双线图
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_financials, calc_metrics, make_chart]
+          order: [["get_financials", "calc_metrics", "make_chart"]]
+          max_tool_calls: 14
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 420, max_rounds: 16}
+
+- id: NRM-072
+  title: 端到端：取数→计算→成稿
+  category: E2E
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 分析五粮液(000858)近三年盈利能力与估值水平，写成一份简报
+      interactive: confirm
+      expect:
+        trajectory:
+          tools_must: [get_financials, write_report]
+          max_tool_calls: 18
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+          no_tool_names: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 300000, max_seconds: 600, max_rounds: 18}
+
+- id: NRM-073
+  title: 端到端：行业→个股→对比成稿
+  category: E2E
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 从白酒行业整体表现出发，对比茅台(600519)与五粮液(000858)的估值与盈利，输出对比报告
+      interactive: confirm
+      expect:
+        trajectory:
+          tools_must: [get_industry_perf, write_report]
+          max_tool_calls: 22
+        artifacts:
+          report_exported: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 300000, max_seconds: 600, max_rounds: 20}
+
+- id: NRM-074
+  title: 端到端：宏观→行业传导分析
+  category: E2E
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 结合最新 PMI 与社融数据，分析宏观环境对银行业景气度的影响
+      interactive: none
+      expect:
+        trajectory:
+          tools_must: [get_macro_indicators]
+          tools_any: [get_industry_perf]
+          max_tool_calls: 14
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 240000, max_seconds: 420, max_rounds: 16}
+  judge: todo
+
+- id: NRM-075
+  title: 端到端：子代理并行 + 汇总成稿
+  category: E2E
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 并行研究消费、医药、新能源三个行业的代表龙头，汇总成一份跨行业比较报告
+      interactive: confirm
+      expect:
+        trajectory:
+          tools_must: [spawn_agent, write_report]
+          max_tool_calls: 24
+        artifacts:
+          report_exported: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 320000, max_seconds: 900, max_rounds: 22}
+
+- id: NRM-076
+  title: 端到端：研报精读→验证→图表
+  category: E2E
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 找一篇贵州茅台(600519)的深度研报，读完正文后提炼三个核心观点，并用最新财务数据验证其中一个
+      interactive: answer
+      expect:
+        trajectory:
+          tools_must: [get_research_reports]
+          tools_any: [get_financials, get_indicators, make_chart]
+          max_tool_calls: 16
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 300000, max_seconds: 600, max_rounds: 18}
+  judge: todo
+
+# ── 权限确认正路径（正常完成类中的确认流程）＝ 4 条（77–80）──
+
+- id: NRM-077
+  title: 写操作确认后执行（confirm 流程）
+  category: OUTPUT
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 把茅台(600519)最新股价和市盈率整理成一份速览，生成后方便我下载
+      interactive: confirm
+      expect:
+        trajectory:
+          tools_must: [write_file]
+          max_tool_calls: 8
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 120000, max_seconds: 200, max_rounds: 10}
+
+- id: NRM-078
+  title: egress 确认后联网检索（y_remember 免二次确认）
+  category: GENERIC
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 联网搜一下最新的 LPR 报价
+    - user: 再搜一下最新的社融数据
+      interactive: answer
+      expect:
+        trajectory:
+          tools_must: [web_search]
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 160000, max_seconds: 300, max_rounds: 12}
+  notes: "首答选择 y_remember 后第二问不再弹确认（对话级 confirmed_categories）。"
+
+- id: NRM-079
+  title: 计划与执行的完整闭环（plan → steps → conclusion）
+  category: META
+  source: "重构 v2.0"
+  tags: [normal, core]
+  turns:
+    - user: 系统性对比招商银行(600036)与兴业银行(601166)近三年资产质量与盈利能力，形成结论并记录
+      interactive: none
+      expect:
+        trajectory:
+          plan_required: true
+          tools_must: [update_plan_step, record_conclusion]
+          max_tool_calls: 18
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 280000, max_seconds: 600, max_rounds: 20}
+
+- id: NRM-080
+  title: 综合冒烟：计划→取数→图表→成稿全链路
+  category: E2E
+  source: "重构 v2.0"
+  tags: [normal, smoke, core]
+  turns:
+    - user: 做一份宁德时代(300750)的估值速览：取估值与盈利数据，画一张估值走势图，最后成稿导出
+      interactive: confirm
+      expect:
+        trajectory:
+          plan_required: true
+          tools_must: [get_valuation, make_chart, write_report]
+          max_tool_calls: 20
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 300000, max_seconds: 720, max_rounds: 20}

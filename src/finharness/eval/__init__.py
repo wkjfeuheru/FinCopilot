@@ -1,8 +1,9 @@
 """FinHarness agent 的评测资产（docs 03.13）。
 
-本包把人工问题集（``docs/测试问题集-功能与幻觉.md``）转换为机器可读的用例
-（``evals/cases/*.yaml``），运行它们以驱动真实或仿真的 ``AgentLoop``，并对
-评测 agent 的四个维度打分：
+测试集是 ``evals/cases/d*.yaml``（v2.0：200 条 × 5 维度 normal / missing /
+failure / risk / noise，权威说明见 ``evals/README.md``；旧人工题库
+``docs/测试问题集-功能与幻觉.md`` 已归档至 ``docs/archive/``）。本包加载
+用例、驱动真实或仿真的 ``AgentLoop``，并对四个维度打分：
 
 * 任务完成率 —— 结构化、由代码校验的验收标准；
 * 轨迹正确性 —— 记录的 Thought/Action/Observation 路径与期望路径的对比；

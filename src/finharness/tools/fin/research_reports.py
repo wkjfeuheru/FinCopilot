@@ -32,7 +32,8 @@ from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 from finharness.tools.generic.fencing import (
     EXTERNAL_NOTICE,
     RESULT_CLOSE,
-    RESULT_OPEN,
+    fence,
+    neutralize,
 )
 
 # 单条结果的 token 预算。研报是"一次抓取、多篇句柄"，比常规数据结果需要更多空间
@@ -147,7 +148,7 @@ class GetResearchReportsTool(BaseTool):
         lines.append("### 研报清单")
         for index, row in enumerate(df.itertuples(index=False), start=1):
             lines.append(
-                f"{index}. {row.title}｜{row.institution}｜{row.publish_date}"
+                f"{index}. {neutralize(row.title)}｜{neutralize(row.institution)}｜{row.publish_date}"
                 f"｜评级：{row.rating}｜共 {row.pdf_pages or '?'} 页"
             )
             lines.append(f"   路径：{row.pdf_path or '（未落盘）'}")
@@ -159,11 +160,11 @@ class GetResearchReportsTool(BaseTool):
             content = str(row.content or "")
             lines.append("")
             lines.append(
-                RESULT_OPEN.format(index=index, url=row.pdf_path or row.pdf_url or row.detail_url)
+                fence(index, row.pdf_path or row.pdf_url or row.detail_url)
             )
-            lines.append(f"标题：{row.title}")
+            lines.append(f"标题：{neutralize(row.title)}")
             if content:
-                lines.append(content)
+                lines.append(neutralize(content))
             else:
                 lines.append("（无预览）")
             lines.append(RESULT_CLOSE)

@@ -21,6 +21,13 @@ from finharness.tools.declare import PermissionLevel, Tier, ToolGroup
 from finharness.tools.fin.announcements import GetAnnouncementsTool
 from finharness.tools.fin.backtest import RunBacktestTool
 from finharness.tools.fin.chart import MakeChartTool
+from finharness.tools.fin.dataset import (
+    ListFuyaoDatasetsTool,
+    QueryAShareDataTool,
+    QueryFundDataTool,
+    QueryFuturesDataTool,
+    QueryOptionsDataTool,
+)
 from finharness.tools.fin.financials import GetFinancialsTool
 from finharness.tools.fin.indicators import GetIndicatorsTool
 from finharness.tools.fin.industry import GetIndustryConstituentsTool, GetIndustryPerfTool
@@ -67,6 +74,12 @@ ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
     GetMacroIndicatorsTool,
     GetIndustryPerfTool,
     GetIndustryConstituentsTool,
+    # 金融-数据（同花顺长尾数据集派发器）
+    ListFuyaoDatasetsTool,
+    QueryAShareDataTool,
+    QueryFundDataTool,
+    QueryFuturesDataTool,
+    QueryOptionsDataTool,
     # 金融-计算
     CalcMetricsTool,
     CalcValuationTool,

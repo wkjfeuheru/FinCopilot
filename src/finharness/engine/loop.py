@@ -35,6 +35,7 @@ from finharness.tools.capabilities import (
     is_research_capability,
 )
 from finharness.tools.budget import resolve_result_budget
+from finharness.tools.generic.fencing import close_dangled
 from finharness.tools.meta.skills import SkillError, SkillRegistry, report_requested, route
 from finharness.tools.registry import ToolRegistry
 from finharness.types import (
@@ -1457,6 +1458,8 @@ class AgentLoop:
                 progress = self._plan_progress(tool_uses)
                 if progress is not None:
                     self._plan_hint = self._plan_hint_text(progress)
+                    # 轮次序号使监控端能把"跑偏"定位到具体一轮（drift 首现轮）。
+                    progress["turn"] = self.turn
                     await self._emit("plan_progress", progress)
                 continue
 
@@ -1515,7 +1518,27 @@ class AgentLoop:
         """
         if limit <= 0 or self.memory.counter.count(content).tokens <= limit:
             return content
-        # 二分查找预算内最长的前缀；计数是单调的。
+        # 截断可能把 </web_result> 切掉而留下悬空围栏——"围栏内是引文"的边界
+        # 由此退化为含糊。补齐闭合优先于截断标记：完整性是安全属性，标记只是
+        # 信息。渲染层的中和保证此刻前缀里的 <web_result 只能是真围栏，而围栏
+        # 总是配对发出（悬空的至多最后一段），因此扣除闭合开销重截一轮即可收敛；
+        # 三轮上限只是对异常输入的防御。
+        budget = limit
+        for _ in range(3):
+            prefix = self._fit_prefix(content, budget)
+            closed = close_dangled(prefix)
+            over = self.memory.counter.count(closed).tokens - limit
+            if over <= 0:
+                break
+            budget -= over + 1
+        prefix = close_dangled(prefix)
+        marker = self._truncation_marker(prefix, content, recovery_path=recovery_path)
+        if self.memory.counter.count(marker).tokens >= limit:
+            return prefix  # 连标记都放不下：宁可无标记，也不超出预算
+        return prefix.rstrip() + marker
+
+    def _fit_prefix(self, content: str, limit: int) -> str:
+        """二分查找 token 预算内最长的前缀；计数是单调的。"""
         low, high = 0, len(content)
         while low < high:
             middle = (low + high + 1) // 2
@@ -1523,11 +1546,7 @@ class AgentLoop:
                 low = middle
             else:
                 high = middle - 1
-        prefix = content[:low]
-        marker = self._truncation_marker(prefix, content, recovery_path=recovery_path)
-        if self.memory.counter.count(marker).tokens >= limit:
-            return prefix  # 连标记都放不下：宁可无标记，也不超出预算
-        return prefix.rstrip() + marker
+        return content[:low]
 
     def _truncation_marker(
         self, prefix: str, content: str, *, recovery_path: str | None
@@ -1675,9 +1694,19 @@ class AgentLoop:
         ]
 
     async def _reject(
-        self, tool_use: ToolUse, message: str, *, duration_ms: int | None = None
+        self,
+        tool_use: ToolUse,
+        message: str,
+        *,
+        duration_ms: int | None = None,
+        verdict: str | None = None,
     ) -> tuple[str, str]:
-        """拒绝一次工具调用：发送失败状态、记录观测并返回编码后的结果。"""
+        """拒绝一次工具调用：发送失败状态、记录观测并返回编码后的结果。
+
+        ``verdict`` 是拒绝的结构性原因（denied/blocked/loop_guard/timeout/
+        unknown/lazy），监控侧据此把「安全拦截」与「工具失败」分开统计；
+        None 表示普通工具执行失败。
+        """
         status: dict[str, Any] = {
             "call_id": tool_use.call_id,
             "name": tool_use.name,
@@ -1685,6 +1714,8 @@ class AgentLoop:
             "ok": False,
             "error": message,
         }
+        if verdict is not None:
+            status["verdict"] = verdict
         if duration_ms is not None:
             status["duration_ms"] = duration_ms
         await self._emit("tool_status", status)
@@ -1732,7 +1763,9 @@ class AgentLoop:
         tool = self.registry.resolve(tool_use.name)
         if tool is None:
             span.set_attribute("status", "unknown")
-            return await self._reject(tool_use, f"unknown tool: {tool_use.name}")
+            return await self._reject(
+                tool_use, f"unknown tool: {tool_use.name}", verdict="unknown"
+            )
 
         # 按需工具的激活闸门：其 schema 此前从未注入，因此模型现在调用它意味着它凭
         # 名称猜到了工具。这不再是错误——注册层知道全部工具，按需注入只是省 token 的
@@ -1767,6 +1800,7 @@ class AgentLoop:
                     "name": tool_use.name,
                     "count": guard.count,
                     "action": "refused" if not guard.escalate else "would_abort",
+                    "turn": self.turn,
                 },
             )
             if guard.escalate:
@@ -1789,13 +1823,15 @@ class AgentLoop:
             await self._audit(tool, tool_use.args, action="denied", verdict="deny")
             span.set_attribute("status", "denied")
             return await self._reject(
-                tool_use, decision.reason or f"tool denied: {tool_use.name}"
+                tool_use,
+                decision.reason or f"tool denied: {tool_use.name}",
+                verdict="denied",
             )
         if not await self.hooks.pre(tool, tool_use.args, turn=self.turn):
             await self._audit(tool, tool_use.args, action="denied", verdict="blocked")
             span.set_attribute("status", "blocked")
             return await self._reject(
-                tool_use, f"tool blocked by hook: {tool_use.name}"
+                tool_use, f"tool blocked by hook: {tool_use.name}", verdict="blocked"
             )
 
         await self._emit(
@@ -1837,6 +1873,7 @@ class AgentLoop:
                 tool_use,
                 f"tool timeout after {timeout}s: {tool_use.name}",
                 duration_ms=duration_ms,
+                verdict="timeout",
             )
         except Exception as exc:
             duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)
@@ -1850,7 +1887,7 @@ class AgentLoop:
                 duration_ms=duration_ms,
             )
             return await self._reject(
-                tool_use, f"tool failed: {exc}", duration_ms=duration_ms
+                tool_use, f"tool failed: {exc}", duration_ms=duration_ms, verdict="error"
             )
 
         duration_ms = self.stats.record_tool_duration(tool_use.name, started_at)

@@ -62,6 +62,9 @@ class Capability(str, Enum):
     RESEARCH_REPORT = "研报"
     MACRO = "宏观"
     INDUSTRY = "行业"
+    # 长尾数据集：特色数据（涨停池/龙虎榜/热股榜）、基金、期货、期权、交易日历等。
+    # 它们没有对应的语义方法，经通用数据集派发器按服务端的目录触达。
+    DATASET = "数据集"
     COMPUTE = "计算"
     OUTPUT = "输出"
     FILE = "文件"
@@ -132,6 +135,12 @@ class ToolSpec:
     needs_interactive: bool = False
     needs_coordinator: bool = False
     data_tool: bool = False
+    # 该工具的调用会把用户数据发往第三方、或从第三方拉入不可信内容，因此首次调用
+    # 须经用户确认（docs 03.7.1）。它是**声明**而非闸门里的名称表：此前判定写在
+    # 权限闸门内的 ``_egress_requested``，那只在"恰好两个工具"时成立；当同花顺把
+    # 整组数据工具都变成外发工具后，逐名字维护必然漏改，而漏改的后果是一个本该
+    # 询问用户的外发调用静默放行。
+    egress: bool = False
     # 由签名与 ``@param`` 合成的 Pydantic 模型。它是**生成物**，不是手写的输入类：
     # 存在的意义是让校验与 JSON Schema 继续走 Pydantic 那条已被验证过的路径。
     input_model: type[BaseModel] = BaseModel
@@ -222,6 +231,7 @@ def tool(
     needs_interactive: bool = False,
     needs_coordinator: bool = False,
     data_tool: bool = False,
+    egress: bool = False,
     model_validator: Callable[[Any], Any] | None = None,
     params_model: type[BaseModel] | None = None,
 ) -> Callable[[type], type]:
@@ -266,6 +276,7 @@ def tool(
             needs_interactive=needs_interactive,
             needs_coordinator=needs_coordinator,
             data_tool=data_tool,
+            egress=egress,
             input_model=model,
             params=params,
         )
@@ -287,6 +298,7 @@ def tool(
         cls.needs_interactive = spec.needs_interactive
         cls.needs_coordinator = spec.needs_coordinator
         cls.data_tool = spec.data_tool
+        cls.egress = spec.egress
         cls.input_model = spec.input_model
         DECLARED_TOOLS[name] = spec
         return cls

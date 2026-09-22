@@ -22,7 +22,8 @@ from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 from finharness.tools.generic.fencing import (
     EXTERNAL_NOTICE,
     RESULT_CLOSE,
-    RESULT_OPEN,
+    fence,
+    neutralize,
 )
 
 
@@ -40,6 +41,8 @@ from finharness.tools.generic.fencing import (
     # 复核是拿报告与会话自身的数据做核对；搜索网页会消耗 token 并把不可信文本
     # 拉入复核者。
     review_eligible=False,
+    # 查询词会发往第三方搜索引擎，因此首次调用须经用户确认（docs 03.7.1）。
+    egress=True,
     output_schema_note="返回每条结果的标题/网址/摘要。",
 )
 class WebSearchTool(BaseTool):
@@ -79,9 +82,9 @@ class WebSearchTool(BaseTool):
 
         lines = [EXTERNAL_NOTICE, ""]
         for index, row in enumerate(raw.df.itertuples(index=False), start=1):
-            lines.append(RESULT_OPEN.format(index=index, url=row.url))
-            lines.append(f"标题：{row.title}")
-            lines.append(str(row.content))
+            lines.append(fence(index, row.url))
+            lines.append(f"标题：{neutralize(row.title)}")
+            lines.append(neutralize(str(row.content)))
             lines.append(RESULT_CLOSE)
             lines.append("")
         return "\n".join(lines).rstrip(), [raw]

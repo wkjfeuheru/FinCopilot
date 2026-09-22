@@ -49,14 +49,6 @@
       "api_version": null,
       "first_byte_timeout_s": 30.0,
       "idle_timeout_s": 60.0
-    },
-    "fake": {
-      "kind": "fake",
-      "base_url": null,
-      "env_key": null,
-      "api_version": null,
-      "first_byte_timeout_s": 30.0,
-      "idle_timeout_s": 60.0
     }
   },
   "permission": {
@@ -71,6 +63,7 @@
   },
   "data": {
     "adapter_order": [
+      "fuyao",
       "akshare",
       "tushare",
       "baostock"
@@ -85,7 +78,8 @@
       "financials": 365,
       "announcements": 7,
       "macro": 7,
-      "industry": 1
+      "industry": 1,
+      "dataset": 1
     }
   },
   "context": {
@@ -150,6 +144,13 @@
       "project": "finharness",
       "env_key": "LANGSMITH_API_KEY",
       "capture_payloads": false
+    },
+    "trace_store": {
+      "enabled": false,
+      "db_path": "state/trace.db",
+      "admin_users": [],
+      "capture_payloads": true,
+      "retention_days": 90
     }
   },
   "server": {
@@ -195,5 +196,15 @@
     "api_key": null,
     "proxy": null,
     "local_pdf_fallback": true
+  },
+  "fuyao": {
+    "enabled": true,
+    "kind": "mcp",
+    "base_url": "https://fuyao.aicubes.cn",
+    "env_key": "HITHINK_FINANCE_API_KEY",
+    "timeout_s": 30.0,
+    "api_key": null,
+    "proxy": null,
+    "catalog_ttl_s": 300.0
   }
 }

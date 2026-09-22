@@ -34,5 +34,16 @@ sets:
   full: {}                 # 空选择器 = 全部用例
   selfcheck:
     tags: ["selfcheck"]
+  # 维度选择器：五个形式维度各成一套（200 条 = 80/30/30/40/20）
+  normal:
+    tags: ["normal"]
+  missing:
+    tags: ["missing"]
+  failure:
+    tags: ["failure"]
+  risk:
+    tags: ["risk"]
+  noise:
+    tags: ["noise"]
 
 cases_dir: cases

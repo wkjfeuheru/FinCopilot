@@ -81,10 +81,12 @@ def test_case_must_declare_some_turns(tmp_path):
 
 
 def test_repo_memory_cases_load_cleanly():
-    """M 系列（跨对话记忆）用例必须通过 schema 校验。"""
+    """跨对话记忆用例（v2.0 用 chats 声明）必须通过 schema 校验。"""
     cases = load_cases_dir("evals/cases")
 
-    memory_cases = [case for case in cases if case.id.startswith("M1-")]
+    # v2.0 测试集把跨对话记忆题放在正常完成类（NRM-050/051/052 等），
+    # 不再有独立的 M1- 编号前缀；凡声明了 chats 的都是跨对话用例。
+    memory_cases = [case for case in cases if case.chats]
     assert len(memory_cases) >= 2
     assert all(case.chats for case in memory_cases)
     assert all(case.all_turns for case in memory_cases)

@@ -15,6 +15,8 @@
 }
 
 * { box-sizing: border-box; }
+/* 仅供屏幕阅读器的播报区（aria-live），视觉上完全隐藏。 */
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0; clip: rect(0 0 0 0); clip-path: inset(50%); overflow: hidden; white-space: nowrap; }
 body { margin: 0; min-width: 320px; font-size: 14px; }
 button, textarea { font: inherit; }
 button, a, textarea { -webkit-tap-highlight-color: transparent; }
@@ -157,6 +159,7 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 }
 @media (prefers-reduced-motion: reduce) {
   .turn-trace-running .trace-pulse { animation: none; }
+  .inline-running-dot { animation: none; }
   .plan-progress-track span { transition: none; }
 }
 .trace-content { padding: 2px 14px 14px; border-top: 1px solid #e3e9ed; }
@@ -237,10 +240,23 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 .markdown-body code { padding: 2px 5px; border-radius: 3px; background: #eef2f5; font-size: 12px; font-family: var(--mono); }
 .markdown-body pre { margin: 0 0 16px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 5px; background: #f5f7f9; overflow-x: auto; }
 .markdown-body pre code { padding: 0; background: none; }
+/* 代码高亮（rehype-highlight 输出的 hljs class）：手写一小套贴纸面
+   观感的浅色主题，避免整份官方主题与本工作区配色打架。 */
+.hljs-comment, .hljs-quote { color: #7d8fa0; font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-doctag, .hljs-type, .hljs-name, .hljs-strong { color: #155e8a; }
+.hljs-string, .hljs-regexp, .hljs-addition, .hljs-attribute, .hljs-meta .hljs-string { color: #1d6b4f; }
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-variable, .hljs-template-variable, .hljs-link, .hljs-selector-attr { color: #9a5b1f; }
+.hljs-title, .hljs-title.function_, .hljs-built_in, .hljs-class .hljs-title { color: #6d3fa2; }
+.hljs-attr, .hljs-property, .hljs-selector-class, .hljs-selector-id { color: #175f58; }
+.hljs-deletion { color: #9b3030; }
+.hljs-emphasis { font-style: italic; }
 .markdown-table-wrap { max-width: 100%; margin: 16px 0; overflow-x: auto; border: 1px solid var(--line); border-radius: 5px; }
-.markdown-body table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums lining-nums; }
+/* 纵向限高内滚：让长表的表头可以 position:sticky 吸附（sticky 只在
+   最近一个滚动容器内生效，越过 .markdown-table-wrap 的 overflow 就会失效）。 */
+.markdown-table-scroll { max-height: 480px; overflow-y: auto; }
+.markdown-body table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums lining-nums; }
 .markdown-body th, .markdown-body td { border-bottom: 1px solid #e2e8ed; padding: 10px 12px; text-align: left; }
-.markdown-body th { background: #eaf0f4; color: #30495d; font-weight: 650; white-space: nowrap; }
+.markdown-body th { position: sticky; top: 0; z-index: 1; background: #eaf0f4; color: #30495d; font-weight: 650; white-space: nowrap; box-shadow: inset 0 -1px 0 #d3dde5; }
 .markdown-body tr:nth-child(even) td { background: #f7f9fa; }
 .markdown-body tr:hover td { background: #edf6f3; }
 .markdown-body tr:last-child td { border-bottom: 0; }
@@ -279,6 +295,13 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 .source-endpoint, .source-meta, .source-params, .source-fingerprint { color: var(--muted); font-size: 11px; line-height: 1.65; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .source-fingerprint { padding-top: 6px; border-top: 1px dashed var(--line); font-family: var(--mono); }
 .tool-status { color: var(--accent); font-size: 12px; overflow-wrap: anywhere; }
+/* 正在生成的消息下方的内联运行状态：把"还在推进"放到视线停留处。 */
+.inline-running-status { display: flex; align-items: center; gap: 8px; color: var(--accent); font-size: 12px; overflow-wrap: anywhere; }
+.inline-running-dot { flex: none; width: 8px; height: 8px; border: 2px solid #176b63; border-radius: 50%; background: #d9eee9; animation: trace-pulse 1.6s ease-out infinite; }
+/* 错误气泡上的一键重试：中性描边按钮，与"继续研究"入口同一权重语汇。 */
+.message-error-actions { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #e0b6b6; }
+.error-retry-button { padding: 6px 14px; border: 1px solid #cf8f8f; border-radius: 5px; background: #fff; color: #9b3030; cursor: pointer; font-size: 12px; font-weight: 600; }
+.error-retry-button:hover { background: #fff1f0; border-color: #b64444; }
 .engine-notice { padding: 12px 14px; border: 1px solid #e5d4aa; border-left: 3px solid #b38a38; border-radius: 5px; background: #fffbef; color: #7a6320; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .artifact-list { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid #cadfd6; border-radius: 5px; background: #f2f8f5; }
 .artifact-title { color: #4b6c60; font-size: 12px; font-weight: 700; }
@@ -300,7 +323,6 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
    与"发送"混淆，同时保持与主按钮相同的尺寸与权重。 */
 .composer .stop-button { background: #5b6b7a; }
 .composer .stop-button:hover:not(:disabled) { background: #44515d; }
-.composer textarea:disabled { color: var(--muted); cursor: not-allowed; }
 .config-empty-state { padding: 28px 12px; margin: 0; border: 1px dashed var(--line); border-radius: 6px; background: #f8fafb; }
 .settings-layout { display: grid; grid-template-columns: minmax(230px, .75fr) minmax(0, 1.35fr); gap: 20px; align-items: start; }
 .settings-config-list, .settings-form-panel { min-width: 0; border: 1px solid var(--line); background: #fbfcfd; }
@@ -402,3 +424,99 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 }
 .login-card .eyebrow { color: var(--muted); }
 .login-card h1 { margin-bottom: 4px; }
+
+/* ── 运行监控视图（docs 03.14.4）：独立只读页，沿用工作台的纸面观感。 ── */
+.monitor-view {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 20px 24px 32px;
+}
+.monitor-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.monitor-header h2 { margin: 0 0 2px; font-size: 17px; }
+.monitor-header p { margin: 0; color: var(--muted); font-size: 12px; }
+.monitor-filters { display: flex; align-items: center; gap: 10px; }
+
+.monitor-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.monitor-metric-card { border: 1px solid var(--line); }
+.monitor-metric-hint { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
+
+.monitor-metric-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+.monitor-metric-columns .ant-card { border: 1px solid var(--line); }
+
+.monitor-bars { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.monitor-bars li { display: grid; grid-template-columns: 110px minmax(0, 1fr) 48px; align-items: center; gap: 9px; }
+.monitor-bar-label { color: var(--ink); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.monitor-bar-track { height: 8px; border-radius: 4px; background: #eef2f5; overflow: hidden; }
+.monitor-bar-fill { display: block; height: 100%; background: var(--accent); }
+.monitor-bar-value { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
+
+.monitor-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.monitor-trace-detail { display: grid; gap: 12px; }
+.monitor-trace-input { margin: 0; font-size: 13px; }
+.monitor-trace-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.monitor-trace-answer {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: #fbfdfc;
+}
+.monitor-trace-answer p { margin: 6px 0 0; white-space: pre-wrap; font-size: 13px; line-height: 1.6; }
+
+/* 监控不可用时的引导块：说清原因与开启方法，替代无信息量的"加载失败"。 */
+.monitor-notice {
+  max-width: 620px;
+  margin: 48px auto 0;
+  padding: 26px 28px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  text-align: left;
+}
+.monitor-notice .ant-empty { margin-bottom: 4px; }
+.monitor-notice-title { color: var(--ink); font-size: 14px; font-weight: 700; }
+.monitor-notice-lines {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.9;
+}
+.monitor-notice-lines code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #eef2f5;
+  font-family: var(--mono);
+  font-size: 11px;
+}

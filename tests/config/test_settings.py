@@ -22,7 +22,7 @@ def test_settings_defaults_include_complete_contract(tmp_path):
     assert settings.providers["deepseek"].kind == "openai_compat"
     assert settings.permission.default_mode == "default"
     assert settings.tools.timeout_default_s == 30
-    assert settings.data.adapter_order == ("akshare", "tushare", "baostock")
+    assert settings.data.adapter_order == ("fuyao", "akshare", "tushare", "baostock")
     assert settings.context.max_turns == 30
     assert settings.server.confirm_ttl_s == 120
     assert settings.server.allow_remote is False
@@ -423,6 +423,84 @@ def test_web_has_its_own_cache_ttl(tmp_path):
     settings = Settings.from_file(write_settings(tmp_path, {"model": {"provider": "fake"}}))
 
     assert settings.data.cache_ttl_days["web"] == 1
+
+
+# --- 同花顺 MCP 配置（文档 03.5） -------------------------------------
+
+def test_fuyao_defaults_point_at_the_hosted_mcp_gateway(tmp_path):
+    """默认接入官方托管网关；凭据只从环境变量读，不预置任何密钥。"""
+    settings = Settings.from_file(write_settings(tmp_path, {"model": {"provider": "fake"}}))
+
+    assert settings.fuyao.enabled is True
+    assert settings.fuyao.kind == "mcp"
+    assert settings.fuyao.base_url == "https://fuyao.aicubes.cn"
+    assert settings.fuyao.env_key == "HITHINK_FINANCE_API_KEY"
+    assert settings.fuyao.api_key is None
+    assert settings.fuyao.resolved_api_key() is None
+
+
+def test_fuyao_resolved_key_prefers_the_inline_value_over_the_environment(monkeypatch, tmp_path):
+    """内联密钥优先，与 search 同一口径：本地配置无需导出环境变量即可生效。"""
+    monkeypatch.setenv("FROM_ENV", "env-key")
+    path = write_settings(
+        tmp_path,
+        {"model": {"provider": "fake"}, "fuyao": {"api_key": "inline", "env_key": "FROM_ENV"}},
+    )
+
+    assert Settings.from_file(path).fuyao.resolved_api_key() == "inline"
+
+
+def test_fuyao_resolved_key_falls_back_to_the_named_environment_variable(monkeypatch, tmp_path):
+    monkeypatch.setenv("MY_HITHINK_KEY", "env-key")
+    monkeypatch.delenv("HITHINK_FINANCE_API_KEY", raising=False)
+    path = write_settings(
+        tmp_path, {"model": {"provider": "fake"}, "fuyao": {"env_key": "MY_HITHINK_KEY"}}
+    )
+
+    assert Settings.from_file(path).fuyao.resolved_api_key() == "env-key"
+
+
+def test_fuyao_missing_credentials_do_not_block_loading(monkeypatch, tmp_path):
+    """未配密钥必须能正常加载：适配器在调用时报告"未配置"，由下一个数据源接管。
+
+    若加载期即失败，未使用同花顺的部署会被一个用不到的集成拖住启动。
+    """
+    monkeypatch.delenv("HITHINK_FINANCE_API_KEY", raising=False)
+    path = write_settings(tmp_path, {"model": {"provider": "fake"}})
+
+    settings = Settings.from_file(path)
+
+    assert settings.fuyao.enabled is True
+    assert settings.fuyao.resolved_api_key() is None
+
+
+def test_fuyao_environment_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("FINH_FUYAO_ENV_KEY", "FROM_ENV_KEY")
+    monkeypatch.setenv("FINH_FUYAO_TIMEOUT_S", "7.5")
+    monkeypatch.setenv("FINH_FUYAO_ENABLED", "false")
+    path = write_settings(tmp_path, {"model": {"provider": "fake"}})
+
+    settings = Settings.from_file(path)
+
+    assert settings.fuyao.env_key == "FROM_ENV_KEY"
+    assert settings.fuyao.timeout_s == 7.5
+    assert settings.fuyao.enabled is False
+
+
+def test_fuyao_rejects_an_unknown_transport(tmp_path):
+    """extra=forbid 与 Literal 在 fuyao 段同样生效；首期只实现 MCP 传输。"""
+    path = write_settings(
+        tmp_path, {"model": {"provider": "fake"}, "fuyao": {"kind": "rest"}}
+    )
+
+    with pytest.raises(SettingsError):
+        Settings.from_file(path)
+
+
+def test_dataset_kind_has_its_own_cache_ttl(tmp_path):
+    settings = Settings.from_file(write_settings(tmp_path, {"model": {"provider": "fake"}}))
+
+    assert settings.data.cache_ttl_days["dataset"] == 1
 
 
 def test_result_token_overrides_are_parsed_from_the_environment(monkeypatch, tmp_path):

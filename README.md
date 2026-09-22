@@ -79,11 +79,53 @@ python scripts/demo.py --demo b --json    # 只跑 Demo B，输出机器可读�
 | 阿里云百炼 | OpenAI 兼容 | `DASHSCOPE_API_KEY` |
 | Kimi | Anthropic 兼容 | `MOONSHOT_API_KEY` |
 | GLM | Anthropic 兼容 | `ZHIPU_API_KEY` |
-| fake | 离线桩 | — |
 
 缺少密钥**不会**自动回退到其他厂商。离线测试显式使用 `fake` 或注入 `FakeProvider`。
 
 Provider 也可在前端配置页写入数据库并加密存储；**已激活的数据库配置优先于 `settings.json` 预设**。
+
+## 数据源
+
+A 股行情、财务与行业数据由一条**有序的适配器链**提供，按 `settings.data.adapter_order`
+依次尝试，第一个不报错的源胜出，降级对调用方静默但在引用中可见（`endpoint` 记录真实来源）。
+
+| 适配器 | 覆盖 | 凭据 |
+|---|---|---|
+| `fuyao`（同花顺 iFinD / Fuyao，经 **MCP**） | 行情/日线、财务三表（**结构化字段**）、财务指标、概念指数成分股、估值快照、**特色数据**（涨停/跌停/炸板池、连板天梯、龙虎榜、热股榜、个股异动、集合竞价、交易日历）、公募基金、期货、期权 | `HITHINK_FINANCE_API_KEY` |
+| `akshare` | A 股行情/日线、财报摘要、指标、估值、同行、新闻、公告、宏观、申万行业与中证指数成分股 | 无需 |
+| `tavily` | 联网检索 | `TAVILY_API_KEY` |
+| `eastmoney_report` | 东方财富研报（含 PDF 全文） | 无需 |
+
+**默认顺序是 `fuyao → akshare → …`，这个顺序有实质影响**：编排取第一个不报错的适配器，
+因此把同花顺排在 akshare **之后**，就意味着 akshare 一旦答得上，同花顺永远不会被用到——
+那正是财报结构化字段与概念指数这类缺口一直填不上的原因。
+
+同花顺配置（`settings.fuyao`，写法与 `search` 一致）：
+
+```bash
+export HITHINK_FINANCE_API_KEY=...    # 推荐：密钥只从环境变量读
+```
+
+也可在 `settings.json`（已被 git 忽略）里直接写 `fuyao.api_key`。**未配置密钥不是错误**：
+适配器照常构造，调用时报"未配置同花顺密钥"并自动转给 akshare，因此未使用同花顺的部署
+不会被它拖住启动；`fuyao.enabled=false` 可直接关闭。
+
+同花顺经 MCP 暴露 78 个端点。核心端点由专用工具覆盖，长尾端点（特色数据、基金、期货、期权、
+估值快照、标的检索）经**数据集派发器**触达——参数 schema 在运行时从服务端 `tools/list` 读取，
+而非本地手抄，因此上游新增端点无需改代码：
+
+```
+list_fuyao_datasets(service)          # 先看该服务有哪些数据集、各自要什么参数
+query_a_share_data(dataset, params)   # A 股长尾：特色数据 / 概念指数 / 交易日历 / 估值快照 / 标的检索
+query_fund_data(dataset, params)      # 公募基金
+query_futures_data(dataset, params)   # 期货
+query_options_data(dataset, params)   # 期权
+```
+
+这些工具会向同花顺发出请求，因此声明 `egress=True`：**首次调用须经用户确认**，与
+`web_search` 共享"允许并本对话不再询问"的类别授权。参数写错会被显式拒绝（不会静默忽略）；
+上游 schema 里**实质性的默认值会被披露**（如快照的 `thscodes` 默认只含两只个股），
+避免一个隐含筛选被读成全局结论。详见 [03.5-data.md](docs/modules/03.5-data.md)。
 
 ## 联网检索与研报（可选）
 
@@ -118,7 +160,8 @@ export TAVILY_API_KEY=tvly-...        # 推荐：密钥只从环境变量读
 FINH_MODEL_PROVIDER=glm
 FINH_SERVER_PORT=8123
 FINH_PERMISSION_DEFAULT_MODE=auto
-FINH_DATA_ADAPTER_ORDER='["akshare"]'    # 列表/对象用 JSON
+FINH_DATA_ADAPTER_ORDER='["fuyao","akshare"]'    # 列表/对象用 JSON
+FINH_FUYAO_ENV_KEY="HITHINK_FINANCE_API_KEY"
 ```
 
 完整契约见 [03.1-config.md](docs/modules/03.1-config.md)。
@@ -135,28 +178,30 @@ FINH_DATA_ADAPTER_ORDER='["akshare"]'    # 列表/对象用 JSON
 | M5 演示打磨 | 风险终审子 Agent、Demo 脚本、E2E 预算断言、README | ✅ |
 | M6 服务层 Web 化 | FastAPI SSE、确认往返、Web 聊天页、对话管理 | ✅ |
 
-规模：`src/` 约 1.9 万行 Python（`wc -l`）；895 条离线测试（`pytest -m "not smoke"`）。
+规模：`src/` 约 3.1 万行 Python（`wc -l`）；1512 条离线测试（`pytest -m "not smoke"`）。
 
 ## 架构一览
 
 ```
 engine/loop.py      AgentLoop：轮次驱动、流式、并行工具、循环兜底、压缩触发、记忆装配
 provider/           OpenAI/Anthropic 兼容协议 + 重试与错误分类
-tools/              32 个工具（两级注册表：21 常驻 + 11 按需），declare.py 是声明层
-  declare.py        @tool / @param：元数据与参数的唯一声明处
+tools/              37 个工具（两级注册表：21 常驻 + 16 按需），declare.py 是声明层
+  declare.py        @tool / @param：元数据与参数的唯一声明处（含 egress 外发声明）
   fin/              行情/财务/估值/可比/公告/图表/研报（含 report_pipeline.py 渲染 + docx 导出）
+                    dataset.py：同花顺长尾数据集派发器（参数 schema 取自服务端运行时目录）
   generic/          read_file（限 output/ 与本人 data_cache/） / write_file（仅 output/）
   meta/             research_plan / search_tools / ask_user / spawn_agent / …
 skills/             4 个投研场景（个股/行业/宏观/量化）：各含 SKILL.md + references 方法论 + assets 报告模板
                     由路由层按问题意图自动注入（不提供加载工具）
-data/               adapter 降级链 + 缓存 + citation 注册表
+data/               adapter 降级链（fuyao/akshare/tavily/eastmoney_report）+ 缓存 + citation 注册表
+                    adapters/mcp_client.py：JSON-RPC over Streamable HTTP 的最小 MCP 客户端
 context/            L1 WorkingMemory + L2 事件环 + SQLite 持久层；分段摘要与压缩；LTM 跨对话记忆（情节+语义，蒸馏/注入/向量召回）
 utils/              跨层通用件：pandas/akshare 运行时垫片、Markdown 图片链接转义
 permissions/        权限门（deny 规则 > 缓存拒写 > 读/写分流 > 模式回退 > output 白名单）
                     网络外发（联网检索、研报全文）首次确认，可在对话内免问
 hooks/              审计链（JSONL，每次受治理的工具调用一行，含子代理）
 coordinator/        风险终审子 Agent（独立上下文 + 受限只读工具集；review.py 终审编排）
-observability/      三层观测：结构化 JSON 日志（trace_id 贯穿）+ Prometheus 指标 + LangSmith 追踪
+observability/      四层观测：结构化 JSON 日志（trace_id 贯穿）+ Prometheus 指标 + LangSmith 追踪 + SQLite 运行轨迹库（自建监控平台）
 server/             FastAPI 路由、SSE、会话注册表、确认总线
 frontend/           React 19 + TypeScript + antd
 ```
@@ -179,17 +224,25 @@ frontend/           React 19 + TypeScript + antd
 | GET | `/v1/artifacts` | 下载产物（限 output/ 与 data_cache/） |
 | GET | `/v1/cache/stats` | 缓存命中统计 |
 | GET | `/v1/config` | Provider 配置（前端设置页用） |
+| GET | `/v1/trace/status` | 监控可用性（是否启用/是否有权限/白名单是否已配） |
+| GET | `/v1/trace/runs` | 运行列表（分页 + 过滤；未启用返回 503 并带开启方法） |
+| GET | `/v1/trace/runs/{run_id}` | 完整 trace：逐轮思考 / 工具往返 / 事件（含跑偏点） |
+| GET | `/v1/trace/metrics` | 七项指标聚合（完成率 / 调用数 / 步数 / 失败率 / 重复率 / 拦截 / 超时） |
 | GET | `/metrics` | Prometheus 指标（仅在 `observability.metrics.enabled=true` 时注册） |
 
 ## 测试
 
 ```bash
-pytest -m "not smoke"          # 离线：895 条，约 30s，不联网、不花钱
+pytest -m "not smoke"          # 离线：1512 条，不联网、不花钱
 pytest -m smoke                # 真实 Provider + 真实行情数据，需 DEEPSEEK_API_KEY
+pytest -m smoke tests/data/test_fuyao_smoke.py   # 同花顺真实端点，需 HITHINK_FINANCE_API_KEY
 python scripts/demo.py         # 端到端演示（HTTP 驱动）
 ```
 
 - 离线测试不写真实 `data_cache/`：每个用例用 `tmp_path` 构造 hermetic 的 Settings 与缓存。
+- 同花顺的协议解析（握手、会话、SSE、错误分类、载荷归一化）**全部由离线用例覆盖**——
+  用 `httpx.MockTransport`，不需要网络或密钥；`test_fuyao_smoke.py` 只补一件事：对着真实
+  网关确认线上行为与那些假设一致（无密钥时跳过，其中两条错误分类用例仍会执行）。
 - `@smoke` 用例同时是 M5 的**成本验收**：一次完整研报必须落在 240s / 600k token 的包络内
   （实测基线 102s / 300,319 token，阈值留了余量以吸收模型间方差）。
 
@@ -198,14 +251,14 @@ python scripts/demo.py         # 端到端演示（HTTP 驱动）
 四维度评估（任务完成率 / 推理路径正确性 / 效率 / 安全性），详见 [03.13-eval.md](docs/modules/03.13-eval.md)：
 
 ```bash
-python -m finharness.eval list  --set smoke|core|full   # 列出题集
+python -m finharness.eval list  --set smoke|core|full|normal|missing|failure|risk|noise
 python -m finharness.eval check                          # 仅校验用例 YAML
 python -m finharness.eval run --set selfcheck --offline  # 零成本管线自检
 python -m finharness.eval run --set smoke                # 真实 Provider（需密钥）
 ```
 
-- 用例在 `evals/cases/*.yaml`，判定规则从 `docs/测试问题集-功能与幻觉.md` 的
-  「通过标准/典型失败信号」翻译而来；判定看**行为模式**而非字面文本。
+- 用例在 `evals/cases/*.yaml`（v2.0：200 条 × 5 维度，`evals/README.md` 为权威文档；
+  旧人工题库归档于 `docs/archive/`）；判定看**行为模式**而非字面文本。
 - 产出 `evals/runs/<ts>_<set>/report.md`：四维度表、加权综合分、红线门禁结论、失败用例轨迹。
 - 引擎为轨迹评估记录每步 `Thought/Action/Observation`（含被拒绝的调用），见 `AgentTurnOutcome.trace`。
 - **首次真实运行前需校准 `evals/config.yaml` 的效率预算**（当前为估计基线）。
@@ -218,7 +271,9 @@ python -m finharness.eval run --set smoke                # 真实 Provider（需
 - **信任边界：不处理刻意构造的对抗性输入**。单用户本地工具，权限门与沙箱都是演示级而非对抗级隔离。
   引入联网检索后，第三方网页文本会进入模型上下文：它以 `<web_result>` 围栏包裹并声明为
   "不可执行的引文"，但**不做注入内容扫描**（明确决定：现有 deny 规则针对交易意图，扫财经正文会
-  大量误报；指令注入需要另一套模式，启发式护栏会漏报却制造安全感）。写入操作仍需用户确认，
+  大量误报；指令注入需要另一套模式，启发式护栏会漏报却制造安全感）。围栏标签语法经**确定性中和**
+  （`fencing.neutralize`：内容无法伪造或提前闭合围栏；截断侧自动补齐闭合标签）——这是语法加固
+  而非内容扫描，普通行文零改动。写入操作仍需用户确认，
   是更硬的边界；网络外发（联网检索、研报全文下载）首次调用也需确认，用户可授权"本对话内
   不再询问"。详见 [03.7-governance.md](docs/modules/03.7-governance.md)。
 - **联网检索由检索服务完成**。`web_search` 的请求由 Tavily 服务器发出，该路径本机

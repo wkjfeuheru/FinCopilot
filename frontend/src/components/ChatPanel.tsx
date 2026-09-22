@@ -1,6 +1,7 @@
 import {
   FormEvent,
   forwardRef,
+  KeyboardEvent,
   useEffect,
   useImperativeHandle,
   useMemo,
@@ -11,8 +12,8 @@ import { Button, Empty } from "antd";
 import { artifactUrl, fetchCitations, respondChat, stopChat, streamChat } from "../api/client";
 import type { Citation, ResumableTurn } from "../api/client";
 import { Interaction, InteractionPrompt } from "./InteractionPrompt";
+import { enqueue, resolve } from "../lib/interactionQueue";
 import { Message, MessageList } from "./MessageList";
-import { ToolStatus } from "./ToolStatus";
 import type { Activity } from "./SourceSidebar";
 import type { AgentStep, TurnTrace } from "./AgentTrace";
 import { planFromEvent, presentToolAction, presentToolProgress } from "../lib/researchPresentation";
@@ -163,8 +164,24 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
   const artifacts = useMemo(() => artifactsFromMessages(messages), [messages]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  // 发送后把焦点还给输入框：连续追问是高频路径，省一次点击。
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  // 最近一次提交的提问，供错误气泡的重试按钮复用。
+  const lastPromptRef = useRef<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  const [interaction, setInteraction] = useState<Interaction | null>(null);
+  // 正在执行的工具/步骤。它进到正在生成的消息内部（而非只出现在
+  // composer 上方）：视线停在消息区时也能看到"还在推进"。
+  const [activeTool, setActiveTool] = useState<string | null>(null);
+  // 待用户作答的提示（引擎暂停）。用队列而非单值：同一轮里并发的多个
+  // 工具确认或提问会先后到达，单值覆盖会让先到的提示连同它的 request_id
+  // 一起消失，那个请求便再也无法被应答，只能等满服务端 TTL 被判拒绝。
+  const [interactions, setInteractions] = useState<Interaction[]>([]);
+  // 队列的同步镜像：事件在同一批里连续到达时，state 尚未提交，靠它给出
+  // 即时的队列长度判断（决定看门狗是否该停摆）。
+  const interactionsRef = useRef<Interaction[]>([]);
+  // 本轮流是否仍在进行。收尾时置 false，使清空队列不再重新装上看门狗
+  // （流已结束，装上只会在 90s 后报一次虚假的"无数据"中断）。
+  const streamActiveRef = useRef(false);
   const [notice, setNotice] = useState<string | null>(null);
   // 用户是否已请求停止本轮，以及为此启动的兜底计时器。后者在宽限期内
   // 收到 done 时取消，否则到点即硬断连接。
@@ -196,6 +213,14 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
   useEffect(() => {
     latestViewRef.current = { messages };
   }, [messages]);
+
+  // 空对话挂载时聚焦输入框，省一次点击；触屏设备跳过——自动聚焦会把
+  // 软键盘拉出来顶走欢迎页。
+  useEffect(() => {
+    if (window.matchMedia("(hover: none)").matches) return;
+    composerRef.current?.focus();
+    // 只在挂载时执行一次；StrictMode 的双挂载聚焦两次无副作用。
+  }, []);
 
   useEffect(() => {
     // 挂载时也要重置：StrictMode 会先挂载、再清理、然后再挂载。
@@ -251,7 +276,11 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
       abortRef.current?.abort();
       setMessages((current) => [
         ...current,
-        { role: "error", text: "响应流长时间无数据，已中断本次请求，请重试。" },
+        {
+          role: "error",
+          text: "响应流长时间无数据，已中断本次请求，请重试。",
+          retryPrompt: lastPromptRef.current ?? undefined,
+        },
       ]);
     }, STREAM_IDLE_TIMEOUT_MS);
   }
@@ -261,6 +290,29 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
       window.clearTimeout(watchdogRef.current);
       watchdogRef.current = null;
     }
+  }
+
+  /** 队列里还有待作答的提示时让看门狗停摆：此时的静默是预期行为（等用户
+   * 输入），而非连接已死；否则重新计时。等待的上界由服务端的 confirm TTL
+   * 兜底——超时后服务端会下发 interaction_resolved，队列随之清空。 */
+  function syncWatchdog() {
+    if (interactionsRef.current.length > 0) disarmWatchdog();
+    else if (streamActiveRef.current) armWatchdog();
+  }
+
+  /** 更新队列并同步看门狗；所有队列改动都经此，避免 state 与镜像脱节。 */
+  function updateInteractions(next: Interaction[]) {
+    interactionsRef.current = next;
+    setInteractions(next);
+    syncWatchdog();
+  }
+
+  function enqueueInteraction(item: Interaction) {
+    updateInteractions(enqueue(interactionsRef.current, item));
+  }
+
+  function resolveInteraction(requestId: string | null) {
+    updateInteractions(resolve(interactionsRef.current, requestId));
   }
 
   function updateActiveAssistant(update: (message: Message) => Message) {
@@ -280,12 +332,40 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
     updateActiveAssistant((message) => message.trace ? { ...message, trace: update(message.trace) } : message);
   }
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+  /** 提交当前输入。表单提交与快捷键共用同一条入口；输入在生成期间
+   * 保持可用（方便边等边准备下一个问题），这里再拦一次 busy。 */
+  function submitMessage() {
     const message = input.trim();
     if (!message || busy) return;
     setInput("");
+    composerRef.current?.focus();
     void sendMessage(message);
+  }
+
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    submitMessage();
+  }
+
+  // Ctrl/Cmd+Enter 提交；Enter 保持换行（避免与中文输入法的候选确认
+  // 打架），isComposing 排除输入法组合期间的事件。
+  function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      submitMessage();
+    }
+  }
+
+  /** 欢迎页场景卡：点击直接作为提问发出，不再只填充输入框。 */
+  function sendPrompt(prompt: string) {
+    if (busy) return;
+    void sendMessage(prompt);
+  }
+
+  /** 从错误气泡一键重试：原样重发触发那轮失败的提问。 */
+  function retryPrompt(prompt: string) {
+    if (busy || !prompt) return;
+    void sendMessage(prompt);
   }
 
   /** 提交一条提问并消费它的流。与表单解耦，使"继续研究"走同一条路径。 */
@@ -309,13 +389,18 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
     ]);
     setBusy(true);
     settledRef.current = false;
+    // 记住这轮的提问：错误气泡用它提供一键重试。
+    lastPromptRef.current = message;
     const controller = new AbortController();
     abortRef.current = controller;
+    streamActiveRef.current = true;
     armWatchdog();
     setNotice(null);
     try {
       await streamChat(message, conversationId, (event) => {
-        armWatchdog();
+        // 每个事件都刷新空闲计时；但队列非空（正在等用户作答）时不计时，
+        // 见 syncWatchdog。
+        syncWatchdog();
         if (event.event === "session") {
           const session = String(event.data.session_id);
           const conversation = event.data.conversation_id ? String(event.data.conversation_id) : null;
@@ -327,6 +412,7 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           const callId = String(event.data.call_id ?? name);
           const state = String(event.data.status ?? "");
           setStatus(`${presentToolAction(name)}${state === "started" ? "中" : state === "completed" ? "已完成" : "未完成"}`);
+          setActiveTool(state === "started" ? presentToolAction(name) : null);
           if (state === "started") {
             updateTrace((trace) => ({
               ...trace,
@@ -392,6 +478,7 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           const detail = presentToolProgress(event.data);
           if (callId && detail) {
             setStatus(detail);
+            setActiveTool((current) => current ?? "正在推进");
             updateTrace((trace) => ({
               ...trace,
               steps: trace.steps.map((step) =>
@@ -457,13 +544,14 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           }
         }
         if (event.event === "interactive_request") {
-          // 引擎已暂停，等待回答；弹出该对话框。
+          // 引擎已暂停，等待回答；入队该对话框（一次只呈现队首）。
           const prompt = String(event.data.prompt ?? "");
-          setInteraction({
+          enqueueInteraction({
             requestId: String(event.data.request_id ?? ""),
             kind: String(event.data.kind ?? "question"),
             prompt,
             options: (event.data.options as string[] | undefined) ?? [],
+            multiSelect: event.data.multi_select === true,
           });
           updateTrace((trace) => ({
             ...trace,
@@ -484,6 +572,31 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
               detail: prompt,
             },
           ]);
+        }
+        if (event.event === "interaction_resolved") {
+          // 该提示已落定（批准/拒绝/超时）：清出队列并收尾对应步骤，
+          // 否则"等待操作确认"会永远停在"进行中"。
+          const requestId = String(event.data.request_id ?? "");
+          const timedOut = event.data.timeout === true;
+          const answer = event.data.answer === null || event.data.answer === undefined ? "" : String(event.data.answer);
+          // 只有确认（confirm）才有"拒绝"语义；提问的自由文本回答里出现
+          // "n" 只是一个普通答案，不能据此渲染成失败。
+          const kind = interactionsRef.current.find((entry) => entry.requestId === requestId)?.kind;
+          const denied = timedOut || (kind === "confirm" && (answer === "" || answer === "n"));
+          resolveInteraction(requestId);
+          updateTrace((trace) => ({
+            ...trace,
+            steps: trace.steps.map((step) => step.key === `ask-${requestId}` && step.status === "running"
+              ? {
+                  ...step,
+                  status: denied ? ("error" as const) : ("done" as const),
+                  detail: timedOut ? "超时未回答，已视为拒绝" : denied ? "已拒绝" : undefined,
+                }
+              : step),
+          }));
+          emitActivities((current) => current.map((item) => item.key === `ask-${requestId}`
+            ? { ...item, status: denied ? ("error" as const) : ("done" as const) }
+            : item));
         }
         if (event.event === "text_reset") {
           // 本轮结果是一次工具调用；丢弃此前流式输出的草稿，
@@ -517,7 +630,7 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
         }
         if (event.event === "error") {
           settledRef.current = true;
-          setInteraction(null);
+          updateInteractions([]);
           updateTrace((trace) => ({
             ...trace,
             status: "error",
@@ -532,7 +645,10 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           };
           const reason = String(event.data.reason ?? "");
           const message = String(event.data.message ?? "Unknown error");
-          setMessages((current) => [...current, { role: "error", text: reasonText[reason] ?? message }]);
+          setMessages((current) => [
+            ...current,
+            { role: "error", text: reasonText[reason] ?? message, retryPrompt: lastPromptRef.current ?? undefined },
+          ]);
         }
         if (event.event === "answer") {
           // 以单个事件送达的终止性答案（主要是失败运行的部分
@@ -595,7 +711,8 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
             setNotice("已停止本轮生成，已获取的数据与结论已保留，可继续研究。");
           }
           setStatus(null);
-          setInteraction(null);
+          setActiveTool(null);
+          updateInteractions([]);
           refreshCitations();
           // 本轮结束（无论是停止还是正常完成），可继续状态由服务端说了算。
           // 用流里已知的对话 id，而不是发送时刻闭包里的那个（新对话时它是 null）。
@@ -607,9 +724,15 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
       // 不该向用户报错。真正的传输失败仍照常提示。
       const aborted = (error as Error).name === "AbortError";
       if (!aborted && !stoppingRef.current) {
-        setMessages((current) => [...current, { role: "error", text: (error as Error).message }]);
+        setMessages((current) => [
+          ...current,
+          { role: "error", text: (error as Error).message, retryPrompt: lastPromptRef.current ?? undefined },
+        ]);
       }
     } finally {
+      // 先声明本轮结束，再清空队列：否则清空触发的 syncWatchdog 会把
+      // 看门狗重新装上，在流已经结束后留一个虚假的中断计时器。
+      streamActiveRef.current = false;
       disarmWatchdog();
       if (stopTimerRef.current !== null) {
         window.clearTimeout(stopTimerRef.current);
@@ -631,7 +754,8 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           ),
         }));
         setStatus(null);
-        setInteraction(null);
+        setActiveTool(null);
+        updateInteractions([]);
         if (stopped) {
           setNotice("已停止本轮生成，已获取的数据与结论已保留，可继续研究。");
         }
@@ -678,7 +802,9 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
   }
 
   async function handleRespond(requestId: string, response: string) {
-    setInteraction(null);
+    // 先出队，队首让位给下一个待处理提示；服务端随后下发的
+    // interaction_resolved 按 id 幂等清尾，重复到达也不会出错。
+    resolveInteraction(requestId);
     try {
       await respondChat(requestId, response);
     } catch (error) {
@@ -700,10 +826,16 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
               </Button>
             </Empty>
           )}
-          <ResearchWelcome onUsePrompt={setInput} />
+          <ResearchWelcome onUsePrompt={sendPrompt} />
         </>
-      ) : <MessageList messages={messages} citations={citations} />}
+      ) : <MessageList messages={messages} citations={citations} onRetry={retryPrompt} />}
       {notice && <div className="engine-notice">{notice}</div>}
+      {busy && activeTool && (
+        <div className="inline-running-status">
+          <span className="inline-running-dot" aria-hidden="true" />
+          {activeTool === "正在推进" ? status : activeTool}
+        </div>
+      )}
       {artifacts.length > 0 && (
         <div className="artifact-list" aria-label="产出文件">
           <span className="artifact-title">产出文件</span>
@@ -714,7 +846,8 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           ))}
         </div>
       )}
-      <ToolStatus status={status} />
+      {/* ToolStatus 已由上方内联在消息区的运行状态行取代：视线停在消息
+          流里就能看到"还在推进"，不必把目光挪回 composer 上方。 */}
       {/* 上一轮未完成但留有断点：给出续做入口，让用户不必重述问题。
           计划由服务端从断点恢复，因此续做不会重跑已完成的步骤。
           措辞随原因而变：用户主动停止与"被中断后恢复"是两回事，用同一句
@@ -730,7 +863,17 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
         </div>
       )}
       <form className="composer" onSubmit={submit}>
-        <textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder="输入研究问题" rows={3} disabled={busy} />
+        {/* 生成期间不禁用输入：一轮研究以分钟计，用户应能边等边准备
+            下一个问题。真正防止误发的是 submitMessage 的 busy 守卫与
+            发送/停止按钮的互斥切换。 */}
+        <textarea
+          ref={composerRef}
+          value={input}
+          onChange={(event) => setInput(event.target.value)}
+          onKeyDown={onComposerKeyDown}
+          placeholder="输入研究问题，Ctrl+Enter 发送"
+          rows={3}
+        />
         {busy ? (
           <button type="button" className="stop-button" onClick={stop} disabled={stopping}>
             {stopping ? "正在停止…" : "停止"}
@@ -739,7 +882,13 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           <button type="submit" disabled={!input.trim() || !configured}>发送</button>
         )}
       </form>
-      <InteractionPrompt interaction={interaction} onRespond={handleRespond} busy={false} />
+      <InteractionPrompt
+        key={interactions[0]?.requestId ?? "none"}
+        interaction={interactions[0] ?? null}
+        pendingCount={interactions.length}
+        onRespond={handleRespond}
+        busy={false}
+      />
     </section>
   );
 });

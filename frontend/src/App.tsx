@@ -5,6 +5,7 @@ import { ConversationList } from "./components/ConversationList";
 import { ChatPanel } from "./components/ChatPanel";
 import type { ChatPanelHandle, ChatView } from "./components/ChatPanel";
 import { LoginScreen } from "./components/LoginScreen";
+import { MonitorView } from "./components/MonitorView";
 import { SessionBar } from "./components/SessionBar";
 import { SettingsModal } from "./components/SettingsModal";
 import { traceFromStoredTurn } from "./components/AgentTrace";
@@ -62,6 +63,9 @@ function activitiesFromView(view: ChatView | undefined): Activity[] {
 function App() {
   // 认证门：null 表示还在探测会话，undefined 表示未登录。
   const [user, setUser] = useState<AuthUser | null | undefined>(undefined);
+  // 顶层视图：工作台与运行监控。不引入路由库，沿用条件渲染（监控是
+  // 独立只读页，不需要深链）。
+  const [view, setView] = useState<"chat" | "monitor">("chat");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [sessionVersion, setSessionVersion] = useState(0);
@@ -324,6 +328,20 @@ function App() {
             <p className="app-positioning">覆盖个股、行业、宏观与量化因子研究；从问题到可回溯结论 <span>不构成投资建议</span></p>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <Button
+              size="small"
+              type={view === "chat" ? "primary" : "default"}
+              onClick={() => setView("chat")}
+            >
+              工作台
+            </Button>
+            <Button
+              size="small"
+              type={view === "monitor" ? "primary" : "default"}
+              onClick={() => setView("monitor")}
+            >
+              运行监控
+            </Button>
             <button
               type="button"
               className="status-pill provider-chip"
@@ -350,7 +368,10 @@ function App() {
           </div>
         </header>
         <section className="workspace">
-          <div className="workspace-body">
+          {view === "monitor" ? (
+            <MonitorView />
+          ) : (
+            <div className="workspace-body">
             <ConversationList
               conversations={conversations}
               activeId={conversationId}
@@ -385,7 +406,8 @@ function App() {
               />
             </div>
             <SourceSidebar activities={activities} citations={citations} />
-          </div>
+            </div>
+          )}
         </section>
         <SettingsModal
           open={settingsOpen}

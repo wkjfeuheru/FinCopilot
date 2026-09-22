@@ -32,7 +32,7 @@ def _module_available(name: str) -> bool:
 PositiveInt = Annotated[int, Field(gt=0)]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
-CacheKind = Literal["quote", "kline", "indicators", "financials", "announcements", "web", "reports", "macro", "industry"]
+CacheKind = Literal["quote", "kline", "indicators", "financials", "announcements", "web", "reports", "macro", "industry", "dataset"]
 ProviderKind = Literal["openai_compat", "anthropic_compat", "fake"]
 PermissionMode = Literal["default", "plan", "auto"]
 
@@ -112,8 +112,12 @@ class ToolSettings(FrozenModel):
 
 
 class DataSettings(FrozenModel):
+    # 顺序即优先级：第一个不报错的适配器胜出，其余仅在它失败或不支持该语义方法时
+    # 才被尝试。同花顺排在 akshare 之前，是因为它提供后者没有的能力（概念指数成分股、
+    # 结构化三表字段、特色数据、基金/期货/期权）；把 akshare 放在前面，一旦它返回了
+    # 数据，同花顺就永远不会被用到——这正是数据缺口填不上的原因。
     adapter_order: Annotated[tuple[str, ...], Field(min_length=1)] = Field(
-        default_factory=lambda: ("akshare", "tushare", "baostock")
+        default_factory=lambda: ("fuyao", "akshare", "tushare", "baostock")
     )
     tushare_token_env: str = "TUSHARE_TOKEN"
     throttle_seconds: NonNegativeFloat = 1.0
@@ -136,6 +140,11 @@ class DataSettings(FrozenModel):
             # 网页结果很快过期；缓存一天与新闻一致，
             # 并让同一会话内重复查询同一关键字无需再次请求。
             "web": 1,
+            # 数据集派发器承载的是异构的长尾端点（热股榜按小时变、交易日历多年不变、
+            # 财报按季）。单一 TTL 只能取其中最保守的一个：过短会让稳定数据反复重取，
+            # 过长会把盘中榜单缓存到收盘之后。一天与 quote/kline 同档，是两者之间的
+            # 折中；需要更细的粒度时由调用方以更窄的参数（如指定交易日）表达。
+            "dataset": 1,
         }
     )
     @field_validator("adapter_order", mode="before")
@@ -357,10 +366,27 @@ class TracingSettings(FrozenModel):
     capture_payloads: bool = False
 
 
+class TraceStoreSettings(FrozenModel):
+    """运行轨迹持久化（docs 03.14.4）：自建监控平台的数据面。
+
+    纯标准库 SQLite，无额外依赖；``admin_users`` 是可访问监控查询 API 的
+    用户名白名单（users 表无角色列，权限走配置而非 auth schema）。
+    """
+
+    enabled: bool = False
+    db_path: Path = Path("state/trace.db")
+    admin_users: list[str] = Field(default_factory=list)
+    # False 时 thought/answer/preview 只存前 2000 字符（仍脱敏）。
+    capture_payloads: bool = True
+    # 保留天数；<=0 表示永久保留。清理随蒸馏扫描器的同一后台节奏执行。
+    retention_days: int = Field(default=90, ge=0)
+
+
 class ObservabilitySettings(FrozenModel):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     metrics: MetricsSettings = Field(default_factory=MetricsSettings)
     tracing: TracingSettings = Field(default_factory=TracingSettings)
+    trace_store: TraceStoreSettings = Field(default_factory=TraceStoreSettings)
 
 
 class ServerSettings(FrozenModel):
@@ -426,6 +452,46 @@ class SearchSettings(FrozenModel):
     local_pdf_fallback: bool = True
 
 
+class FuyaoSettings(FrozenModel):
+    """同花顺（iFinD / Fuyao）金融数据后端（docs 03.5）。
+
+    以 MCP 形式接入：六个服务各自是一个 Streamable HTTP 端点，共用一个 API Key
+    （请求头 ``X-api-key``）。配置方式与 Provider/Search 一致——推荐把凭据放在
+    环境变量里（``env_key``），也允许在未被跟踪的 ``settings.json`` 内联明文
+    ``api_key`` 作为本地便利。
+
+    加载时缺少凭据并非错误：适配器照常构造，真正被调用时才报告"未配置同花顺
+    密钥"，编排器把它当作普通的回退原因交给下一个数据源。这样"没配 key"与
+    "启动失败"不会混为一谈，未使用同花顺的部署也不会被它拖住。
+
+    ``catalog_ttl_s`` 缓存的是各服务的 ``tools/list``（数据集目录），不是数据本身：
+    目录只在发现工具与校验参数时读取，每次调用都重取会为一次取数多付一个往返。
+    """
+
+    enabled: bool = True
+    kind: Literal["mcp"] = "mcp"
+    base_url: str = "https://fuyao.aicubes.cn"
+    env_key: str = "HITHINK_FINANCE_API_KEY"
+    timeout_s: Annotated[float, Field(gt=0)] = 30.0
+    api_key: str | None = None
+    # 与 ``search.proxy`` 同理：``httpx`` 只读环境变量，而 A 股数据源（``requests``）
+    # 还遵循操作系统代理，在不显式设置时两者会走不同的出口。留空则回退到系统代理。
+    proxy: str | None = None
+    catalog_ttl_s: NonNegativeFloat = 300.0
+
+    def resolved_api_key(self) -> str | None:
+        """本次进程可用的凭据：内联 ``api_key`` 优先于环境变量。
+
+        与 ``settings.search`` 同一口径（内联 key 让本地配置无需导出任何环境变量
+        即可生效）。密钥从不写进日志或工具结果——它只在这里被读取。
+        """
+        if self.api_key:
+            return self.api_key
+        if not self.env_key:
+            return None
+        return os.getenv(self.env_key)
+
+
 def _default_providers() -> dict[str, ProviderSettings]:
     return {
         "deepseek": ProviderSettings(
@@ -482,6 +548,7 @@ class Settings(BaseSettings):
     quota: QuotaSettings = Field(default_factory=QuotaSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
+    fuyao: FuyaoSettings = Field(default_factory=FuyaoSettings)
 
     @field_validator("providers")
     @classmethod
@@ -788,6 +855,7 @@ def _resolve_paths(payload: dict[str, Any], base: Path) -> None:
         ("data", "cache_dir"),
         ("audit", "log_path"),
         ("observability", "logging", "path"),
+        ("observability", "trace_store", "db_path"),
         ("server", "static_dir"),
         ("paths", "output_dir"),
         ("paths", "state_dir"),
@@ -911,6 +979,22 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
         ("observability", "tracing", "capture_payloads"),
         bool,
     ),
+    "FINH_OBSERVABILITY_TRACE_STORE_ENABLED": (
+        ("observability", "trace_store", "enabled"),
+        bool,
+    ),
+    "FINH_OBSERVABILITY_TRACE_STORE_DB_PATH": (
+        ("observability", "trace_store", "db_path"),
+        Path,
+    ),
+    "FINH_OBSERVABILITY_TRACE_STORE_CAPTURE_PAYLOADS": (
+        ("observability", "trace_store", "capture_payloads"),
+        bool,
+    ),
+    "FINH_OBSERVABILITY_TRACE_STORE_RETENTION_DAYS": (
+        ("observability", "trace_store", "retention_days"),
+        int,
+    ),
     "FINH_SERVER_HOST": (("server", "host"), str),
     "FINH_SERVER_PORT": (("server", "port"), int),
     "FINH_SERVER_SESSION_TTL_S": (("server", "session_ttl_s"), int),
@@ -946,6 +1030,14 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_SEARCH_API_KEY": (("search", "api_key"), str),
     "FINH_SEARCH_PROXY": (("search", "proxy"), str),
     "FINH_SEARCH_LOCAL_PDF_FALLBACK": (("search", "local_pdf_fallback"), bool),
+    "FINH_FUYAO_ENABLED": (("fuyao", "enabled"), bool),
+    "FINH_FUYAO_KIND": (("fuyao", "kind"), Literal["mcp"]),
+    "FINH_FUYAO_BASE_URL": (("fuyao", "base_url"), str),
+    "FINH_FUYAO_ENV_KEY": (("fuyao", "env_key"), str),
+    "FINH_FUYAO_TIMEOUT_S": (("fuyao", "timeout_s"), float),
+    "FINH_FUYAO_API_KEY": (("fuyao", "api_key"), str),
+    "FINH_FUYAO_PROXY": (("fuyao", "proxy"), str),
+    "FINH_FUYAO_CATALOG_TTL_S": (("fuyao", "catalog_ttl_s"), float),
 }
 
 

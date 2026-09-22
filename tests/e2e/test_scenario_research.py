@@ -71,7 +71,7 @@ def _build_loop(tmp_path, *, answer_ask: bool = False) -> AgentLoop:
     cite = CitationRegistry()
     ctx = ResearchContext(cite=cite, settings=settings)
 
-    async def auto_answer(_kind, _prompt, _options):
+    async def auto_answer(_kind, _prompt, _options, **_):
         # 对 UI 会显示的确认对话框的确定性替身。
         return "综合体检"
 

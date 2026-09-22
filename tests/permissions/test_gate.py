@@ -5,14 +5,18 @@ from dataclasses import dataclass
 
 from finharness.config.settings import PermissionSettings, Settings
 from finharness.permissions.gate import PermissionGate, ReadOnlyGate
-from finharness.permissions.modes import Verdict
+from finharness.permissions.modes import PermissionMode, Verdict
 from finharness.tools.base import PermissionLevel
+from finharness.workspace import Workspace
 
 
 @dataclass
 class FakeTool:
     name: str = "t"
     permission: PermissionLevel = PermissionLevel.READ
+    # 网络外发是**声明**（``@tool(egress=True)``），不是闸门里的名称表；因此测试
+    # 替身也必须显式声明，否则它验证的就不是生产里那条判定。
+    egress: bool = False
 
 
 def make_settings(tmp_path, *, mode="default") -> Settings:
@@ -185,17 +189,56 @@ def test_write_into_cache_dir_is_denied(tmp_path):
         assert "缓存" in decision.reason
 
 
-def test_egress_tools_require_confirmation(tmp_path):
-    """web_search 是读类工具，但网络外发首次须经确认。"""
+def test_read_from_cache_pdf_is_allowed(tmp_path):
+    """读类工具读缓存 PDF 必须放行。
 
-    tool = FakeTool(name="web_search")
+    研报正文落盘在 cache/pdf 后由 read_pdf/summarize_document 取用，是这条
+    拒绝规则设计内的主流程。拒写规则若不分读写一律拒，整条路径（检索研报
+    全文并摘要）会不可用——那正是把它误当成写入的结果。
+    """
+    settings = make_settings(tmp_path)
+    workspace = Workspace(settings)
+    target = str(workspace.cache_pdf / "abd8b2554737033c.pdf")
+
+    decision = check(FakeTool(name="read_pdf"), {"path": target}, settings)
+
+    assert decision.verdict is Verdict.ALLOW
+
+
+def test_read_from_cache_parquet_is_allowed(tmp_path):
+    """复核子代理重读缓存 parquet 同样属于读取，不得被拒写规则误伤。"""
+    settings = make_settings(tmp_path)
+    workspace = Workspace(settings)
+    target = str(workspace.cache_parquet / "2026-09" / "abc.parquet")
+
+    decision = check(FakeTool(name="read_file"), {"path": target}, settings)
+
+    assert decision.verdict is Verdict.ALLOW
+
+
+def test_egress_tools_require_confirmation(tmp_path):
+    """声明了 egress 的读类工具，首次外发须经确认。"""
+
+    tool = FakeTool(name="web_search", egress=True)
     decision = check(tool, {"query": "白酒政策"}, make_settings(tmp_path))
     assert decision.verdict is Verdict.DENY
     assert "网络" in decision.reason
 
 
+def test_a_read_tool_without_the_egress_declaration_is_direct(tmp_path):
+    """判定读的是声明而非名称：同名工具没声明就不再外发，这正是这次改造的意义。
+
+    名称表只在"恰好两个工具"时成立；同花顺把整组数据工具都变成外发工具后，
+    逐名字维护必然漏改，而漏改的后果是一个本该询问用户的调用静默放行。
+    """
+    decision = check(FakeTool(name="web_search"), {"query": "a"}, make_settings(tmp_path))
+
+    assert decision.verdict is Verdict.ALLOW
+    assert decision.reason == ""
+
+
 def test_egress_allows_after_user_confirms(tmp_path):
-    tool = FakeTool(name="web_search")
+    tool = FakeTool(name="web_search", egress=True)
 
     async def confirm(name, args):
         return True
@@ -222,8 +265,8 @@ def test_egress_remembered_within_conversation(tmp_path):
         confirm_egress=confirm_egress,
     )
 
-    first = asyncio.run(gate.check(FakeTool(name="web_search"), {"query": "a"}))
-    second = asyncio.run(gate.check(FakeTool(name="web_search"), {"query": "b"}))
+    first = asyncio.run(gate.check(FakeTool(name="web_search", egress=True), {"query": "a"}))
+    second = asyncio.run(gate.check(FakeTool(name="web_search", egress=True), {"query": "b"}))
 
     assert first.verdict is Verdict.ALLOW
     assert second.verdict is Verdict.ALLOW
@@ -245,7 +288,7 @@ def test_egress_denial_is_not_remembered(tmp_path):
         confirmed_categories=confirmed,
     )
 
-    first = asyncio.run(gate.check(FakeTool(name="web_search"), {"query": "a"}))
+    first = asyncio.run(gate.check(FakeTool(name="web_search", egress=True), {"query": "a"}))
 
     assert first.verdict is Verdict.DENY
     assert confirmed == set()  # 拒绝不进免问集合
@@ -254,13 +297,22 @@ def test_egress_denial_is_not_remembered(tmp_path):
 def test_egress_allows_in_auto_mode(tmp_path):
     class WebTool(FakeTool):
         name = "web_search"
+        egress = True
 
     decision = check(WebTool(), {"query": "a"}, make_settings(tmp_path, mode="auto"))
     assert decision.verdict is Verdict.ALLOW
 
 
+def test_every_declared_data_tool_group_egress_is_honoured(tmp_path):
+    """同花顺的数据集工具整组声明外发；这里断言"整组"确实按声明生效。"""
+    for name in ("query_a_share_data", "query_fund_data", "list_fuyao_datasets"):
+        decision = check(FakeTool(name=name, egress=True), {}, make_settings(tmp_path))
+        assert decision.verdict is Verdict.DENY, name
+        assert "网络" in decision.reason
+
+
 def test_research_reports_metadata_mode_still_direct(tmp_path):
-    """研报工具不带 with_text 时仍是普通读调用，直通。"""
+    """研报是唯一按**参数**判定的情形：不带 with_text 时仍是普通读调用，直通。"""
 
     tool = FakeTool(name="get_research_reports")
     decision = check(
@@ -275,5 +327,38 @@ def test_research_reports_full_text_requires_confirmation(tmp_path):
     decision = check(
         tool, {"with_text": True}, make_settings(tmp_path)
     )
+    assert decision.verdict is Verdict.DENY
+    assert "网络" in decision.reason
+
+
+def test_a_string_mode_is_normalized_to_the_enum(tmp_path):
+    """签名声明 ``PermissionMode``，但 Python 不会挡住一个等价的字符串。
+
+    不规范化时，``mode="auto"`` 落成一个 ``str``，而两个 AUTO 分支用 ``is`` 比较枚举
+    成员——AUTO 模式会静默退化成"需确认"，无交互通道时外发/写类工具被直接拒绝。
+    这个 bug 只在"显式传入 mode"时出现（生产走 settings 那条路径，是安全的），因此
+    必须由测试守住。
+    """
+    gate = PermissionGate(settings=make_settings(tmp_path), mode="auto")
+
+    assert gate.mode is PermissionMode.AUTO
+
+    decision = asyncio.run(gate.check(FakeTool(name="query_a_share_data", egress=True), {}))
+    assert decision.verdict is Verdict.ALLOW
+    assert "auto" in decision.reason
+
+
+def test_an_enum_mode_still_works(tmp_path):
+    gate = PermissionGate(settings=make_settings(tmp_path), mode=PermissionMode.AUTO)
+
+    assert gate.mode is PermissionMode.AUTO
+
+
+def test_non_auto_string_modes_still_require_confirmation(tmp_path):
+    """规范化不能把 PLAN/DEFAULT 一并放行——它们对外发仍须确认。"""
+    gate = PermissionGate(settings=make_settings(tmp_path), mode="plan")
+
+    decision = asyncio.run(gate.check(FakeTool(name="query_a_share_data", egress=True), {}))
+
     assert decision.verdict is Verdict.DENY
     assert "网络" in decision.reason

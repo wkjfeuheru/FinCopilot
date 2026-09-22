@@ -65,7 +65,8 @@ v1.1 中工具数量存在几处不精确（架构图"12 金融+5 通用" vs 工
 │   · AutoCompactor（80% 阈值，保留 ResearchContext/计划/结论）            │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ L5 数据与产出  data/ + coordinator/（研报管道在 tools/fin/，utils/ 承跨层件）│
-│   · DataAdapter（akshare 主 → tushare 自动降级，防腐层）                 │
+│   · DataAdapter（多源防腐层，按 settings.data.adapter_order 顺序降级；        │
+│     现为 fuyao 同花顺 → akshare → …，另有 tavily / eastmoney_report）        │
 │   · LocalCache（SQLite 索引 + parquet 数据体）                           │
 │   · CitationRegistry（引用溯源注册表，数据零幻觉根基）                   │
 │   · ReportPipeline（模板渲染 / cite+chart 注入 / docx 导出）            │
@@ -121,7 +122,7 @@ AgentLoop 内部事件(文本增量/工具状态/计划/结论/确认请求)统�
 | ADR-3 | ~~懒加载工具"两段式激活"（search→load_tool），Skills 经 load_skill 注入~~ **已被 ADR-11 取代** | 预注入全部 schema | 模型只能调用已注入 schema 的工具，必须显式激活；控 token |
 | ADR-4 | 结果裁剪发生在**入上下文前**，完整数据落 parquet 供 `read_file` 精读 | 全量入上下文 | v1.1 §3.5：~50K token → ~1K |
 | ADR-5 | 审计为"强制 hook + JSONL 追加"，无开关 | 可关闭审计 | 投研留痕是产品卖点，永不关闭 |
-| ADR-6 | 数据访问收敛到 DataAdapter，akshare 失败字段级降级 tushare | 直接调用 ak | akshare 上游频繁改版，防腐层是工程亮点 |
+| ADR-6 | 数据访问收敛到 DataAdapter，按 `settings.data.adapter_order` 顺序降级（现默认 fuyao → akshare） | 直接调用 ak | akshare 上游频繁改版，防腐层是工程亮点；顺序即优先级，故新增源要按"谁更懂这个数据域"排 |
 | ADR-7 | Provider 直连 HTTP（httpx + SSE），不依赖 anthropic/openai 官方 SDK | 官方 SDK | 便于兼容 Kimi/GLM/DeepSeek 多端点，体现代码功底 |
 | ADR-8 | 记忆分层（§3.6.4）：L1 工作/L2 短期在内存（`list[Msg]`/事件环）；对话内持久化为 SQLite `memory.db`；**跨对话长期记忆 = `ltm_episodes` 情节表 + `ltm_facts` 语义表（按 `user_id` 作用域；情节 task_result 每轮结构化写入 + decision/excerpt 懒蒸馏，语义与偏好同一次调用产出）**；`MEMORY.md` 不做（改只读端点）；语义检索走向量召回（远程 embedding + Qdrant，三级降级到本地 BLOB 余弦/键匹配） | JSONL 事件库 / 纯 markdown 单文件 / 语义也只做键匹配 | L1/L2 进程即会话无需回放；情节需幂等去重（内容哈希）、语义需 UPSERT 覆盖（同键只能有一个版本的真相）；语义条目无稳定键，键匹配召回太弱，故护栏由"跨会话语义召回"真实需求触发（2026-09 已触发） |
 | ADR-9 | 流式输出走 **FastAPI SSE 接口层**，与 CLI 双入口并存 | 仅 CLI / 用 WebSocket 替代 | REPL 保证本地演示与脚本化验收；HTTP 让任意前端接入；SSE 语义贴合"流式文本+工具状态"，实现与调试成本最低（选 WebSocket 则前端与代理复杂度更高，收益不足） |
@@ -535,7 +536,8 @@ finharness/
 │   │                              # spawn_agent summarize_document preference
 │   ├── data/
 │   │   ├── access.py               # DataAccess 门面（降级编排）
-│   │   ├── adapters/akshare_adapter.py tushare_adapter.py base.py
+│   │   ├── adapters/ base.py akshare_adapter.py fuyao_adapter.py
+│   │   │            mcp_client.py tavily_adapter.py eastmoney_report_adapter.py
 │   │   ├── mapping.py              # 列名映射单一事实
 │   │   ├── cache.py / citation.py
 │   │   └── errors.py
@@ -569,7 +571,7 @@ finharness/
 
 | 项 | v1.1 | 本文档裁定 |
 |---|---|---|
-| 工具总数 | "12 金融+5 通用"/"23 能力"口径不一 | **32 个**（金融-数据12 + 金融-计算3 + 金融-输出2 + 通用4 + 元11） |
+| 工具总数 | "12 金融+5 通用"/"23 能力"口径不一 | **37 个**（金融-数据17 + 金融-计算3 + 金融-输出2 + 通用4 + 元11） |
 | 按需激活 | 仅描述 search 后按需注册 | 引擎发起：检索即激活 + 直接调用即激活，schema 下一次请求生效（ADR-11） |
 | 元工具 | 5 个 | **8 个**（含 `search_tools`、`summarize_document`；`load_tool`/`load_skill`/`list_skills` 已删） |
 | 常驻/按需 | ~15 常驻 | **21 常驻 / 8 按需**（get_announcements, calc_valuation, web_search, get_research_reports, spawn_agent, read_pdf, summarize_document, run_backtest），层级由 `@tool(tier=...)` 声明 |

@@ -21,9 +21,10 @@ from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 from finharness.tools.generic.fencing import (
     EXTERNAL_NOTICE,
     RESULT_CLOSE,
-    RESULT_OPEN,
+    fence,
+    neutralize,
 )
-from finharness.tools.generic.files import _resolve_within
+from finharness.workspace import Workspace
 
 # 默认返回页数：一页足以为读者提供上下文，又不至于让首次读取就撑满结果预算。
 _DEFAULT_PAGE_SPAN = 1
@@ -49,13 +50,7 @@ class ReadPdfTool(BaseTool):
     @param("path", desc="本地 PDF 路径（限 output/ 与 data_cache/ 目录内）")
     @param("pages", desc="页码范围，如 '3'、'1-3'、'2-'；省略时只读第 1 页")
     async def _dispatch(self, *, path: str, pages: str | None = None) -> RawData:
-        settings = self.data.settings
-        roots = [
-            Path(settings.paths.output_dir).resolve(),
-            (Path(settings.data.cache_dir) / "pdf").resolve(),
-            (Path(settings.data.cache_dir) / "parquet").resolve(),
-        ]
-        target = _resolve_within(path, roots)
+        target = Workspace(self.data.settings).resolve_read(path)
         try:
             # PDF 解析既 CPU 密集又阻塞；放进线程才能让工具超时真正生效，
             # 且阻塞期间不占住事件循环（多租户下这是跨租户 DoS 的另一条路径）。
@@ -93,9 +88,9 @@ class ReadPdfTool(BaseTool):
         lines = [EXTERNAL_NOTICE, "", f"文件：{target}（共 {total} 页；本次读取第 {first}-{last} 页）", ""]
         for offset, page in enumerate(pages):
             number = first + offset
-            lines.append(RESULT_OPEN.format(index=number, url=target))
+            lines.append(fence(number, target))
             lines.append(f"第 {number} 页")
-            lines.append(page.strip() or "（本页无可抽取文本，可能是图片/扫描页）")
+            lines.append(neutralize(page.strip()) or "（本页无可抽取文本，可能是图片/扫描页）")
             lines.append(RESULT_CLOSE)
             lines.append("")
         if last < total:

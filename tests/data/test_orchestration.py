@@ -335,3 +335,238 @@ def test_report_cache_key_separates_parameter_sets(tmp_path):
 
     assert calls["n"] == 2
     assert first.df.iloc[0]["title"] != second.df.iloc[0]["title"]
+
+
+# --- 通用数据集派发（docs 03.5） ---------------------------------------
+
+class DatasetAdapter(DataAdapter):
+    """一个能提供数据集目录与通用取数的源；记录每次调用的参数。"""
+
+    name = "fuyao"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+        self.catalogs: list[str] = []
+
+    def list_datasets(self, service):
+        self.catalogs.append(service)
+        return [{"name": "get_a_share_prices_snapshot", "inputSchema": {"type": "object"}}]
+
+    def fetch_dataset(self, service, dataset, params):
+        self.calls.append((service, dataset, dict(params)))
+        return FetchResult(
+            df=pd.DataFrame({"ticker": ["600519"], "limit": [params.get("limit")]}),
+            interface=dataset,
+        )
+
+
+def test_dataset_endpoint_names_the_dataset_that_served_it(tmp_path):
+    adapter = DatasetAdapter()
+    access = DataAccess([adapter], settings=make_settings(tmp_path, order=("fuyao",)))
+
+    raw = asyncio.run(access.query_dataset("a-share", "get_a_share_prices_snapshot", {}))
+
+    assert raw.endpoint == "fuyao:get_a_share_prices_snapshot"
+
+
+def test_dataset_cache_is_scoped_per_dataset_and_parameters(tmp_path):
+    """不同数据集、不同参数必须各占一个槽位。
+
+    否则一个 limit=5 的结果会被交给 limit=500 的下一次查询——调用方拿到的是
+    一份与它所请求的形状不符的数据，且没有任何信号。
+    """
+    adapter = DatasetAdapter()
+    access = DataAccess([adapter], settings=make_settings(tmp_path, order=("fuyao",)))
+
+    first = asyncio.run(access.query_dataset("a-share", "ds_a", {"limit": 5}))
+    again = asyncio.run(access.query_dataset("a-share", "ds_a", {"limit": 5}))
+    other_params = asyncio.run(access.query_dataset("a-share", "ds_a", {"limit": 9}))
+    other_dataset = asyncio.run(access.query_dataset("a-share", "ds_b", {"limit": 5}))
+
+    assert first.from_cache is False
+    assert again.from_cache is True
+    assert other_params.from_cache is False
+    assert other_dataset.from_cache is False
+    assert len(adapter.calls) == 3
+
+
+def test_dataset_cache_is_scoped_per_service(tmp_path):
+    """同名数据集跨服务不共享槽位：服务是寻址的一部分。"""
+    adapter = DatasetAdapter()
+    access = DataAccess([adapter], settings=make_settings(tmp_path, order=("fuyao",)))
+
+    asyncio.run(access.query_dataset("a-share", "prices_snapshot", {}))
+    second = asyncio.run(access.query_dataset("fund", "prices_snapshot", {}))
+
+    assert second.from_cache is False
+
+
+def test_dataset_catalog_is_not_written_to_the_table_cache(tmp_path):
+    """目录是元数据：写进 parquet 会让"上游新增了端点"在 TTL 内不可见，
+    而目录正是用来发现这些端点的。"""
+    adapter = DatasetAdapter()
+    access = DataAccess([adapter], settings=make_settings(tmp_path, order=("fuyao",)))
+
+    first = asyncio.run(access.dataset_catalog("a-share"))
+    second = asyncio.run(access.dataset_catalog("a-share"))
+
+    assert first[0]["name"] == "get_a_share_prices_snapshot"
+    # 适配器被问了两次（无本地表缓存），而不是命中缓存。
+    assert adapter.catalogs == ["a-share", "a-share"]
+    assert second == first
+
+
+def test_a_source_without_the_dataset_endpoint_is_skipped(tmp_path):
+    """排在数据集源之前的数据源必须报告"不支持"并被跳过，而不是中断请求。"""
+    class NonDataset(DataAdapter):
+        name = "akshare"
+
+    adapter = DatasetAdapter()
+    access = DataAccess(
+        [NonDataset(), adapter], settings=make_settings(tmp_path, order=("akshare", "fuyao"))
+    )
+
+    raw = asyncio.run(access.query_dataset("a-share", "get_a_share_prices_snapshot", {}))
+
+    assert raw.endpoint == "fuyao:get_a_share_prices_snapshot"
+
+
+def test_dataset_sources_follow_the_configured_adapter_order(tmp_path):
+    """同花顺排在 akshare 之前时，请求先到它；这与"行情类数据由谁提供"是同一机制。"""
+    class Other(DatasetAdapter):
+        name = "other"
+
+    other = Other()
+    fuyao = DatasetAdapter()
+    access = DataAccess(
+        [other, fuyao], settings=make_settings(tmp_path, order=("fuyao", "other"))
+    )
+
+    raw = asyncio.run(access.query_dataset("a-share", "ds", {}))
+
+    assert raw.endpoint == "fuyao:ds"
+    assert other.calls == []
+
+
+def test_catalog_failure_when_no_source_can_answer(tmp_path):
+    """没有源能给出目录时抛 DataUnavailable，而不是返回一个空目录假装成功。"""
+    class Silent(DataAdapter):
+        name = "akshare"
+
+    access = DataAccess([Silent()], settings=make_settings(tmp_path, order=("akshare",)))
+
+    try:
+        asyncio.run(access.dataset_catalog("a-share"))
+    except DataUnavailableError as exc:
+        assert "不支持数据集目录" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected DataUnavailableError")
+
+
+def test_typed_methods_do_not_reach_the_dataset_channel(tmp_path):
+    """typed 方法与通用通道各走各的：行情请求不会退化成数据集调用。"""
+    adapter = DatasetAdapter()
+    access = DataAccess([adapter], settings=make_settings(tmp_path, order=("fuyao",)))
+
+    try:
+        asyncio.run(access.quote("600519"))
+    except DataUnavailableError as exc:
+        assert "不支持 quote" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected DataUnavailableError")
+
+    assert adapter.calls == []
+
+
+# --- 号段不可识别是回退理由，不是致命错误 --------------------------------
+
+def test_an_unresolvable_symbol_falls_through_to_the_next_source(tmp_path):
+    """某源不认识的号段必须让编排继续回退，而不是中断整条请求。
+
+    ``UnknownExchangePrefix`` 继承自 ``ValueError``，因此 ``_fetch`` 里针对它的分支
+    必须排在 ``except ValueError: raise`` 之前——否则一个 akshare 本可作答的代码
+    （如 ETF）会在第一个适配器上就失败，回退链形同虚设。
+    """
+    from finharness.data.mapping import UnknownExchangePrefix
+
+    class LimitedSource(DataAdapter):
+        name = "fuyao"
+
+        def fetch_quote(self, symbol):
+            # 模拟"A 股端点收到 ETF 代码"：该源提供不了这个标的。
+            raise UnknownExchangePrefix(f"无法识别交易所前缀：{symbol}")
+
+    class UniversalSource(DataAdapter):
+        name = "akshare"
+        calls = 0
+
+        def fetch_quote(self, symbol):
+            type(self).calls += 1
+            return FetchResult(
+                df=pd.DataFrame([{"symbol": symbol, "close": 4.58}]),
+                interface="spot",
+            )
+
+    access = DataAccess(
+        [LimitedSource(), UniversalSource()],
+        settings=make_settings(tmp_path, order=("fuyao", "akshare")),
+    )
+
+    raw = asyncio.run(access.quote("510300"))
+
+    assert raw.endpoint == "akshare:spot"
+    assert UniversalSource.calls == 1
+
+
+def test_an_unresolvable_symbol_reports_every_source_when_all_fail(tmp_path):
+    """全部源都不认识时，报错要汇总各源原因，而不是只抛第一个。"""
+    from finharness.data.mapping import UnknownExchangePrefix
+
+    class Limited(DataAdapter):
+        def __init__(self, name):
+            self.name = name
+
+        def fetch_quote(self, symbol):
+            raise UnknownExchangePrefix(f"{self.name} 不认识 {symbol}")
+
+    access = DataAccess(
+        [Limited("fuyao"), Limited("akshare")],
+        settings=make_settings(tmp_path, order=("fuyao", "akshare")),
+    )
+
+    try:
+        asyncio.run(access.quote("510300"))
+    except DataUnavailableError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected DataUnavailableError")
+
+    assert "fuyao" in message and "akshare" in message
+
+
+def test_an_invalid_symbol_still_fails_fast_without_calling_adapters(tmp_path):
+    """调用方**格式**非法（非 6 位）仍是致命错误：不该被当成回退理由。
+
+    与"号段不识别"的区别在于：前者无论发给哪个源都非法，后者只是某个源的能力边界。
+    """
+    from finharness.data.mapping import UnknownExchangePrefix
+
+    class Counting(DataAdapter):
+        name = "fuyao"
+        calls = 0
+
+        def fetch_quote(self, symbol):
+            type(self).calls += 1
+            raise UnknownExchangePrefix("nope")
+
+    adapter = Counting()
+    access = DataAccess([adapter], settings=make_settings(tmp_path, order=("fuyao",)))
+
+    try:
+        asyncio.run(access.quote("abc"))
+    except ValueError as exc:
+        assert "6-digit" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ValueError")
+
+    assert adapter.calls == 0

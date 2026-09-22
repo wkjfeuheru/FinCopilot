@@ -16,15 +16,14 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from pathlib import Path
 
 from finharness.permissions.modes import PermissionMode, Verdict
 from finharness.permissions.rules import RuleHit, scan_args, scan_text
 from finharness.tools.base import PermissionLevel
+from finharness.workspace import Workspace
 
-# 带路径的工具：目标位于这些目录中的写入属于产物写入，而非对用户数据的改动。
+# 带路径的工具：目标位于可写区内的写入属于产物写入，而非对用户数据的改动。
 # cache 不在其中——写缓存在 check 中被显式拒绝，而非默默绕过确认。
-_WHITELIST_DIR_KEYS = ("output",)
 _PATH_ARG_KEYS = ("path", "file", "filename", "target")
 
 # 网络外发确认类别：同一对话内首次确认后免问。键是"风险类别"而非工具名，
@@ -36,15 +35,18 @@ EGRESS_CATEGORY = "egress"
 def _egress_requested(tool, args: dict) -> bool:
     """判定一次读类调用是否构成网络外发。
 
-    表驱动而非给 @tool 加声明属性：目前只有两个工具、且其中一个按参数
-    （``with_text``）而非按工具判定，声明轴上还没有第二个消费者；等出现
-    "整类工具都外发"的工具组时再提升为声明属性。
+    读的是**声明**（``@tool(egress=True)``），因为这正是当初注释里预告的时点：判定
+    一度是闸门内的名称表，只在"恰好两个工具"时成立。同花顺把整组数据工具都变成
+    外发工具后，逐名字维护必然漏改，而漏改的后果是一个本该询问用户的外发调用静默
+    放行——所以规则搬到了它本来该在的地方。
+
+    ``get_research_reports`` 是唯一按**参数**而非按工具判定的情形（``with_text``），
+    因此这里保留一个显式特例：它关掉全文时只是一次普通的读书调用，把它整类标成外发
+    会让元数据查询也弹框。
     """
-    if tool.name == "web_search":
-        return True
-    if tool.name == "get_research_reports" and args.get("with_text") is True:
-        return True
-    return False
+    if tool.name == "get_research_reports":
+        return args.get("with_text") is True
+    return bool(getattr(tool, "egress", False))
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +109,16 @@ class PermissionGate:
         confirm_egress: "Callable[[str, dict], Awaitable[bool]] | None" = None,
     ) -> None:
         self.settings = settings
-        self.mode = mode or PermissionMode(settings.permission.default_mode)
+        # ``mode`` 规范化后再存：下方对 AUTO 的判定用 ``is`` 比较枚举成员，而签名虽然
+        # 声明 ``PermissionMode``，Python 不会替我们挡住一个等价的字符串。此前落库的
+        # ``"auto"`` 会让两个 AUTO 分支永不命中——AUTO 模式静默退化成"需确认"，无交互
+        # 通道时外发工具被直接拒绝。``PermissionMode`` 是 ``str`` 枚举，转换是幂等的，
+        # 因此对已是成员的入参没有额外代价。
+        self.mode = (
+            PermissionMode(mode)
+            if mode is not None
+            else PermissionMode(settings.permission.default_mode)
+        )
         self.confirm = confirm
         # 网络外发确认可以携带"本对话不再询问"的第三选项；缺省回落到与写
         # 工具相同的两选项回调。
@@ -116,8 +127,10 @@ class PermissionGate:
         self.confirmed_categories = (
             confirmed_categories if confirmed_categories is not None else set()
         )
-        self._output_dir = Path(settings.paths.output_dir).resolve()
-        self._cache_dir = Path(settings.data.cache_dir).resolve()
+        # 可达性来自 workspace（唯一来源），与工具侧同源判定：门与工具因此
+        # 不可能对"这是不是产物写入"得出不同结论。此前两者各自拼根，
+        # 白名单根一度宽于工具实际根。
+        self.workspace = Workspace(settings)
         self._deny_patterns = deny_patterns
 
     async def check(self, tool, args: dict) -> GateDecision:
@@ -130,7 +143,13 @@ class PermissionGate:
 
         # 2. 写入共享缓存结构性拒绝：lookup 键跨用户共享，模型侧写入
         #    即缓存投毒。即使 AUTO 模式、即使参数带路径白名单键。
-        if self._path_in_cache(args):
+        #    **仅限写入**：缓存的两棵子树（parquet/、pdf/）对读取是开放的，
+        #    读类工具本就以它们为工作对象——研报正文落盘后由 read_pdf 精读、
+        #    summarize_document 摘要，复核子代理也据此重读载荷。此处若不分
+        #    读写一律拒绝，这条设计内的主流程会整条不可用，也与 workspace
+        #    的可读契约（output/ + cache 的 parquet/pdf）相矛盾。读类调用
+        #    的可达性由工具侧 resolve_read 把关，它只放行那两棵子树。
+        if tool.permission is not PermissionLevel.READ and self._path_in_cache(args):
             return GateDecision(Verdict.DENY, "缓存目录不可写：data_cache 载荷为共享只读")
 
         # 3. 读类工具：默认放行；网络外发首次须确认。
@@ -181,34 +200,12 @@ class PermissionGate:
 
     def _path_in_cache(self, args: dict) -> bool:
         for key in _PATH_ARG_KEYS:
-            raw = args.get(key)
-            if not isinstance(raw, str) or not raw.strip():
-                continue
-            try:
-                target = Path(raw).resolve()
-            except (OSError, ValueError):
-                continue
-            if self._under(target, self._cache_dir):
+            if self.workspace.is_in_cache(args.get(key)):
                 return True
         return False
 
     def _path_in_whitelist(self, args: dict) -> bool:
         for key in _PATH_ARG_KEYS:
-            raw = args.get(key)
-            if not isinstance(raw, str) or not raw.strip():
-                continue
-            try:
-                target = Path(raw).resolve()
-            except (OSError, ValueError):
-                continue
-            if self._under(target, self._output_dir):
+            if self.workspace.is_artifact_write(args.get(key)):
                 return True
         return False
-
-    @staticmethod
-    def _under(target: Path, root: Path) -> bool:
-        """抵抗 ``..`` 越权逃逸的包含性检查（两者均已解析）。"""
-        try:
-            return target == root or target.is_relative_to(root)
-        except (OSError, ValueError):
-            return False

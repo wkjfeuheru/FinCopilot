@@ -92,6 +92,10 @@ class BaseTool(ABC):
     # 因为一旦复核开始搜索互联网，就会消耗 token 并把不可信文本拉入复核者，毫无收益——
     # 它的职责是拿报告与会话自身的数据做核对。
     review_eligible = True
+    # 该工具会把用户数据发往第三方（或从第三方拉入不可信内容），因此首次调用须经
+    # 用户确认（docs 03.7.1）。与 ``data_tool`` 一样是 ``@tool`` 声明在类上的投影，
+    # 使权限闸门读声明而不是维护一份名称表。
+    egress = False
 
     def __init__(self, data: DataAccess, *, ctx: Any | None = None, registry: Any | None = None) -> None:
         self.data = data

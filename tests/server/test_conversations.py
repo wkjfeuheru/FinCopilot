@@ -140,7 +140,7 @@ def make_client(
 
     client = authed_client(
         TestClient(
-            create_app(provider=provider, data_access=data_access, settings=settings)
+            create_app(provider=provider, data_access=data_access, settings=settings, single_tenant=True)
         )
     )
     return (client, provider)

@@ -19,7 +19,7 @@ from finharness.config.settings import Settings
 from finharness.data.adapters.base import AdapterError, DataAdapter, FetchResult
 from finharness.data.cache import LocalCache, make_lookup_key
 from finharness.data.citation import fingerprint_series
-from finharness.data.mapping import normalize_valuation_indicator
+from finharness.data.mapping import UnknownExchangePrefix, normalize_valuation_indicator
 from finharness.data.raw import RawData
 
 
@@ -51,7 +51,7 @@ def _data_date(df: pd.DataFrame | None, fallback: str) -> str:
     """推导数据自身的日期，使 TTL 跟随数据而非抓取时刻。"""
     if df is None or not len(df):
         return fallback
-    for column in ("date", "日期", "公告日期", "报告期", "end_date"):
+    for column in ("date", "日期", "公告日期", "报告期", "end_date", "report_period", "ex_date"):
         if column in df.columns:
             parsed = pd.to_datetime(df[column], errors="coerce").dropna()
             if len(parsed):
@@ -128,6 +128,16 @@ class DataAccess:
                     break
                 except NotImplementedError:
                     errors.append(f"{adapter.name}: 不支持 {kind}")
+                    break
+                except UnknownExchangePrefix as exc:
+                    # 某源不认识的号段（如 ETF 代码之于只覆盖股票的接口）是"这个源
+                    # 提供不了这个标的"，与"不支持这个语义方法"同类：**必须落到下一个
+                    # 数据源**，而不是中断整条请求。
+                    #
+                    # 它继承自 ``ValueError``，因此这一支必须排在下面的 ``ValueError``
+                    # 之前——否则它会被当成"调用方参数非法"直接 raise，使一个 akshare
+                    # 本可作答的请求在第一个适配器上就失败。
+                    errors.append(f"{adapter.name}: {exc}")
                     break
                 except AdapterError as exc:
                     # 仅重试瞬时故障；鉴权与配额错误
@@ -392,6 +402,56 @@ class DataAccess:
             cache_params={"op": "index_cons", "index": canonical},
             method="fetch_index_constituents",
             args=(canonical,),
+        )
+
+    async def query_dataset(
+        self, service: str, dataset: str, params: dict[str, Any] | None = None
+    ) -> RawData:
+        """通用数据集取数：触达没有专用语义方法的长尾端点（docs 03.5）。
+
+        特色数据、基金/期货/期权与估值快照都属于这一类。走同一条 ``_fetch`` 编排，
+        因此缓存、适配器回退与来源追溯（``RawData.endpoint`` 记作
+        ``fuyao:<dataset>``）都与既有数据一致，而不是另起一条并行路径。
+
+        缓存键含 ``service`` 与参数全量：不同数据集、不同参数对应不同槽位，否则
+        一个 ``limit=5`` 的结果会被交给 ``limit=500`` 的下一次查询。
+        """
+        return await self._fetch(
+            kind="dataset",
+            cache_params={
+                "op": "dataset",
+                "service": service,
+                "dataset": dataset,
+                "params": dict(params or {}),
+            },
+            method="fetch_dataset",
+            args=(service, dataset, dict(params or {})),
+        )
+
+    async def dataset_catalog(self, service: str) -> list[dict[str, Any]]:
+        """某服务可用的数据集目录（含 ``inputSchema``）。
+
+        目录不落本地表缓存：它是**元数据**，且适配器已在内存里按实例缓存（
+        MCP 客户端的 ``tools/list`` 结果）。把它写进 parquet 缓存会让"上游新增了
+        端点"在 TTL 内对本地不可见，而目录正是用来发现这些端点的。
+
+        适配器不支持目录（非 MCP 数据源）时返回空列表：这是一次能力查询，不是错误。
+        """
+        errors: list[str] = []
+        for adapter in self._ordered_adapters():
+            lister = getattr(adapter, "list_datasets", None)
+            if lister is None:
+                errors.append(f"{adapter.name}: 不支持数据集目录")
+                continue
+            try:
+                return await asyncio.to_thread(lister, service)
+            except NotImplementedError:
+                errors.append(f"{adapter.name}: 不支持数据集目录")
+            except AdapterError as exc:
+                # 与数据取数同一口径：某个源答不上来就换下一个，全都不行才报错。
+                errors.append(f"{adapter.name}: {exc.message}")
+        raise DataUnavailableError(
+            "; ".join(errors) or f"没有数据源能提供 {service} 的数据集目录"
         )
 
     # -- 辅助函数 --------------------------------------------------------------

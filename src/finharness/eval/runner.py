@@ -228,6 +228,18 @@ def build_data_access(settings: Settings, *, offline: bool) -> DataAccess:
 
         adapters.append(OfflineAdapter())
     else:
+        # 与生产接线同一顺序：同花顺优先，akshare 兜底。
+        from finharness.data.adapters.fuyao_adapter import FuyaoMcpAdapter
+
+        adapters.append(
+            FuyaoMcpAdapter(
+                api_key=settings.fuyao.resolved_api_key(),
+                base_url=settings.fuyao.base_url,
+                timeout_s=settings.fuyao.timeout_s,
+                proxy=settings.fuyao.proxy,
+                throttle_seconds=settings.data.throttle_seconds,
+            )
+        )
         adapters.append(AkShareAdapter(throttle_seconds=settings.data.throttle_seconds))
         api_key = os.getenv(settings.search.env_key) or settings.search.api_key
         if api_key:
@@ -306,6 +318,7 @@ class EvalRunner:
         offline: bool = False,
         turn_timeout_s: float = 300.0,
         verbose: bool = False,
+        trace_store: Any | None = None,
     ) -> None:
         self.base_settings = base_settings
         self.provider = provider
@@ -313,6 +326,10 @@ class EvalRunner:
         self.offline = offline
         self.turn_timeout_s = turn_timeout_s
         self.verbose = verbose
+        # 可选 trace 落库（监控平台）：开启后每个用例轮次都以 source=eval
+        # 落一行 run，使线上监控页与评测运行共享同一观测面。TraceStore 吞
+        # 错，不影响评测本身。
+        self.trace_store = trace_store
 
     def _log(self, message: str) -> None:
         if self.verbose:
@@ -391,6 +408,7 @@ class EvalRunner:
                         duration_ms=round((time.monotonic() - turn_started) * 1000),
                     )
                     record.turns.append(captured)
+                    self._record_trace(case, conversation_id, turn, captured)
                     turn_index += 1
                     self._log(
                         f"  [{case.id}] turn {turn_index} ({conversation_id}): "
@@ -423,6 +441,50 @@ class EvalRunner:
             record.report_text = self._read_reports(record.exports)
             record.audit_denials = _read_audit_denials(settings.audit.log_path)
         return record
+
+    def _record_trace(self, case: EvalCase, conversation_id: str, turn: Any, captured: CapturedTurn) -> None:
+        """把一个评测轮次落进监控 trace 库（未启用时为 no-op）。
+
+        run_id 必须可重入稳定：同一用例重跑覆盖旧行，监控页看到的是最新
+        一次评测的轨迹，而不是历史叠加。
+        """
+        store = self.trace_store
+        if store is None:
+            return
+        try:
+            run_id = f"tr_eval_{case.id}_{captured.index}"
+            store.start_run(
+                run_id=run_id,
+                source="eval",
+                user_id="",
+                session_id=None,
+                conversation_id=conversation_id,
+                eval_case_id=case.id,
+                input=turn.user,
+            )
+            for event in captured.events:
+                if event.kind != "text_delta":
+                    store.record_event(run_id, event.kind, dict(event.data))
+            outcome = captured.outcome
+            usage = getattr(outcome, "usage", None)
+            store.finish_run(
+                run_id,
+                status="done" if getattr(outcome, "succeeded", False) else "error",
+                answer=str(getattr(outcome, "answer", "") or ""),
+                reason=getattr(outcome, "reason", None),
+                succeeded=bool(getattr(outcome, "succeeded", False)),
+                rounds=getattr(outcome, "rounds", None),
+                tool_calls=getattr(outcome, "tool_calls", None),
+                retry_count=getattr(outcome, "retry_count", None),
+                usage={
+                    "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+                    "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+                },
+                citations=list(getattr(outcome, "citations", []) or []),
+                trace_rounds=list(getattr(outcome, "trace", []) or []),
+            )
+        except Exception:  # noqa: BLE001 - trace 落库绝不影响评测
+            self._log(f"  [{case.id}] trace record failed")
 
     @staticmethod
     def _read_reports(exports: list[str]) -> str:

@@ -50,6 +50,10 @@ RESEARCH_CAPABILITIES = frozenset(
         Capability.RESEARCH_REPORT,
         Capability.MACRO,
         Capability.INDUSTRY,
+        # 数据集派发器取的是证据（特色数据、基金、期货、期权），因此与上面几项同类：
+        # 它是"研究工作"，也就可能对某个任务而言用错了。FIN_DATA 分组的工具必须落在
+        # 这个集合里，否则"计划指向 A 数据、实际取了 B 数据"就失去唯一的判定层。
+        Capability.DATASET,
         Capability.COMPUTE,
     }
 )
@@ -126,6 +130,16 @@ _CAPABILITY_KEYWORDS: dict[Capability, tuple[str, ...]] = {
         "利率", "社融", "m2", "汇率",
     ),
     Capability.INDUSTRY: ("行业", "产业", "赛道", "产业链", "景气", "格局", "集中度"),
+    # 长尾数据集：特色数据、基金、期货、期权、交易日历。这些是"另有一类东西
+    # 可查"的信号，而不是某类研究工作——当问题落在这些域里时，路由层应注入数据集
+    # 派发器，而不是去激活一个语义上更近但答不了它的工具。
+    Capability.DATASET: (
+        "涨停", "跌停", "炸板", "连板", "龙虎榜", "游资", "热股", "人气榜",
+        "异动", "集合竞价", "竞价", "交易日", "交易日历",
+        "基金", "净值", "基金经理", "重仓", "持仓",
+        "期货", "合约", "仓单", "基差", "期权", "ETF", "LOF", "REITs",
+        "概念板块", "概念指数",
+    ),
     Capability.COMPUTE: ("计算", "分解", "归因", "回测", "因子", "绩效"),
 }
 

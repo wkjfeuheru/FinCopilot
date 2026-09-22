@@ -26,6 +26,8 @@ _LLM_BUCKETS = (0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0)
 _FIRST_TOKEN_BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0)
 # 工具大多在亚秒到几十秒；数据抓取偶有分钟级。
 _TOOL_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+# 一次运行的轮数：多数在个位数，长链路可达数十轮。
+_ROUNDS_BUCKETS = (1, 2, 4, 6, 8, 12, 16, 20, 30, 50)
 
 
 class MetricsRecorder:
@@ -79,8 +81,27 @@ class MetricsRecorder:
             buckets=_FIRST_TOKEN_BUCKETS,
             registry=self.registry,
         )
+        # 运行终态与轮数：任务完成率与平均执行步数在 Prometheus 侧的来源
+        # （自建监控页的口径在 TraceStore.metrics_summary，两者互补）。
+        self.run_total = Counter(
+            "agent_run_total",
+            "按终态与原因统计的运行数",
+            labelnames=("status", "reason"),
+            registry=self.registry,
+        )
+        self.rounds = Histogram(
+            "agent_rounds",
+            "一次运行经历的轮数",
+            buckets=_ROUNDS_BUCKETS,
+            registry=self.registry,
+        )
 
     # -- Observer 接口 ----------------------------------------------------------
+
+    def run_finished(self, *, status: str, reason: str, rounds: int | None) -> None:
+        self.run_total.labels(status=status or "unknown", reason=reason or "unknown").inc()
+        if rounds is not None:
+            self.rounds.observe(rounds)
 
     def request_finished(
         self, *, status: str, duration_s: float, model: str = ""

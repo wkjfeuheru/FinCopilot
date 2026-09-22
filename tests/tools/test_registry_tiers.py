@@ -91,6 +91,9 @@ def test_registry_covers_the_documented_catalogue(tmp_path):
         "get_valuation", "get_peers", "get_market_news", "get_announcements",
         "get_research_reports",
         "get_macro_indicators", "get_industry_perf", "get_industry_constituents",
+        # 同花顺长尾数据集派发器（docs 03.4）
+        "list_fuyao_datasets", "query_a_share_data", "query_fund_data",
+        "query_futures_data", "query_options_data",
         "calc_metrics", "calc_valuation", "run_backtest", "make_chart", "write_report",
         "read_file", "read_pdf", "write_file", "web_search", "research_plan",
         "update_plan_step", "record_conclusion", "search_tools",

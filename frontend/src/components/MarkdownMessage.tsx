@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
 import { artifactUrl } from "../api/client";
 import { renderCitations } from "../lib/citations";
 
@@ -56,6 +57,7 @@ export function MarkdownMessage({
     <div className="markdown-body">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeHighlight, { detect: false, ignoreMissing: true }]]}
         // react-markdown 默认会净化未知的 URL scheme，这会
         // 剥离像 C:\... 这样的 Windows 路径；这里恢复信任，由下方的
         // 原生链接/图片组件决定实际输出什么。
@@ -93,9 +95,14 @@ export function MarkdownMessage({
             );
           },
           table({ children }) {
+            // 表头随纵向滚动固定：财务对照表动辄几十行，滚到中部时
+            // 列名还在，数字才有可读性。表头吸附要求容器是独立滚动
+            // 盒（sticky 不越过 overflow 祖先），因此这里限高内滚。
             return (
               <div className="markdown-table-wrap">
-                <table>{children}</table>
+                <div className="markdown-table-scroll">
+                  <table>{children}</table>
+                </div>
               </div>
             );
           },

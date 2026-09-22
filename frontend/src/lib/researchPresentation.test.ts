@@ -7,6 +7,13 @@ describe("presentToolAction", () => {
     expect(presentToolAction("write_report")).toBe("生成研究报告并复核");
   });
 
+  it("names the report-reading tools so a failure points at a real step", () => {
+    // 这两个工具此前缺失，界面回落到兜底的"执行研究步骤"，失败时看不出
+    // 是哪一步出了问题。
+    expect(presentToolAction("read_pdf")).toBe("精读研报正文");
+    expect(presentToolAction("summarize_document")).toBe("生成文档摘要");
+  });
+
   it("keeps unknown internal names out of the user interface", () => {
     expect(presentToolAction("experimental_private_tool")).toBe("执行研究步骤");
   });

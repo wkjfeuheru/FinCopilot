@@ -29,6 +29,7 @@ from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
 from finharness.data.adapters.eastmoney_report_adapter import EastmoneyReportAdapter
+from finharness.data.adapters.fuyao_adapter import FuyaoMcpAdapter
 from finharness.data.adapters.tavily_adapter import TavilyAdapter
 from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
@@ -54,6 +55,7 @@ from finharness.server.sse import HEARTBEAT_S, encode_comment, encode_event
 from finharness.tools.registry import ALL_TOOL_CLASSES, ToolRegistry
 from finharness.types import StopSignal
 from finharness.utils.bounded import BoundedMap
+from finharness.workspace import Workspace, WorkspaceViolation
 
 # 单一定义，从 prompts/system.md 加载，使测试与产品发布使用同一份文本
 # （文档说明：它管控规划、引用与收敛）。
@@ -87,7 +89,7 @@ class StopRequest(BaseModel):
 
 
 class QueueSink:
-    def __init__(self):
+    def __init__(self, trace_recorder=None):
         import asyncio
 
         self.queue = asyncio.Queue()
@@ -95,6 +97,9 @@ class QueueSink:
         self.first_token_at: float | None = None
         self.done_at: float | None = None
         self.replay_events: list[dict] = []
+        # 可选的 trace 落库旁路（监控平台，docs 03.14.4）：记录非 text_delta
+        # 事件；TraceStore 自身吞错，落库失败绝不影响对话流。
+        self.trace_recorder = trace_recorder
 
     async def emit(self, event):
         """将引擎事件入队，并记录计时与重放所需的元数据。"""
@@ -103,6 +108,8 @@ class QueueSink:
             self.first_token_at = now
         if event.kind == "done":
             self.done_at = now
+        if self.trace_recorder is not None and event.kind != "text_delta":
+            self.trace_recorder(event)
         if event.kind in {
             "tool_status",
             "tool_activated",
@@ -145,8 +152,25 @@ def create_app(
     config_store: ConfigStore | None = None,
     resolver: ProviderResolver | None = None,
     probe_client_factory=None,
+    single_tenant: bool = False,
 ) -> FastAPI:
-    """构建 FastAPI 应用，装配缓存、适配器、会话注册表与全部路由。"""
+    """构建 FastAPI 应用，装配缓存、适配器、会话注册表与全部路由。
+
+    ``data_access`` 是**单租户**注入点：给了它，全体用户共用同一个实例，
+    每用户的产物与缓存命名空间随之关闭（见 ``data_for``）。因此它必须与
+    ``single_tenant=True`` 同时出现，且在远程监听（``server.allow_remote``）
+    下被拒绝——多租户部署里"静默共用一个数据面"是隔离失效，而不是配置选项。
+    """
+    if data_access is not None and not single_tenant:
+        raise ValueError(
+            "注入 data_access 会关闭每用户产物/缓存隔离，必须显式声明 "
+            "single_tenant=True（仅用于测试与单用户本地运行）"
+        )
+    if data_access is not None and settings is not None and settings.server.allow_remote:
+        raise ValueError(
+            "server.allow_remote=true（多租户）下不接受 data_access 注入："
+            "全体用户共用一份数据面会静默关闭租户隔离"
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -162,6 +186,10 @@ def create_app(
             settings=settings,
             observer=observer,
         )
+        # trace 保留期清理与蒸馏扫描器同一生命周期：启动即跑、关闭即停。
+        trace_cleanup_task = None
+        if trace_store is not None:
+            trace_cleanup_task = asyncio.create_task(_trace_cleanup_worker())
         # 向量回填（docs 03.6.4 LTM）：覆盖"先积累了语义条目、之后才配好
         # embedding 端点"以及"条目被改写导致向量失效"两种情况。放在启动时
         # 做一次，避免这些条目直到下次蒸馏才重新可召回。失败无妨——语义
@@ -174,9 +202,20 @@ def create_app(
         try:
             yield
         finally:
+            if trace_cleanup_task is not None:
+                trace_cleanup_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await trace_cleanup_task
             await stop_distill_sweeper(getattr(app.state, "ltm_sweeper_task", None))
 
     application = FastAPI(title="FinHarness", lifespan=lifespan)
+
+    async def _trace_cleanup_worker() -> None:
+        """trace 保留期清理：小时级节奏，失败只等下一轮。"""
+        while True:
+            await asyncio.sleep(3600.0)
+            with contextlib.suppress(Exception):
+                trace_store.cleanup(trace_cfg.retention_days)  # type: ignore[union-attr]
     settings = settings or Settings.from_file()
 
     # 日志在任何组件之前配置，使启动期的日志本身就带上下文字段。
@@ -187,6 +226,17 @@ def create_app(
     )
     # 观测门面：未启用或未安装可选依赖时自动降级为 no-op，绝不影响主流程。
     observer = build_observer(settings)
+
+    # 运行轨迹落库（监控平台数据面，docs 03.14.4）：默认关闭；纯标准库
+    # SQLite，无可选依赖。所有写入吞错——trace 缺失不该影响任何一次对话。
+    trace_store = None
+    trace_cfg = settings.observability.trace_store
+    if trace_cfg.enabled:
+        from finharness.observability.trace_store import TraceStore
+
+        trace_store = TraceStore(
+            trace_cfg.db_path, capture_payloads=trace_cfg.capture_payloads
+        )
 
     # -- 认证（docs 03.13）-----------------------------------------------------
     user_store = UserStore(settings.paths.auth_db)
@@ -274,6 +324,17 @@ def create_app(
     # （测试传入隔离的替身），因此这里绝不改动它。
     data_cache = LocalCache(settings.data.cache_dir)
     adapters = [
+        # 同花顺排在最前：它提供 akshare 没有的能力（结构化三表字段、完整财务指标、
+        # 概念指数成分股、特色数据、基金/期货/期权），而回退是有序的——放在后面就
+        # 意味着 akshare 一旦答得上，它就永远不会被用到。启动时缺少密钥无妨：工具
+        # 被调用时才报告"未配置"，编排器把它当作普通的回退原因交给 akshare。
+        FuyaoMcpAdapter(
+            api_key=settings.fuyao.resolved_api_key(),
+            base_url=settings.fuyao.base_url,
+            timeout_s=settings.fuyao.timeout_s,
+            proxy=settings.fuyao.proxy,
+            throttle_seconds=settings.data.throttle_seconds,
+        ),
         AkShareAdapter(throttle_seconds=settings.data.throttle_seconds),
         # Web 访问走同一条适配器链与缓存；启动时缺少 key 无妨——
         # 工具在被调用时会报告"未配置"。settings.json 中的内联 key
@@ -297,9 +358,10 @@ def create_app(
     def adapters_for(user_settings: Settings) -> list:
         """某用户数据面所用的适配器。
 
-        取数适配器（akshare/tushare）与检索适配器全局共享一份：其节流状态保护的是
-        上游数据源，按用户复制会把上游请求速率乘以用户数。唯一必须按用户隔离的是
-        研报适配器——它的全文落盘目录随后要由该用户的 ``read_pdf`` 读回。
+        取数适配器（同花顺/akshare/tushare）与检索适配器全局共享一份：其节流状态与
+        （同花顺的）MCP 会话保护的都是上游数据源，按用户复制会把上游请求速率乘以
+        用户数，还会让每个用户各握一个会话。唯一必须按用户隔离的是研报适配器——
+        它的全文落盘目录随后要由该用户的 ``read_pdf`` 读回。
         """
         return [
             adapter.with_pdf_dir(Path(user_settings.data.cache_dir) / "pdf")
@@ -450,6 +512,10 @@ def create_app(
                 "confirm",
                 f"工具 {name} 将访问外部网络并引入第三方内容，入参：{summarize_args(args)}",
                 ["y", "y_remember", "n"],
+                # 同一轮并发的多个外发调用是同一个决定，合并成一次提问：
+                # 分开问既重复打断用户，又会因前端一次只呈现一个提示而让
+                # 其余请求等满 TTL 被判拒绝（docs 03.7.1）。
+                dedupe_key=f"egress:{session_id or 'local'}:{conversation_id or 'local'}",
             )
             if answer == "y_remember":
                 confirmed.add(EGRESS_CATEGORY)
@@ -480,15 +546,39 @@ def create_app(
             semantic_index=semantic_index,
         )
 
-        async def _ask(kind: str, prompt: str, options: list[str]):
-            """经由 SSE 宣告请求，然后 await 客户端的应答。"""
-            _, answer = await confirm_bus.request(
+        async def _ask(
+            kind: str,
+            prompt: str,
+            options: list[str],
+            *,
+            multi_select: bool = False,
+            dedupe_key: str | None = None,
+        ):
+            """经由 SSE 宣告请求，然后 await 客户端的应答。
+
+            ``multi_select`` 仅对 ``ask_user`` 提问有意义，随 payload 下发前端以
+            决定选项是单选还是多选。``dedupe_key`` 让同类别并发请求共用一次提问；
+            此时多个调用者会各自收到同一条 resolution，前端按 request_id 幂等收尾即可。
+            """
+            payload, answer = await confirm_bus.request(
                 session_id=session_id or "local",
                 kind=kind,
                 prompt=prompt,
                 options=options,
+                multi_select=multi_select,
                 user_id=user_id,
-                announce=lambda payload: loop._emit("interactive_request", payload),
+                announce=lambda item: loop._emit("interactive_request", item),
+                dedupe_key=dedupe_key,
+            )
+            # 明确告知前端该提示已落定（批准/拒绝/超时），否则"等待操作确认"
+            # 步骤会永远停在"进行中"——它此前只有发起、没有收尾。
+            await loop._emit(
+                "interaction_resolved",
+                {
+                    "request_id": payload.get("request_id"),
+                    "answer": answer,
+                    "timeout": answer is None,
+                },
             )
             return answer
 
@@ -529,6 +619,21 @@ def create_app(
             settings=settings,
             probe_client_factory=probe_client_factory,
             require_user=require_user,
+        )
+    )
+    # 监控查询 API（docs 03.14.4）：始终挂载——未启用时数据端点返回 503
+    # （带开启方法）而非 404，否则运维方只看到一个无信息量的"加载失败"。
+    # 路由内部按 admin_users 白名单二次鉴权。
+    from finharness.server.trace_api import create_trace_router
+
+    if trace_store is not None and not trace_cfg.admin_users:
+        get_logger("finharness.server.api").warning(
+            "trace_admin_users_empty",
+            extra={"hint": "trace_store 已启用但 admin_users 为空，监控页对所有人不可见"},
+        )
+    application.include_router(
+        create_trace_router(
+            trace_store, list(trace_cfg.admin_users), require_user=require_user
         )
     )
     frontend_dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
@@ -843,31 +948,19 @@ def create_app(
     async def download_artifact(
         path: str, user: CurrentUser = Depends(require_user)
     ):
-        """提供产出的文件，范围限于该用户自己的产物目录与缓存数据。
+        """提供产出的文件，范围限于该用户自己的 workspace。
 
-        在解析之后强制校验包含关系，与 read_file 一致；没有它，
-        该 endpoint 就会变成任意文件读取。缓存侧只开放该用户自己的
-        命名空间——打开整个 data_cache/ 会连带暴露 users.db（密码哈希）
-        与 memory.db（全部用户的对话），而**只**放开 ``parquet/`` 又会让
-        任何用户读到他人缓存的载荷（文件名是 endpoint+params 的哈希）。
+        可达性来自该用户的 ``Workspace``，与 ``read_file``/``read_pdf`` 同源；
+        没有校验该端就会变成任意文件读取。缓存侧只开放该用户自己的命名空间
+        ——整个 data_cache/ 会连带暴露 users.db（密码哈希）与 memory.db
+        （全部用户的对话），而共享一份 parquet/ 又会让任何用户读到他人缓存的
+        载荷（文件名是 endpoint+params 的哈希）。
         """
-        user_cache = scoped_settings(user.id).data.cache_dir
-        allowed_roots = [
-            (Path(settings.paths.output_dir) / user.id).resolve(),
-            (Path(user_cache) / "parquet").resolve(),
-            (Path(user_cache) / "pdf").resolve(),
-        ]
+        user_workspace = Workspace(scoped_settings(user.id))
         try:
-            target = Path(path).resolve()
-        except (OSError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="非法路径") from exc
-        if not any(
-            target == root or target.is_relative_to(root) for root in allowed_roots
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="路径超出允许范围（仅限 output/ 与 data_cache/）",
-            )
+            target = user_workspace.resolve_read(path)
+        except WorkspaceViolation as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         if not target.is_file():
             raise HTTPException(status_code=404, detail="文件不存在")
         return FileResponse(target, filename=target.name)
@@ -1107,10 +1200,35 @@ def create_app(
                 get_logger("finharness.server.api").exception("session_start_audit_failed")
         # trace_id 在请求入口生成并绑定到当前上下文；``create_task`` 会复制
         # context，因此引擎任务与所有日志自动携带同一个 id。
-        observer.bind_request(
+        trace_ctx = observer.bind_request(
             session_id=session.session_id,
             conversation_id=session.conversation_id,
         )
+        # NullObserver（或旧签名）的 bind_request 返回空串：此时引擎内部
+        # 仍会自建 trace id，服务端用 session 派生一个等价稳定的 run_id。
+        run_id = getattr(trace_ctx, "trace_id", "") or f"tr_{session.session_id}"
+
+        # 监控平台旁路（docs 03.14.4）：开启 trace_store 时，本轮对话的全部
+        # 非文本事件、轮次轨迹与终态都落库。失败只降级（TraceStore 吞错）。
+        trace_run_started = trace_store is not None
+        if trace_store is not None:
+            trace_store.start_run(
+                run_id=run_id,
+                source="server",
+                user_id=user.id,
+                session_id=session.session_id,
+                conversation_id=session.conversation_id,
+                input=request.message,
+            )
+
+            def record_trace_event(event) -> None:
+                if event.kind != "text_delta":
+                    trace_store.record_event(run_id, event.kind, dict(event.data))
+
+        else:
+            record_trace_event = None
+        sink = QueueSink(trace_recorder=record_trace_event)
+        session.loop.output = sink
         task = asyncio.create_task(session.loop.run(request.message))
 
         async def events() -> AsyncIterator[str]:
@@ -1175,11 +1293,57 @@ def create_app(
                         return None
                 return None
 
+            def finish_trace(status: str, reason: str | None = None) -> None:
+                """把本次运行的终态与轮次轨迹落库（未启用时为 no-op）。
+
+                覆盖四条收尾路径：done 事件、引擎异常、用户停止/断连、以及
+                引擎正常返回但缺少终止事件的兜底。outcome 的 ``trace``（每轮
+                thought/actions/observations）只在引擎正常返回时可得；异常路径
+                落一个终态行即可——事件流已经把过程留下来了。
+                """
+                if trace_store is None or not trace_run_started:
+                    return
+                outcome = None
+                if task.done() and not task.cancelled():
+                    try:
+                        outcome = task.result()
+                    except BaseException:  # noqa: BLE001 - 异常路径没有 outcome
+                        outcome = None
+                succeeded = None
+                if outcome is not None:
+                    succeeded = bool(getattr(outcome, "succeeded", False))
+                elif status == "done":
+                    succeeded = True
+                usage = None
+                if outcome is not None:
+                    u = getattr(outcome, "usage", None)
+                    usage = {
+                        "input_tokens": getattr(u, "input_tokens", 0) or 0,
+                        "output_tokens": getattr(u, "output_tokens", 0) or 0,
+                    }
+                trace_store.finish_run(
+                    run_id,
+                    status=status,
+                    answer=str(getattr(outcome, "answer", "") or ""),
+                    reason=reason or (getattr(outcome, "reason", None) if outcome else None),
+                    succeeded=succeeded,
+                    rounds=getattr(outcome, "rounds", None) if outcome else None,
+                    tool_calls=getattr(outcome, "tool_calls", None) if outcome else None,
+                    retry_count=getattr(outcome, "retry_count", None) if outcome else None,
+                    usage=usage,
+                    citations=list(getattr(outcome, "citations", []) or []) if outcome else None,
+                    trace_rounds=list(getattr(outcome, "trace", []) or []) if outcome else None,
+                )
+
             def terminal_frames() -> list[str]:
                 """引擎未下发终止事件时的兜底帧，保证客户端一定收敛。"""
                 nonlocal terminal_sent
                 terminal_sent = True
                 failure = engine_failure()
+                finish_trace(
+                    "error" if failure is not None else "done",
+                    "engine_error" if failure is not None else "missing_terminal_event",
+                )
                 if failure is None:
                     # 引擎正常返回却没有 ``done``：这是异常路径，但答案通常
                     # 已落盘，因此对用户按成功收尾，只留一条告警供排查。
@@ -1275,8 +1439,12 @@ def create_app(
                         # 引擎在将最终回答刷入记忆之前发出 ``done``。
                         # 在浏览器可能观察到完成并刷新页面之前，
                         # 先完成该刷写并附上重放记录；但这一步失败不得
-                        # 连累终止帧，否则答案已落库、界面却停在运行中。
+                        # 累终止帧，否则答案已落库、界面却停在运行中。
                         await settle_engine()
+                        finish_trace(
+                            "stopped" if stop_signal.requested else "done",
+                            str(data.get("reason") or "done"),
+                        )
                         turn_metadata = sink.turn_metadata()
                         if turn_metadata is not None:
                             try:
@@ -1331,6 +1499,12 @@ def create_app(
                 confirm_bus.cancel_session(session.session_id)
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+                # 终态落库：用户停止（stop_signal 已置位）与传输掐断分开记账，
+                # 与下方日志的口径一致。
+                finish_trace(
+                    "stopped" if stop_signal.requested else "aborted",
+                    "user_stop" if stop_signal.requested else "disconnected",
+                )
                 # 区分两种断流：用户自己按了停止（前端宽限期到期后硬断兜底）
                 # 与传输/代理掐断。两者的运维含义完全不同，混成一条日志会
                 # 让"停止功能坏了吗"无从判断。
@@ -1348,6 +1522,7 @@ def create_app(
                 # 传输层自身的意外失败：至少给客户端一个终止事件，
                 # 而不是静默断流。落盘由引擎负责，这里只负责收尾。
                 log.exception("chat_stream_transport_failed")
+                finish_trace("error", "transport_failed")
                 if not terminal_sent:
                     for frame in terminal_frames():
                         yield frame

@@ -125,6 +125,16 @@ def cmd_run(args) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"▶ 运行题集 {args.set or 'full'}：{len(selected)} 题 → {run_dir}")
+    # 监控平台旁路：trace_store 开启时，评测运行与线上对话共用同一观测面
+    # （source=eval）。TraceStore 吞错，不配置时为 None，均不影响评测。
+    trace_store = None
+    trace_cfg = getattr(settings.observability, "trace_store", None)
+    if trace_cfg is not None and trace_cfg.enabled:
+        from finharness.observability.trace_store import TraceStore
+
+        trace_store = TraceStore(
+            trace_cfg.db_path, capture_payloads=trace_cfg.capture_payloads
+        )
     runner = EvalRunner(
         base_settings=settings,
         provider=provider,
@@ -132,6 +142,7 @@ def cmd_run(args) -> int:
         offline=args.offline,
         turn_timeout_s=args.timeout,
         verbose=True,
+        trace_store=trace_store,
     )
 
     async def _drive():

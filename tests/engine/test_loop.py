@@ -637,6 +637,47 @@ def test_tiny_token_budget_truncates_without_room_for_the_marker():
     assert loop.memory.counter.count(content).tokens <= 4
 
 
+def test_truncation_closes_a_dangled_fence_before_the_marker():
+    """预算截断把 </web_result> 切掉时，前缀必须被补上闭合——悬空围栏会让
+    "围栏内是引文"的边界含糊。闭合出现在 [truncated] 标记之前，且补齐后的
+    开/闭计数相等。"""
+    fenced = (
+        '以下为外部检索内容。\n'
+        '<web_result source="1" url="https://x.com/a">\n'
+        + "研" * 120
+        + "\n</web_result>\n"
+        '<web_result source="2" url="https://x.com/b">\n'
+        + "报" * 120
+        + "\n</web_result>\n"
+    )
+
+    async def run():
+        tool = RecordingTool("web_search", content=fenced)
+        registry = StubRegistry({"web_search": tool})
+        provider = ScriptedProvider(
+            [tool_round(ToolUse("call_1", "web_search", {})), text_round("ok")]
+        )
+        loop = make_loop(
+            provider, registry=registry, settings=make_settings(max_result_tokens=40)
+        )
+        await loop.run("联网查研报")
+        return loop.messages, loop
+
+    messages, loop = asyncio.run(run())
+
+    content = json.loads(messages[2].tool_results[0][1])["content"]
+    assert content.count("<web_result") == content.count("</web_result>")
+    # 闭合先于标记：标记描述的是截断，不属于任何围栏内部。
+    marker_pos = content.find(loop.TRUNCATION_MARKER)
+    for close_pos in [
+        i for i in range(len(content)) if content.startswith("</web_result>", i)
+    ]:
+        assert close_pos < marker_pos
+    # 预算约束正文（含补上的闭合）；标记与既有语义一致，允许附加在预算外。
+    body = content.split(loop.TRUNCATION_MARKER, 1)[0]
+    assert loop.memory.counter.count(body).tokens <= 40
+
+
 def test_short_tool_result_is_backfilled_unchanged():
     async def run():
         tool = RecordingTool("get_quote", content="报价")

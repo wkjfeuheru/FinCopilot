@@ -1,17 +1,16 @@
 import { useState } from "react";
 import { Alert, Button, Input, Modal, Space, Tag, Typography } from "antd";
 
-export type Interaction = {
-  requestId: string;
-  kind: string;
-  prompt: string;
-  options: string[];
-};
+import type { Interaction } from "../lib/interactionQueue";
+
+export type { Interaction };
 
 type Props = {
   interaction: Interaction | null;
   onRespond: (requestId: string, response: string) => void;
   busy: boolean;
+  /** 队列中待处理的提示总数（含当前这条）。> 1 时提示用户还有后续。 */
+  pendingCount?: number;
 };
 
 /**
@@ -26,12 +25,42 @@ function confirmLabel(option: string): string {
   if (option === "y_remember") return "允许并本对话不再询问";
   return "拒绝";
 }
-export function InteractionPrompt({ interaction, onRespond, busy }: Props) {
+
+/** 模型有时会把"其他"直接列进 options；这类项应触发输入框而非当作普通答案提交。 */
+const OTHER_LABELS = new Set(["其他", "其它", "other"]);
+function isOtherOption(option: string): boolean {
+  return OTHER_LABELS.has(option.trim().toLowerCase());
+}
+
+export function InteractionPrompt({ interaction, onRespond, busy, pendingCount = 1 }: Props) {
   const [freeText, setFreeText] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [otherOpen, setOtherOpen] = useState(false);
 
   if (!interaction) return null;
   const isConfirm = interaction.kind === "confirm";
-  const hasOptions = interaction.options.length > 0;
+  const options = interaction.options;
+  const hasOptions = options.length > 0;
+  const multi = interaction.multiSelect && !isConfirm;
+  // 模型若已自行给出"其他"选项，复用它作为展开入口，不再重复追加。
+  const otherOption = options.find(isOtherOption);
+  const otherLabel = otherOption ?? "其他";
+  const choices = options.filter((option) => !isOtherOption(option));
+  const custom = freeText.trim();
+
+  const submitCustom = () => {
+    if (custom) onRespond(interaction.requestId, custom);
+  };
+  const submitMulti = () => {
+    const parts = [...selected];
+    if (otherOpen && custom) parts.push(custom);
+    if (parts.length) onRespond(interaction.requestId, parts.join("；"));
+  };
+  const toggle = (option: string) =>
+    setSelected((current) =>
+      current.includes(option) ? current.filter((item) => item !== option) : [...current, option]
+    );
+  const canSubmitMulti = selected.length > 0 || (otherOpen && Boolean(custom));
 
   return (
     <Modal
@@ -53,42 +82,125 @@ export function InteractionPrompt({ interaction, onRespond, busy }: Props) {
           {interaction.prompt}
         </Typography.Paragraph>
 
-        {hasOptions ? (
-          <Space wrap>
-            {interaction.options.map((option) => (
-              <Button
-                key={option}
-                type={isConfirm && option.startsWith("y") ? "primary" : "default"}
-                danger={isConfirm && option === "n"}
-                disabled={busy}
-                onClick={() => onRespond(interaction.requestId, option)}
-              >
-                {isConfirm ? confirmLabel(option) : option}
-              </Button>
-            ))}
-          </Space>
-        ) : (
+        {!hasOptions && (
           <Space.Compact style={{ width: "100%" }}>
             <Input
               value={freeText}
               onChange={(event) => setFreeText(event.target.value)}
               placeholder="输入你的回答"
-              onPressEnter={() => {
-                if (freeText.trim()) onRespond(interaction.requestId, freeText.trim());
-              }}
+              onPressEnter={submitCustom}
               disabled={busy}
             />
-            <Button
-              type="primary"
-              disabled={busy || !freeText.trim()}
-              onClick={() => onRespond(interaction.requestId, freeText.trim())}
-            >
+            <Button type="primary" disabled={busy || !custom} onClick={submitCustom}>
               提交
             </Button>
           </Space.Compact>
         )}
 
-        {isConfirm && <Tag color="default">超时未回答将视为拒绝并继续</Tag>}
+        {hasOptions && isConfirm && (
+          <Space wrap>
+            {options.map((option) => (
+              <Button
+                key={option}
+                type={option.startsWith("y") ? "primary" : "default"}
+                danger={option === "n"}
+                disabled={busy}
+                onClick={() => onRespond(interaction.requestId, option)}
+              >
+                {confirmLabel(option)}
+              </Button>
+            ))}
+          </Space>
+        )}
+
+        {hasOptions && !isConfirm && multi && (
+          <>
+            <Space wrap>
+              {choices.map((option) => (
+                <Button
+                  key={option}
+                  type={selected.includes(option) ? "primary" : "default"}
+                  disabled={busy}
+                  onClick={() => toggle(option)}
+                >
+                  {option}
+                </Button>
+              ))}
+              <Button
+                type={otherOpen ? "primary" : "default"}
+                disabled={busy}
+                onClick={() => setOtherOpen((open) => !open)}
+              >
+                {otherLabel}
+              </Button>
+            </Space>
+            {otherOpen && (
+              <Input
+                value={freeText}
+                onChange={(event) => setFreeText(event.target.value)}
+                placeholder="输入你的回答"
+                disabled={busy}
+                autoFocus
+              />
+            )}
+            <Button
+              type="primary"
+              block
+              disabled={busy || !canSubmitMulti}
+              onClick={submitMulti}
+            >
+              提交{selected.length > 0 ? `（已选 ${selected.length} 项）` : ""}
+            </Button>
+          </>
+        )}
+
+        {hasOptions && !isConfirm && !multi && otherOpen && (
+          <Space.Compact style={{ width: "100%" }}>
+            <Input
+              value={freeText}
+              onChange={(event) => setFreeText(event.target.value)}
+              placeholder="输入你的回答"
+              onPressEnter={submitCustom}
+              disabled={busy}
+              autoFocus
+            />
+            <Button type="primary" disabled={busy || !custom} onClick={submitCustom}>
+              提交
+            </Button>
+            <Button
+              disabled={busy}
+              onClick={() => {
+                setOtherOpen(false);
+                setFreeText("");
+              }}
+            >
+              返回选项
+            </Button>
+          </Space.Compact>
+        )}
+
+        {hasOptions && !isConfirm && !multi && !otherOpen && (
+          <Space wrap>
+            {choices.map((option) => (
+              <Button
+                key={option}
+                disabled={busy}
+                onClick={() => onRespond(interaction.requestId, option)}
+              >
+                {option}
+              </Button>
+            ))}
+            <Button type="dashed" disabled={busy} onClick={() => setOtherOpen(true)}>
+              {otherLabel}
+            </Button>
+          </Space>
+        )}
+
+        {isConfirm && (
+          <Tag color="default">
+            {pendingCount > 1 ? `还有 ${pendingCount - 1} 个待处理 · 超时未回答将视为拒绝并继续` : "超时未回答将视为拒绝并继续"}
+          </Tag>
+        )}
       </Space>
     </Modal>
   );

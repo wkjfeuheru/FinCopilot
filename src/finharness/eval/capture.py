@@ -56,7 +56,9 @@ class InteractionChannel:
         self.answer = answer
         self.log = []
 
-    async def ask(self, kind: str, prompt: str, options: list[str]) -> str | None:
+    async def ask(
+        self, kind: str, prompt: str, options: list[str], *, multi_select: bool = False
+    ) -> str | None:
         """引擎循环的 ``interactive`` 回调（也是权限门禁的确认来源）。"""
         if kind == "confirm":
             approved = self.policy == "confirm"

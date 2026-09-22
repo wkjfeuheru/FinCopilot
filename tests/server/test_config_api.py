@@ -164,7 +164,10 @@ def test_presets_endpoint_lists_documented_and_custom_kinds(client):
 
     assert response.status_code == 200
     names = {preset["name"] for preset in response.json()["presets"]}
-    assert {"deepseek", "kimi", "glm", "fake"} <= names
+    assert {"deepseek", "kimi", "glm"} <= names
+    # fake 不作为预设提供（没有可填的内容）：即使默认 providers 表里存在，
+    # 预设接口也不返回它——离线走 model.provider 显式选择或协议类型下拉。
+    assert "fake" not in names
     deepseek = next(p for p in response.json()["presets"] if p["name"] == "deepseek")
     assert FAKE_KEY not in json.dumps(deepseek)
 

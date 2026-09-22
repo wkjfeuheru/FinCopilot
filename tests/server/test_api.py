@@ -230,7 +230,7 @@ def make_client(provider=None, data_access=None, tmp_path=None) -> TestClient:
     )
     from tests.server.conftest import authed_client
 
-    client = TestClient(create_app(provider, data_access=data_access, settings=settings))
+    client = TestClient(create_app(provider, data_access=data_access, settings=settings, single_tenant=True))
     return authed_client(client)
 
 
@@ -312,6 +312,11 @@ def test_tools_endpoint_lists_m1_financial_tools() -> None:
             "get_macro_indicators",
             "get_industry_perf",
             "get_industry_constituents",
+            "list_fuyao_datasets",
+            "query_a_share_data",
+            "query_fund_data",
+            "query_futures_data",
+            "query_options_data",
             "calc_metrics",
             "calc_valuation",
             "run_backtest",
@@ -426,6 +431,7 @@ def test_cancelling_the_stream_cancels_the_loop_task_and_frees_the_session(
         asgi_app = create_app(
             provider,
             data_access=data,
+            single_tenant=True,
             settings=Settings(
                 data={"cache_dir": tmp_path / "cache"},
                 paths={

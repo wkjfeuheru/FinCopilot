@@ -162,6 +162,9 @@ def create_config_router(
 
     @router.get("/presets")
     async def list_presets(user=Depends(require_user) if require_user else None) -> dict[str, list[dict[str, Any]]]:
+        # fake 不作为预设提供：它没有可填的 base_url/key，一键填入毫无内容，
+        # 反而让人误以为"选了就能用"。离线运行走 model.provider="fake" 的显式
+        # 选择，或协议类型下拉里的"离线 Fake"——那是类型，不是预设。
         presets = [
             {
                 "name": name,
@@ -171,6 +174,7 @@ def create_config_router(
                 "has_env_key": bool(preset.env_key and os.getenv(preset.env_key)),
             }
             for name, preset in settings.providers.items()
+            if preset.kind != "fake"
         ]
         return {"presets": presets}
 

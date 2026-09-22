@@ -435,6 +435,14 @@ class Observer:
                     duration_s=span.duration_s(),
                     model=payload.get("model", ""),
                 )
+                run_finished = getattr(self.metrics, "run_finished", None)
+                if callable(run_finished):
+                    attrs = span.attributes
+                    run_finished(
+                        status=payload["status"] or "unknown",
+                        reason=str(attrs.get("reason") or "unknown"),
+                        rounds=attrs.get("rounds"),
+                    )
             elif kind == "llm_finished":
                 span: Span = payload["span"]
                 usage = span._usage

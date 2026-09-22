@@ -49,8 +49,8 @@ from finharness.data.adapters.pdf_fetch import extract_pdf_pages
 from finharness.data.raw import RawData
 from finharness.tools.base import BaseTool
 from finharness.tools.declare import Capability, Tier, ToolGroup, tool
-from finharness.tools.generic.fencing import EXTERNAL_NOTICE
-from finharness.tools.generic.files import _resolve_within
+from finharness.tools.generic.fencing import EXTERNAL_NOTICE, neutralize
+from finharness.workspace import Workspace
 
 # 结果声明一个较宽的预算：它要容纳一份全局摘要 + 分片索引 + 路径，但仍是有界的。
 _RESULT_TOKENS = 4000
@@ -179,13 +179,7 @@ class SummarizeDocumentTool(BaseTool):
         """
         if text and text.strip():
             return text, None, None
-        settings = self.data.settings
-        roots = [
-            Path(settings.paths.output_dir).resolve(),
-            (Path(settings.data.cache_dir) / "pdf").resolve(),
-            (Path(settings.data.cache_dir) / "parquet").resolve(),
-        ]
-        target = _resolve_within(path or "", roots)
+        target = Workspace(self.data.settings).resolve_read(path or "")
         if not target.is_file():
             raise ValueError(f"文件不存在：{path}")
         if target.suffix.lower() == ".pdf":
@@ -379,7 +373,9 @@ class SummarizeDocumentTool(BaseTool):
         verify: list[str] | None = None,
     ) -> RawData:
         """把摘要、核对结果、分片索引与句柄组装成有界文本。"""
-        lines = [EXTERNAL_NOTICE, "", f"# 文档摘要：{title}", ""]
+        # 标题取自文档原文首行，与正文一样是第三方文本；围栏外的标题位若能携带
+        # 伪造标签，会稀释"围栏内才是引文"的边界，因此同样中和。
+        lines = [EXTERNAL_NOTICE, "", f"# 文档摘要：{neutralize(title)}", ""]
         if note:
             lines.append(note)
             lines.append("")

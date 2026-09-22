@@ -42,6 +42,8 @@ const TOOL_ACTIONS: Record<string, string> = {
   write_report: "生成研究报告并复核",
   web_search: "检索公开资料",
   read_file: "读取研究材料",
+  read_pdf: "精读研报正文",
+  summarize_document: "生成文档摘要",
   write_file: "保存研究文件",
   research_plan: "制定研究计划",
   update_plan_step: "更新计划进度",

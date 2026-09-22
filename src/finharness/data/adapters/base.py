@@ -93,3 +93,9 @@ class DataAdapter(ABC):
         self, query: str, top_n: int, topic: str | None, time_range: str | None
     ) -> FetchResult:
         raise NotImplementedError
+
+    # 通用数据集取数：面向那些没有对应语义方法的长尾端点（特色数据、基金/期货/
+    # 期权）。同花顺这类以"数据集目录"暴露能力的源经此进入同一条缓存与溯源链路，
+    # 而无需为上游的每个端点各加一个方法。
+    def fetch_dataset(self, service: str, dataset: str, params: dict) -> FetchResult:
+        raise NotImplementedError

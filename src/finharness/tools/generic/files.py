@@ -6,6 +6,10 @@
 预算，返回的内容不会比取数时更多。``write_file`` 只有在允许的根目录内才无需确认即可
 通过权限门禁。
 
+**可达性由 ``workspace`` 决定，本模块不再自行拼路径。** 此前这组根在六个地方各写
+一遍（本模块的读/写、``read_pdf``、``summarize_document``、产物端点、权限门），
+它们靠巧合保持一致；收敛之后只有一个来源，工具与门不可能得出不同结论。
+
 **所有文件 I/O 都在线程中执行。** 循环用 ``asyncio.wait_for`` 施加工具超时，而它只能
 取消会在 await 点让出的协程：直接在 async 函数里做同步 ``read_text``/``read_parquet``
 会让超时形同虚设，并在阻塞期间占住整个事件循环——多租户下一个大文件即可让所有租户
@@ -20,6 +24,7 @@ from pathlib import Path
 from finharness.data.raw import RawData
 from finharness.tools.base import BaseTool
 from finharness.tools.declare import Capability, ToolGroup, param, tool
+from finharness.workspace import Workspace
 
 MAX_READ_BYTES = 200_000
 # 写入上限。与读取的 200_000 字符对齐：允许写的比允许读回的多没有意义，
@@ -28,37 +33,6 @@ MAX_WRITE_BYTES = 200_000
 # parquet 需要单独的字节上限：它按数据框读取，不经过文本截断那条路径，
 # 一个超大文件会在解码阶段就吃掉大量内存。
 MAX_PARQUET_BYTES = 64 * 1024 * 1024
-
-
-def _resolve_within(raw: str, roots: list[Path]) -> Path:
-    """解析路径并要求其保持在某个允许的根目录之内。"""
-    target = Path(raw).resolve()
-    for root in roots:
-        try:
-            if target == root or target.is_relative_to(root):
-                return target
-        except (OSError, ValueError):
-            continue
-    allowed = "、".join(str(root) for root in roots)
-    raise ValueError(f"路径超出允许范围（仅限 {allowed}）：{raw}")
-
-
-def _roots_for(settings) -> list[Path]:
-    """读取类工具的允许根：产物目录与该用户的缓存 parquet 子树。"""
-    return [
-        Path(settings.paths.output_dir).resolve(),
-        (Path(settings.data.cache_dir) / "parquet").resolve(),
-    ]
-
-
-def _write_root_for(settings) -> Path:
-    """写类工具的唯一允许根：产物目录。
-
-    缓存 parquet 子树对读取开放（复核子代理按句柄重读载荷），但对写入
-    关闭：缓存的 lookup 键对所有用户共享，一次模型侧的写入就能替换另一
-    个用户稍后命中的载荷——这是缓存投毒，而不是产物产出。
-    """
-    return Path(settings.paths.output_dir).resolve()
 
 
 @tool(
@@ -76,8 +50,7 @@ class ReadFileTool(BaseTool):
     @param("path", desc="待读取的文件路径（限 output/ 与 data_cache/ 目录内）")
     async def _dispatch(self, *, path: str) -> RawData:
         """读取允许目录内的文件；parquet 读为数据框，其余按文本读取（截断到 MAX_READ_BYTES）。"""
-        settings = self.data.settings
-        target = _resolve_within(path, _roots_for(settings))
+        target = Workspace(self.data.settings).resolve_read(path)
         if not await asyncio.to_thread(target.is_file):
             raise ValueError(f"文件不存在：{path}")
         suffix = target.suffix.lower()
@@ -131,8 +104,7 @@ class WriteFileTool(BaseTool):
     @param("content", desc="写入内容")
     async def _dispatch(self, *, path: str, content: str) -> RawData:
         """将内容写入允许目录内的文件（自动创建父目录），返回写入路径与字符数。"""
-        settings = self.data.settings
-        target = _resolve_within(path, [_write_root_for(settings)])
+        target = Workspace(self.data.settings).resolve_write(path)
         if len(content) > MAX_WRITE_BYTES:
             raise ValueError(
                 f"写入内容过大（{len(content)} 字符，上限 {MAX_WRITE_BYTES}）"

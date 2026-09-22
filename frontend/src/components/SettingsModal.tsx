@@ -18,6 +18,10 @@ const KIND_LABELS: Record<string, string> = {
   fake: "离线 Fake",
 };
 
+// 预设下拉里的固定入口：选中后清空自动填充，所有字段手填。
+// 不与后端预设名冲突的前缀，保证 presets 接口将来返回同名项也不会撞车。
+const CUSTOM_PRESET = "__custom__";
+
 type FormValues = {
   preset?: string;
   name: string;
@@ -69,6 +73,18 @@ export function SettingsModal({ open, onClose, refreshConfig }: Props) {
   }, [open]);
 
   function applyPreset(name: string) {
+    if (name === CUSTOM_PRESET) {
+      // 自定义配置：清空自动填充，回到纯手填。协议类型回落到默认值，
+      // 让用户从"协议类型"下拉重新选择（含"离线 Fake"）。
+      form.setFieldsValue({
+        preset: CUSTOM_PRESET,
+        name: "",
+        kind: "openai_compat",
+        base_url: undefined,
+        model: "",
+      });
+      return;
+    }
     const preset = presets.find((item) => item.name === name);
     if (!preset) return;
     form.setFieldsValue({
@@ -239,11 +255,14 @@ export function SettingsModal({ open, onClose, refreshConfig }: Props) {
             <Form.Item name="preset" label="供应商预设" style={{ minWidth: 220 }}>
               <Select
                 allowClear
-                placeholder="选择预设自动填充"
-                options={presets.map((preset) => ({
-                  value: preset.name,
-                  label: `${preset.name}（${KIND_LABELS[preset.kind] ?? preset.kind}${preset.has_env_key ? " · 环境变量可用" : ""}）`,
-                }))}
+                placeholder="选择预设自动填写，或选自定义手动填写"
+                options={[
+                  ...presets.map((preset) => ({
+                    value: preset.name,
+                    label: `${preset.name}（${KIND_LABELS[preset.kind] ?? preset.kind}${preset.has_env_key ? " · 环境变量可用" : ""}）`,
+                  })),
+                  { value: CUSTOM_PRESET, label: "自定义配置（手动填写）" },
+                ]}
                 onChange={(value: string | undefined) => value && applyPreset(value)}
               />
             </Form.Item>

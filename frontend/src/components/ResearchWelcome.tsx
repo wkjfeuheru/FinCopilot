@@ -64,7 +64,7 @@ export function ResearchWelcome({ onUsePrompt }: ResearchWelcomeProps) {
           <span className="research-kicker">RESEARCH ENTRY</span>
           <h2>选择研究场景</h2>
         </div>
-        <span>点击示例填入问题</span>
+        <span>点击示例直接开始研究</span>
       </div>
       <div className="research-scenarios">
         {SCENARIOS.map((scenario) => (
@@ -75,7 +75,7 @@ export function ResearchWelcome({ onUsePrompt }: ResearchWelcomeProps) {
             </div>
             <p>{scenario.summary}</p>
             <button type="button" onClick={() => onUsePrompt(scenario.prompt)}>
-              <span>示例问题</span>
+              <span>开始研究</span>
               {scenario.prompt}
             </button>
           </article>
