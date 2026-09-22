@@ -1,0 +1,4 @@
+# 容器入口脚本必须是 LF：CRLF 会让 sh 解释器把 \r 当作文件名一部分，
+# 容器启动直接失败（"no such file or directory"）。Windows 开发机
+# core.autocrlf=true 时靠本文件保住脚本的 LF。
+*.sh text eol=lf
