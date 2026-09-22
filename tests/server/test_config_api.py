@@ -154,6 +154,30 @@ def test_activate_switches_configs_and_marks_single_active(client):
     assert active_flags[first["id"]] is False
 
 
+def test_remote_activate_rejects_legacy_non_preset_provider_url(remote_client, store):
+    legacy = store.create(
+        name="legacy-local",
+        kind="openai_compat",
+        base_url="https://169.254.169.254/v1",
+        model="deepseek-chat",
+        env_key=None,
+        api_key=FAKE_KEY,
+        activate=False,
+        user_id=remote_client.finharness_user["id"],
+    )
+
+    response = remote_client.post(f"/v1/config/{legacy.id}/activate")
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["errors"] == [
+        {
+            "field": "base_url",
+            "message": "远程部署只允许使用运维预设的 Provider 地址",
+        }
+    ]
+    assert remote_client.get("/v1/config").json()["active_id"] is None
+
+
 def test_update_without_key_keeps_the_stored_secret(client, store):
     created = client.post("/v1/config", json=create_payload()).json()["config"]
 

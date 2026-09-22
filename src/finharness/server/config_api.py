@@ -259,6 +259,15 @@ def create_config_router(
     ) -> dict[str, Any]:
         """激活指定配置，使其成为该用户解析器当前使用的 provider。"""
         user_id = user.id if user is not None else ""
+        existing = store().get(config_id, user_id=user_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="配置不存在")
+        url_error = validate_user_provider_url(existing.base_url, existing.kind, settings)
+        if url_error is not None:
+            raise HTTPException(
+                status_code=422,
+                detail={"errors": [{"field": "base_url", "message": url_error}]},
+            )
         try:
             record = store().activate(config_id, user_id=user_id)
         except ConfigNotFound as exc:

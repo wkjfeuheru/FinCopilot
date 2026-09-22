@@ -12,6 +12,7 @@ from finharness.config.settings import ProviderSettings, Settings
 from finharness.config.store import ConfigStore, ProviderConfigRecord
 from finharness.provider.base import Provider
 from finharness.provider.registry import build_provider_from_fields
+from finharness.server.provider_policy import validate_user_provider_url
 
 
 class NotConfigured(RuntimeError):
@@ -110,6 +111,9 @@ class ProviderResolver:
 
     def _from_database(self, active: ProviderConfigRecord, *, user_id: str) -> Provider:
         """根据数据库中的激活记录构建（并缓存）provider。"""
+        url_error = validate_user_provider_url(active.base_url, active.kind, self._settings)
+        if url_error is not None:
+            raise NotConfigured(url_error)
         cache_key = ("database", user_id, active.id, active.updated_at)
         if self._cached_key == cache_key and self._cached_provider is not None:
             return self._cached_provider

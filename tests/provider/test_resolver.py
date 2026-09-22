@@ -41,6 +41,26 @@ def test_resolver_prefers_the_active_database_config(store, monkeypatch):
     assert provider.api_key == FAKE_KEY
 
 
+def test_remote_resolver_rejects_legacy_active_non_preset_url(store):
+    store.create(
+        name="legacy-local",
+        kind="openai_compat",
+        base_url="https://169.254.169.254/v1",
+        model="custom-model",
+        env_key=None,
+        api_key=FAKE_KEY,
+        activate=True,
+    )
+    settings = Settings(server={"host": "0.0.0.0", "allow_remote": True})
+    resolver = build_resolver(store, settings)
+
+    with pytest.raises(
+        NotConfigured,
+        match="远程部署只允许使用运维预设的 Provider 地址",
+    ):
+        resolver.current()
+
+
 def test_resolver_falls_back_to_settings_preset_and_environment(store, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "env-value")
     resolver = build_resolver(store, Settings())
