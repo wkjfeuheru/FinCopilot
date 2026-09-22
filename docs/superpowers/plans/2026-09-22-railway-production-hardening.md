@@ -198,5 +198,5 @@ Expected: 全部通过。提交信息：docs: 更新 Railway 生产部署说明�
 ## Plan Self-Review
 
 * Task 1 覆盖 SSRF 和 HTTPS；Task 2 覆盖 ready 与安全 Cookie；Task 3 覆盖 Docker、Volume、单 worker；Task 4 覆盖备份；Task 5 覆盖 CI 和质量门禁；Task 6 覆盖演练与文档。
-* 没有 TBD、TODO 或“以后实现”占位符。
+* 所有任务均指定了目标文件、验证命令与验收结果。
 * Provider 策略只经 Settings 和 Config API 使用；备份工具不暴露 HTTP 路由；就绪检查只依赖既有 SQLite store。
