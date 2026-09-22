@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from finharness.auth.store import UserStore
+from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings, SettingsError
 from finharness.config.store import ConfigStore
 from finharness.context.memory.store import MemoryStore
@@ -294,6 +295,21 @@ def test_ready_returns_503_when_audit_parent_is_not_writable(
     assert response.json() == {"status": "not_ready"}
 
 
+def test_ready_returns_503_when_audit_parent_check_raises(
+    tmp_path, monkeypatch
+) -> None:
+    def fail_access(*_args) -> bool:
+        raise OSError("filesystem unavailable")
+
+    client = _ready_client(tmp_path)
+    monkeypatch.setattr("finharness.server.api.os.access", fail_access)
+
+    response = client.get("/v1/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+
+
 def test_ready_returns_503_when_config_store_cannot_be_opened(
     tmp_path, monkeypatch
 ) -> None:
@@ -307,6 +323,77 @@ def test_ready_returns_503_when_config_store_cannot_be_opened(
 
     assert response.status_code == 503
     assert response.json() == {"status": "not_ready"}
+
+
+def _trace_store_queries(monkeypatch, store) -> list[str]:
+    queries: list[str] = []
+    connect = store._connect
+
+    def traced_connect():
+        connection = connect()
+        connection.set_trace_callback(queries.append)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", traced_connect)
+    return queries
+
+
+def test_user_store_ping_uses_select_one_and_preserves_existing_users(
+    tmp_path, monkeypatch
+) -> None:
+    store = UserStore(tmp_path / "users.db")
+    issued = store.register("ping-user", "test-password")
+    before = store.get_user(issued.user.id)
+    queries = _trace_store_queries(monkeypatch, store)
+
+    result = store.ping()
+
+    assert result is None
+    assert queries == ["SELECT 1"]
+    assert store.count_users() == 1
+    assert store.get_user(issued.user.id) == before
+
+
+def test_memory_store_ping_uses_select_one_and_preserves_existing_conversations(
+    tmp_path, monkeypatch
+) -> None:
+    store = MemoryStore(tmp_path / "memory.db")
+    before = store.ensure_conversation("ping-conversation", user_id="ping-user")
+    queries = _trace_store_queries(monkeypatch, store)
+
+    result = store.ping()
+
+    assert result is None
+    assert queries == ["SELECT 1"]
+    assert store.get_conversation("ping-conversation", user_id="ping-user") == before
+
+
+def test_config_store_ping_uses_select_one_and_preserves_existing_provider_configs(
+    tmp_path, monkeypatch
+) -> None:
+    store = ConfigStore(
+        tmp_path / "config.db",
+        cipher=SecretCipher(tmp_path / "secret.key"),
+    )
+    created = store.create(
+        name="ping-provider",
+        kind="openai_compat",
+        base_url="https://example.test/v1",
+        model="test-model",
+        env_key=None,
+        api_key="test-secret",
+        activate=True,
+        user_id="ping-user",
+    )
+    before = store.list_configs(user_id="ping-user")
+    queries = _trace_store_queries(monkeypatch, store)
+
+    result = store.ping()
+
+    assert result is None
+    assert queries == ["SELECT 1"]
+    assert store.list_configs(user_id="ping-user") == before == [created]
+    assert store.resolve_key(created.id, user_id="ping-user") == "test-secret"
 
 
 def test_chat_stream_returns_session_and_answer_events() -> None:
@@ -562,6 +649,23 @@ def test_production_factory_runs_runtime_audit_validation(tmp_path) -> None:
     )
 
     with pytest.raises(SettingsError, match="审计日志父目录不可写"):
+        create_production_app(settings_path)
+
+
+def test_production_factory_rejects_remote_insecure_cookie(tmp_path) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "model": {"provider": "fake"},
+                "server": {"host": "0.0.0.0", "allow_remote": True},
+                "auth": {"secure_cookie": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SettingsError, match="auth.secure_cookie"):
         create_production_app(settings_path)
 
 

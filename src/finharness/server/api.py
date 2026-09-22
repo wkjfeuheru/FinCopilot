@@ -648,10 +648,20 @@ def create_app(
 
     @application.get("/v1/ready")
     async def ready() -> JSONResponse:
+        def check_audit_log_parent() -> None:
+            audit_parent = settings.audit.log_path.parent
+            if (
+                not audit_parent.exists()
+                or not audit_parent.is_dir()
+                or not os.access(audit_parent, os.W_OK)
+            ):
+                raise PermissionError("audit log parent is not writable")
+
         checks = (
             ("user_store", user_store.ping),
             ("memory_store", memory_store.ping),
             ("config_store", lambda: store_factory().ping()),
+            ("audit_log_parent", check_audit_log_parent),
         )
         for dependency, check in checks:
             try:
@@ -668,24 +678,6 @@ def create_app(
                     status_code=503,
                     content={"status": "not_ready"},
                 )
-
-        audit_parent = settings.audit.log_path.parent
-        if (
-            not audit_parent.exists()
-            or not audit_parent.is_dir()
-            or not os.access(audit_parent, os.W_OK)
-        ):
-            get_logger("finharness.server.api").warning(
-                "readiness_check_failed",
-                extra={
-                    "dependency": "audit_log_parent",
-                    "error_type": "PermissionError",
-                },
-            )
-            return JSONResponse(
-                status_code=503,
-                content={"status": "not_ready"},
-            )
         return JSONResponse(content={"status": "ready"})
 
     metrics_recorder = getattr(observer, "metrics", None)
