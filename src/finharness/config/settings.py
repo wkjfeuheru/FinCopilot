@@ -635,6 +635,15 @@ class Settings(BaseSettings):
             raise SettingsError(
                 "server.allow_remote=true 时 permission.default_mode 必须为 default"
             )
+        if self.server.allow_remote:
+            for name, configured_provider in self.providers.items():
+                if configured_provider.kind == "fake":
+                    continue
+                parsed = urlparse(configured_provider.base_url or "")
+                if parsed.scheme != "https":
+                    raise SettingsError(
+                        f"Provider {name}：远程部署的 Provider 地址必须使用 HTTPS"
+                    )
         if require_api_key and provider.kind != "fake":
             env_key = provider.env_key
             if env_key is None or not os.getenv(env_key):

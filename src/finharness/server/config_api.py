@@ -11,7 +11,6 @@ import os
 import time
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -29,6 +28,7 @@ from finharness.provider.base import Provider
 from finharness.provider.errors import ProviderError
 from finharness.provider.registry import build_provider_from_fields
 from finharness.provider.resolver import ProviderResolver
+from finharness.server.provider_policy import validate_user_provider_url
 from finharness.types import ModelUsage, Msg, StreamEvent
 
 SUPPORTED_KINDS = {"openai_compat", "anthropic_compat", "fake"}
@@ -55,7 +55,10 @@ class ProbePayload(BaseModel):
     config_id: int | None = None
 
 
-def _field_errors(payload: ConfigPayload | ProbePayload) -> list[dict[str, str]]:
+def _field_errors(
+    payload: ConfigPayload | ProbePayload,
+    settings: Settings,
+) -> list[dict[str, str]]:
     """校验配置/探测载荷的字段，返回字段级错误列表。"""
     errors: list[dict[str, str]] = []
     if isinstance(payload, ConfigPayload) and not payload.name.strip():
@@ -64,15 +67,9 @@ def _field_errors(payload: ConfigPayload | ProbePayload) -> list[dict[str, str]]
         errors.append({"field": "model", "message": "模型名称不能为空"})
     if payload.kind not in SUPPORTED_KINDS:
         errors.append({"field": "kind", "message": f"不支持的协议类型：{payload.kind}"})
-    if payload.kind != "fake":
-        if not payload.base_url or not payload.base_url.strip():
-            errors.append({"field": "base_url", "message": "base_url 不能为空"})
-        else:
-            parsed = urlparse(payload.base_url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                errors.append(
-                    {"field": "base_url", "message": "base_url 必须是绝对 HTTP(S) URL"}
-                )
+    url_error = validate_user_provider_url(payload.base_url, payload.kind, settings)
+    if url_error is not None:
+        errors.append({"field": "base_url", "message": url_error})
     return errors
 
 
@@ -198,7 +195,7 @@ def create_config_router(
     ) -> dict[str, Any]:
         """校验并新建一份 provider 配置，成功后失效解析器缓存。"""
         user_id = user.id if user is not None else ""
-        errors = _field_errors(payload)
+        errors = _field_errors(payload, settings)
         if errors:
             raise HTTPException(status_code=422, detail={"errors": errors})
         if payload.kind != "fake" and not _effective_secret(store(), payload, config_id=None):
@@ -228,7 +225,7 @@ def create_config_router(
     ) -> dict[str, Any]:
         """更新指定配置；保留未重新提供的已存密钥并失效解析器缓存。"""
         user_id = user.id if user is not None else ""
-        errors = _field_errors(payload)
+        errors = _field_errors(payload, settings)
         if errors:
             raise HTTPException(status_code=422, detail={"errors": errors})
         if store().get(config_id, user_id=user_id) is None:
@@ -294,7 +291,7 @@ def create_config_router(
     ) -> dict[str, Any]:
         """探测一份配置的连通性，返回是否可用及延迟。"""
         user_id = user.id if user is not None else ""
-        errors = _field_errors(payload)
+        errors = _field_errors(payload, settings)
         if errors:
             raise HTTPException(status_code=422, detail={"errors": errors})
         if payload.kind == "fake":

@@ -293,6 +293,21 @@ def test_remote_binding_requires_default_permission_mode(tmp_path):
         )
 
 
+def test_remote_settings_reject_http_provider_url(tmp_path):
+    with pytest.raises(SettingsError, match="Provider 地址必须使用 HTTPS"):
+        Settings.from_file(
+            write_settings(
+                tmp_path,
+                {
+                    "server": {"host": "0.0.0.0", "allow_remote": True},
+                    "providers": {
+                        "deepseek": {"base_url": "http://api.example.test/v1"}
+                    },
+                },
+            )
+        )
+
+
 def test_local_binding_rejects_non_loopback_host(tmp_path):
     with pytest.raises(SettingsError, match="allow_remote"):
         Settings.from_file(write_settings(tmp_path, {"server": {"host": "0.0.0.0"}}))

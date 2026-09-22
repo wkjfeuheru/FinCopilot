@@ -25,6 +25,19 @@ def _settings(tmp_path) -> Settings:
     )
 
 
+def _remote_settings(tmp_path) -> Settings:
+    """构造远程部署设置，Provider 预设保持默认 HTTPS 地址。"""
+    return Settings(
+        data={"cache_dir": tmp_path / "cache"},
+        server={"host": "0.0.0.0", "allow_remote": True},
+        paths={
+            "output_dir": tmp_path / "output",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
+        },
+    )
+
+
 @pytest.fixture
 def store(tmp_path):
     return ConfigStore(tmp_path / "config.db", cipher=SecretCipher(tmp_path / "secret.key"))
@@ -33,6 +46,12 @@ def store(tmp_path):
 @pytest.fixture
 def client(store, tmp_path):
     app = create_app(settings=_settings(tmp_path), config_store=store)
+    return authed_client(TestClient(app))
+
+
+@pytest.fixture
+def remote_client(store, tmp_path):
+    app = create_app(settings=_remote_settings(tmp_path), config_store=store)
     return authed_client(TestClient(app))
 
 
@@ -90,6 +109,21 @@ def test_create_config_validates_required_fields(client):
     assert fields == {"model", "base_url"}
 
 
+def test_remote_create_rejects_non_preset_provider_url(remote_client):
+    response = remote_client.post(
+        "/v1/config",
+        json=create_payload(base_url="https://169.254.169.254/v1"),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["errors"] == [
+        {
+            "field": "base_url",
+            "message": "远程部署只允许使用运维预设的 Provider 地址",
+        }
+    ]
+
+
 def test_create_config_rejects_missing_key(client):
     response = client.post("/v1/config", json=create_payload(api_key=None, env_key=None))
 
@@ -133,6 +167,23 @@ def test_update_without_key_keeps_the_stored_secret(client, store):
     assert response.json()["config"]["has_key"] is True
     # 密钥按用户存储：直接查库要带上测试用户的归属。
     assert store.resolve_key(created["id"], user_id=client.finharness_user["id"]) == FAKE_KEY
+
+
+def test_remote_update_cannot_switch_to_non_preset_provider_url(remote_client):
+    created = remote_client.post("/v1/config", json=create_payload()).json()["config"]
+
+    response = remote_client.put(
+        f"/v1/config/{created['id']}",
+        json=create_payload(base_url="https://169.254.169.254/v1", api_key=None),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["errors"] == [
+        {
+            "field": "base_url",
+            "message": "远程部署只允许使用运维预设的 Provider 地址",
+        }
+    ]
 
 
 def test_delete_refuses_active_config_while_others_remain(client):
@@ -240,6 +291,26 @@ def test_probe_requires_a_key(client):
     body = response.json()
     assert body["ok"] is False
     assert "API Key" in body["error"]
+
+
+def test_remote_probe_rejects_non_preset_provider_url_before_network(remote_client):
+    response = remote_client.post(
+        "/v1/config/probe",
+        json={
+            "kind": "openai_compat",
+            "base_url": "https://169.254.169.254/v1",
+            "model": "m",
+            "api_key": FAKE_KEY,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["errors"] == [
+        {
+            "field": "base_url",
+            "message": "远程部署只允许使用运维预设的 Provider 地址",
+        }
+    ]
 
 
 def test_probe_accepts_fake_kind_without_network(client):
