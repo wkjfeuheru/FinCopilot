@@ -4,7 +4,10 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from finharness.auth.store import UserStore
 from finharness.config.settings import Settings, SettingsError
+from finharness.config.store import ConfigStore
+from finharness.context.memory.store import MemoryStore
 from finharness.data.access import DataAccess, RawData
 from finharness.data.adapters.base import DataAdapter
 from finharness.provider.base import Provider
@@ -239,6 +242,56 @@ def test_health_endpoint_returns_service_status() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def _ready_client(tmp_path) -> TestClient:
+    audit_parent = tmp_path / "logs"
+    audit_parent.mkdir()
+    settings = Settings(
+        data={"cache_dir": tmp_path / "cache"},
+        audit={"log_path": audit_parent / "audit.jsonl"},
+        paths={
+            "output_dir": tmp_path / "output",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
+            "config_db": tmp_path / "state" / "config.db",
+            "secret_key": tmp_path / "state" / "secret.key",
+        },
+    )
+    return TestClient(create_app(settings=settings))
+
+
+def test_ready_is_anonymous_when_persistent_stores_are_usable(tmp_path) -> None:
+    response = _ready_client(tmp_path).get("/v1/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
+@pytest.mark.parametrize("store_type", [UserStore, MemoryStore, ConfigStore])
+def test_ready_returns_503_when_a_persistent_store_is_unavailable(
+    tmp_path, monkeypatch, store_type
+) -> None:
+    def fail_ping(_store) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(store_type, "ping", fail_ping, raising=False)
+    response = _ready_client(tmp_path).get("/v1/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+
+
+def test_ready_returns_503_when_audit_parent_is_not_writable(
+    tmp_path, monkeypatch
+) -> None:
+    client = _ready_client(tmp_path)
+    monkeypatch.setattr("finharness.server.api.os.access", lambda *_args: False)
+
+    response = client.get("/v1/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
 
 
 def test_chat_stream_returns_session_and_answer_events() -> None:

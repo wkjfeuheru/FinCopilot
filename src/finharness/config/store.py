@@ -134,6 +134,11 @@ class ConfigStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def ping(self) -> None:
+        """确认配置数据库可建立连接并执行查询。"""
+        with self._connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")

@@ -123,6 +123,11 @@ class UserStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def ping(self) -> None:
+        """确认用户数据库可建立连接并执行查询。"""
+        with self._connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+
     # -- 用户 ------------------------------------------------------------------
     def count_users(self) -> int:
         with self._connect() as connection:

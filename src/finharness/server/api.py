@@ -1,6 +1,6 @@
 """FastAPI 应用与 M0 聊天路由。
 
-除 ``/v1/health``、``/v1/auth/*`` 与 ``/metrics`` 外，所有端点都要求
+除 ``/v1/health``、``/v1/ready``、``/v1/auth/*`` 与 ``/metrics`` 外，所有端点都要求
 认证，且所有数据访问都按当前用户隔离（docs 03.13）。
 """
 
@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -645,6 +645,48 @@ def create_app(
     @application.get("/v1/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @application.get("/v1/ready")
+    async def ready() -> dict[str, str] | Response:
+        checks = (
+            ("user_store", user_store.ping),
+            ("memory_store", memory_store.ping),
+            ("config_store", store_factory().ping),
+        )
+        for dependency, check in checks:
+            try:
+                check()
+            except Exception as exc:  # noqa: BLE001 - readiness 必须把依赖异常映射为 503
+                get_logger("finharness.server.api").warning(
+                    "readiness_check_failed",
+                    extra={
+                        "dependency": dependency,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={"status": "not_ready"},
+                )
+
+        audit_parent = settings.audit.log_path.parent
+        if (
+            not audit_parent.exists()
+            or not audit_parent.is_dir()
+            or not os.access(audit_parent, os.W_OK)
+        ):
+            get_logger("finharness.server.api").warning(
+                "readiness_check_failed",
+                extra={
+                    "dependency": "audit_log_parent",
+                    "error_type": "PermissionError",
+                },
+            )
+            return JSONResponse(
+                status_code=503,
+                content={"status": "not_ready"},
+            )
+        return {"status": "ready"}
 
     metrics_recorder = getattr(observer, "metrics", None)
     if metrics_recorder is not None:

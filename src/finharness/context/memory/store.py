@@ -515,6 +515,11 @@ class MemoryStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def ping(self) -> None:
+        """确认记忆数据库可建立连接并执行查询。"""
+        with self._connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+
     # -- 对话 ------------------------------------------------------------------
     def ensure_conversation(
         self, conversation_id: str, *, user_id: str = "", title: str | None = None

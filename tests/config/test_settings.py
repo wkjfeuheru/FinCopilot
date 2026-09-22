@@ -293,6 +293,19 @@ def test_remote_binding_requires_default_permission_mode(tmp_path):
         )
 
 
+def test_remote_binding_requires_secure_cookie(tmp_path):
+    with pytest.raises(SettingsError, match="auth.secure_cookie"):
+        Settings.from_file(
+            write_settings(
+                tmp_path,
+                {
+                    "server": {"host": "0.0.0.0", "allow_remote": True},
+                    "auth": {"secure_cookie": False},
+                },
+            )
+        )
+
+
 def test_remote_settings_reject_http_provider_url(tmp_path):
     with pytest.raises(SettingsError, match="Provider 地址必须使用 HTTPS"):
         Settings.from_file(

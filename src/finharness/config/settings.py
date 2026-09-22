@@ -644,6 +644,10 @@ class Settings(BaseSettings):
                     raise SettingsError(
                         f"Provider {name}：远程部署的 Provider 地址必须使用 HTTPS"
                     )
+            if not self.auth.secure_cookie:
+                raise SettingsError(
+                    "server.allow_remote=true 时 auth.secure_cookie 必须为 true"
+                )
         if require_api_key and provider.kind != "fake":
             env_key = provider.env_key
             if env_key is None or not os.getenv(env_key):
