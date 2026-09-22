@@ -317,8 +317,28 @@ def test_probe_requires_a_key(client):
     assert "API Key" in body["error"]
 
 
-def test_remote_probe_rejects_non_preset_provider_url_before_network(remote_client):
-    response = remote_client.post(
+def test_remote_probe_rejects_non_preset_provider_url_before_network(tmp_path):
+    factory_calls: list[tuple[float, float]] = []
+    transport_calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        transport_calls.append(request)
+        raise AssertionError("拒绝非法 Provider 地址前不应发起网络请求")
+
+    def client_factory(first_byte: float, idle: float) -> httpx.AsyncClient:
+        factory_calls.append((first_byte, idle))
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    app = create_app(
+        settings=_remote_settings(tmp_path),
+        config_store=ConfigStore(
+            tmp_path / "probe.db", cipher=SecretCipher(tmp_path / "probe.key")
+        ),
+        probe_client_factory=client_factory,
+    )
+    probe_client = authed_client(TestClient(app))
+
+    response = probe_client.post(
         "/v1/config/probe",
         json={
             "kind": "openai_compat",
@@ -335,6 +355,8 @@ def test_remote_probe_rejects_non_preset_provider_url_before_network(remote_clie
             "message": "远程部署只允许使用运维预设的 Provider 地址",
         }
     ]
+    assert factory_calls == []
+    assert transport_calls == []
 
 
 def test_probe_accepts_fake_kind_without_network(client):
