@@ -1,0 +1,44 @@
+# 密钥与状态：绝不进入镜像（构建上下文越完整，误复制的代价越高）。
+# settings.json 含本地真实密钥（fuyao/tavily 等），只允许 FINH_* Variables 注入。
+settings.json
+state/
+state.bak/
+data_cache/
+data_cache.bak/
+logs/
+output/
+evals/runs/
+
+# 本地工具链与缓存
+.git/
+.github/
+.venv/
+.zcode/
+.superpowers/
+.workbuddy/
+.mimosa/
+.pytest_cache/
+.pytest-tmp*/
+.ruff_cache/
+.mypy_cache/
+.tmp/
+__pycache__/
+*.py[cod]
+*.egg-info/
+node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+*.bak
+
+# 容器栈自身的编排文件不需要进入镜像；entrypoint 脚本除外（Dockerfile COPY 它）
+docker-compose.observability.yml
+ops/*
+!ops/docker-entrypoint.sh
+railway.toml
+Dockerfile
+.dockerignore
+
+# 本地 IDE / OS 杂项
+.env
+.env.*
+*.tsbuildinfo

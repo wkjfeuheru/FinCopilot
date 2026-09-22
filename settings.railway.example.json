@@ -1,0 +1,208 @@
+{
+  "model": {
+    "provider": "deepseek",
+    "model_name": "deepseek-chat",
+    "temperature": 0.1,
+    "max_tokens": 4096,
+    "thinking": {
+      "enabled": true,
+      "budget_tokens": 2048
+    }
+  },
+  "providers": {
+    "deepseek": {
+      "kind": "openai_compat",
+      "base_url": "https://api.deepseek.com/v1",
+      "env_key": "DEEPSEEK_API_KEY",
+      "api_version": null,
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0
+    },
+    "kimi": {
+      "kind": "anthropic_compat",
+      "base_url": "https://api.moonshot.cn/anthropic/v1",
+      "env_key": "MOONSHOT_API_KEY",
+      "api_version": "2023-06-01",
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0
+    },
+    "glm": {
+      "kind": "anthropic_compat",
+      "base_url": "https://open.bigmodel.cn/api/anthropic/v1",
+      "env_key": "ZHIPU_API_KEY",
+      "api_version": "2023-06-01",
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0
+    },
+    "volcano": {
+      "kind": "openai_compat",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "env_key": "ARK_API_KEY",
+      "api_version": null,
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0
+    },
+    "qwen": {
+      "kind": "openai_compat",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "env_key": "DASHSCOPE_API_KEY",
+      "api_version": null,
+      "first_byte_timeout_s": 30.0,
+      "idle_timeout_s": 60.0
+    }
+  },
+  "permission": {
+    "default_mode": "default"
+  },
+  "tools": {
+    "timeout_default_s": 30,
+    "timeout_overrides": {},
+    "result_token_overrides": {},
+    "resident": [],
+    "lazy": []
+  },
+  "data": {
+    "adapter_order": [
+      "fuyao",
+      "akshare",
+      "tushare",
+      "baostock"
+    ],
+    "tushare_token_env": "TUSHARE_TOKEN",
+    "throttle_seconds": 1.0,
+    "cache_dir": "/data/data_cache",
+    "cache_ttl_days": {
+      "quote": 1,
+      "kline": 1,
+      "indicators": 7,
+      "financials": 365,
+      "announcements": 7,
+      "macro": 7,
+      "industry": 1,
+      "dataset": 1
+    }
+  },
+  "context": {
+    "max_turns": 30,
+    "compaction_ratio": 0.8,
+    "trim_rows": 20,
+    "max_result_tokens": 1000,
+    "compaction_result_tokens": 500,
+    "max_tool_schema_tokens": 60,
+    "short_mem_cap": 200,
+    "recall_max_tokens": 400,
+    "summary_inject_max_tokens": 600,
+    "max_loaded_rounds": 200,
+    "max_window_rounds": 40
+  },
+  "ltm": {
+    "distill_idle_s": 1800,
+    "distill_batch": 3,
+    "distill_max_attempts": 3,
+    "recent_episodes": 5,
+    "inject_max_tokens": 600,
+    "recall_max_tokens": 400,
+    "retention_episodes": 500,
+    "retention_days": 365,
+    "distill_semantics": true,
+    "retention_facts": 300,
+    "retention_facts_days": 730,
+    "semantic_top_k": 5,
+    "semantic_inject_max_tokens": 400,
+    "embeddings": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "env_key": "DASHSCOPE_API_KEY",
+      "model_name": "text-embedding-v4",
+      "timeout_s": 30.0
+    },
+    "vector_db": {
+      "kind": "qdrant",
+      "url": null,
+      "collection": "finharness_semantics",
+      "api_key_env": null,
+      "timeout_s": 10.0,
+      "dim": 0
+    }
+  },
+  "audit": {
+    "log_path": "/data/logs/audit.jsonl"
+  },
+  "observability": {
+    "logging": {
+      "level": "INFO",
+      "json_format": true,
+      "path": null,
+      "capture_payloads": false,
+      "max_payload_chars": 4000
+    },
+    "metrics": {
+      "enabled": false
+    },
+    "tracing": {
+      "enabled": false,
+      "backend": "langsmith",
+      "project": "finharness",
+      "env_key": "LANGSMITH_API_KEY",
+      "capture_payloads": false
+    },
+    "trace_store": {
+      "enabled": false,
+      "db_path": "/data/state/trace.db",
+      "admin_users": [],
+      "capture_payloads": false,
+      "retention_days": 90
+    }
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "session_ttl_s": 1800,
+    "confirm_ttl_s": 120,
+    "busy_timeout_s": 3600,
+    "user_cache_size": 64,
+    "allow_remote": true
+  },
+  "auth": {
+    "token_ttl_s": 1209600,
+    "min_password_len": 8,
+    "secure_cookie": true,
+    "allow_register": false,
+    "login_max_attempts": 10,
+    "login_window_s": 300,
+    "register_max_attempts": 5,
+    "register_window_s": 3600,
+    "claim_legacy_on_first_register": false
+  },
+  "quota": {
+    "turns_per_window": 600,
+    "window_s": 3600,
+    "max_concurrent_streams": 0
+  },
+  "paths": {
+    "output_dir": "/data/output",
+    "state_dir": "/data/state",
+    "memory_db": "/data/state/memory.db",
+    "auth_db": "/data/state/users.db",
+    "config_db": "/data/state/config.db",
+    "secret_key": "/data/state/secret.key"
+  },
+  "search": {
+    "kind": "tavily",
+    "base_url": "https://api.tavily.com",
+    "env_key": "TAVILY_API_KEY",
+    "timeout_s": 30.0,
+    "api_key": null,
+    "proxy": null,
+    "local_pdf_fallback": true
+  },
+  "fuyao": {
+    "enabled": true,
+    "kind": "mcp",
+    "base_url": "https://fuyao.aicubes.cn",
+    "env_key": "HITHINK_FINANCE_API_KEY",
+    "timeout_s": 30.0,
+    "api_key": null,
+    "proxy": null,
+    "catalog_ttl_s": 300.0
+  }
+}

@@ -70,6 +70,32 @@ python scripts/demo.py --demo b --json    # 只跑 Demo B，输出机器可读�
 
 `demo.py` 走的是与浏览器完全相同的 HTTP/SSE 接口，包括写工具的确认往返，因此它同时是一次接口验收。
 
+### Railway 部署（远程模式）
+
+单 service、单 replica、单 Uvicorn worker。仓库已含发布物：`Dockerfile`（多阶段：
+Node 构建前端 → `uv sync --locked` 装依赖 → 非 root 运行）、`railway.toml`（健康检查
+`/v1/ready`）、`settings.railway.example.json`（无密钥的远程模式配置，构建时烘焙为镜像内
+`settings.json`，所有状态路径指向 `/data`）。入口脚本 `ops/docker-entrypoint.sh` 以 root
+启动仅为接管 root 挂载的 Volume，`chown` 后立即降权到 `app` 用户。
+
+控制台操作要点：
+
+1. 新建项目并连接 GitHub 仓库，Railway 按 `railway.toml` 用 Dockerfile 构建并自动部署
+   main 分支。
+2. 为 service 挂载 Volume 到 `/data`（属主由 entrypoint 自动接管），账号、会话、加密配置
+   与产物都落在其中；**replica 保持 1**——状态是进程内 SQLite，多副本会分叉。
+3. Variables 至少配置：`FINH_SERVER_PORT=$PORT`（引用 Railway 注入的端口）、
+   `FINH_SERVER_HOST=0.0.0.0`、`FINH_SERVER_ALLOW_REMOTE=true`、
+   `FINH_AUTH_SECURE_COOKIE=true`，以及所选 Provider 的密钥（如 `DEEPSEEK_API_KEY`）。
+   只接受白名单内的 `FINH_*` 变量，未知变量会导致启动失败（这是有意的）。
+   是否开放注册由 `FINH_AUTH_ALLOW_REGISTER` 决定（镜像默认关闭）。
+4. 生成域名后即可访问；Railway 终止 TLS，`/v1/ready` 返回 200 即部署成功。
+
+远程模式的安全约束（启动时强制校验）：所有非 fake Provider 必须 HTTPS、
+`auth.secure_cookie=true`、`permission.default_mode=default`；用户在前端配置页只能
+选择 `settings.providers` 里预设的 Provider 地址（SSRF 防护），自有密钥经 Fernet 加密
+存储在 Volume 中。
+
 ## 支持的 Provider
 
 | Provider | 协议 | 密钥环境变量 |
@@ -210,7 +236,8 @@ frontend/           React 19 + TypeScript + antd
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/v1/health` | 健康检查 |
+| GET | `/v1/health` | 健康检查（liveness） |
+| GET | `/v1/ready` | 就绪检查：三个 SQLite store ping + 审计目录可写；失败返回 503（Railway 部署健康探针） |
 | POST | `/v1/chat/stream` | 流式对话（SSE），主入口 |
 | POST | `/v1/chat/respond` | 回应写确认 / `ask_user` 提问 |
 | POST | `/v1/chat/stop` | 停止当前生成（协作式；保留已取得的数据与结论，可继续） |

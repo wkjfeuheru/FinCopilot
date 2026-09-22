@@ -1,0 +1,17 @@
+# Railway 服务定义（单 service、单 replica、单 worker，见
+# docs/superpowers/specs/2026-09-22-railway-production-hardening-design.md）。
+# 环境变量不在本文件配置：密钥与 FINH_* 覆盖项通过 Railway 控制台的
+# Variables 注入（FINH_SERVER_PORT 引用 Railway 的 $PORT）。
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# 就绪检查探针（Task 2 交付）：三个 SQLite store ping + 审计目录可写，
+# 任一失败返回 503，Railway 据此判定部署不健康。
+healthcheckPath = "/v1/ready"
+healthcheckTimeout = 300
+# 单副本是有意为之：状态是进程内 SQLite + /data Volume，多副本会分叉。
+# 不要在控制台提高 replica 数；扩容前先完成外部状态存储的迁移设计。
+replicas = 1
