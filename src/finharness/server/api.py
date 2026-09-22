@@ -647,11 +647,11 @@ def create_app(
         return {"status": "ok"}
 
     @application.get("/v1/ready")
-    async def ready() -> dict[str, str] | Response:
+    async def ready() -> JSONResponse:
         checks = (
             ("user_store", user_store.ping),
             ("memory_store", memory_store.ping),
-            ("config_store", store_factory().ping),
+            ("config_store", lambda: store_factory().ping()),
         )
         for dependency, check in checks:
             try:
@@ -686,7 +686,7 @@ def create_app(
                 status_code=503,
                 content={"status": "not_ready"},
             )
-        return {"status": "ready"}
+        return JSONResponse(content={"status": "ready"})
 
     metrics_recorder = getattr(observer, "metrics", None)
     if metrics_recorder is not None:

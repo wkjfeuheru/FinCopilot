@@ -258,7 +258,7 @@ def _ready_client(tmp_path) -> TestClient:
             "secret_key": tmp_path / "state" / "secret.key",
         },
     )
-    return TestClient(create_app(settings=settings))
+    return TestClient(create_app(settings=settings), raise_server_exceptions=False)
 
 
 def test_ready_is_anonymous_when_persistent_stores_are_usable(tmp_path) -> None:
@@ -289,6 +289,21 @@ def test_ready_returns_503_when_audit_parent_is_not_writable(
     monkeypatch.setattr("finharness.server.api.os.access", lambda *_args: False)
 
     response = client.get("/v1/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+
+
+def test_ready_returns_503_when_config_store_cannot_be_opened(
+    tmp_path, monkeypatch
+) -> None:
+    class UnavailableConfigStore:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise OSError("database cannot be opened")
+
+    monkeypatch.setattr("finharness.server.api.ConfigStore", UnavailableConfigStore)
+
+    response = _ready_client(tmp_path).get("/v1/ready")
 
     assert response.status_code == 503
     assert response.json() == {"status": "not_ready"}

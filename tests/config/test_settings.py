@@ -179,6 +179,7 @@ def test_single_underscore_environment_overrides_nested_and_path_fields(monkeypa
     monkeypatch.setenv("FINH_MODEL_THINKING_ENABLED", "false")
     monkeypatch.setenv("FINH_SERVER_ALLOW_REMOTE", "true")
     monkeypatch.setenv("FINH_SERVER_HOST", "0.0.0.0")
+    monkeypatch.setenv("FINH_AUTH_SECURE_COOKIE", "true")
     monkeypatch.setenv("FINH_PATHS_OUTPUT_DIR", "generated")
 
     settings = Settings.from_file(path)
@@ -186,6 +187,7 @@ def test_single_underscore_environment_overrides_nested_and_path_fields(monkeypa
     assert settings.model.thinking.enabled is False
     assert settings.server.allow_remote is True
     assert settings.server.host == "0.0.0.0"
+    assert settings.auth.secure_cookie is True
     assert settings.paths.output_dir == (tmp_path / "generated").resolve()
 
 
