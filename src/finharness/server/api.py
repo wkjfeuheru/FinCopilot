@@ -5,7 +5,9 @@
 """
 
 import asyncio
+import base64
 import contextlib
+import json
 import os
 import sqlite3
 import time
@@ -13,7 +15,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -24,6 +26,7 @@ from finharness.auth.store import CurrentUser, UserStore
 from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
 from finharness.config.store import ConfigStore
+from finharness.compute.protocol import ReplayError, SignatureError, TaskSigner
 from finharness.context.memory.store import MemoryStore
 from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
@@ -77,6 +80,20 @@ class ChatRequest(BaseModel):
 class RespondRequest(BaseModel):
     request_id: str
     response: str
+
+
+class WorkerLeaseRequest(BaseModel):
+    worker_id: str
+
+
+class WorkerJobRequest(BaseModel):
+    worker_id: str
+    job_id: str
+
+
+class WorkerFinishRequest(WorkerJobRequest):
+    result_json: str | None = None
+    error: str | None = None
 
 
 class StopRequest(BaseModel):
@@ -264,6 +281,83 @@ def create_app(
         max_waiting_per_user=int(settings.compute.max_waiting_per_user),
         max_attempts=int(settings.compute.max_attempts),
     )
+    compute_secret = os.getenv(settings.compute.hmac_secret_env)
+    application.state.compute_signer = (
+        TaskSigner(compute_secret) if compute_secret and len(compute_secret.encode("utf-8")) >= 16 else None
+    )
+
+    async def _verify_worker_request(request: Request) -> None:
+        signer = application.state.compute_signer
+        if signer is None:
+            raise HTTPException(status_code=503, detail="计算 worker 签名密钥未配置")
+        try:
+            signer.verify(await request.body(), request.headers)
+        except (ReplayError, SignatureError) as exc:
+            raise HTTPException(status_code=401, detail="worker 请求签名无效") from exc
+
+    def _worker_job_payload(job) -> dict:
+        package_root = Path(settings.paths.compute_packages_dir).resolve()
+        package_path = Path(job.payload_path).resolve()
+        try:
+            package_path.relative_to(package_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail="计算任务包不在受控 state 目录") from exc
+        if not package_path.is_file() or package_path.stat().st_size > 16 * 1024 * 1024:
+            raise HTTPException(status_code=500, detail="计算任务包不可用或超过大小限制")
+        return {
+            "job": {
+                "job_id": job.job_id,
+                "user_id": job.user_id,
+                "conversation_id": job.conversation_id,
+                "kind": job.kind,
+                "attempts": job.attempts,
+            },
+            "package_b64": base64.b64encode(package_path.read_bytes()).decode("ascii"),
+        }
+
+    @application.post("/v1/internal/compute/lease", include_in_schema=False)
+    async def lease_compute_job(payload: WorkerLeaseRequest, request: Request) -> dict:
+        await _verify_worker_request(request)
+        job = application.state.compute_jobs.lease_next(
+            worker_id=payload.worker_id, lease_seconds=float(settings.compute.lease_seconds)
+        )
+        return {"job": None} if job is None else _worker_job_payload(job)
+
+    @application.post("/v1/internal/compute/running", include_in_schema=False)
+    async def mark_compute_running(payload: WorkerJobRequest, request: Request) -> Response:
+        await _verify_worker_request(request)
+        try:
+            application.state.compute_jobs.mark_running(
+                payload.job_id, worker_id=payload.worker_id, lease_seconds=float(settings.compute.lease_seconds)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(status_code=204)
+
+    @application.post("/v1/internal/compute/renew", include_in_schema=False)
+    async def renew_compute_lease(payload: WorkerJobRequest, request: Request) -> Response:
+        await _verify_worker_request(request)
+        try:
+            application.state.compute_jobs.renew(
+                payload.job_id, worker_id=payload.worker_id, lease_seconds=float(settings.compute.lease_seconds)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(status_code=204)
+
+    @application.post("/v1/internal/compute/finish", include_in_schema=False)
+    async def finish_compute_job(payload: WorkerFinishRequest, request: Request) -> Response:
+        await _verify_worker_request(request)
+        try:
+            if payload.error:
+                application.state.compute_jobs.fail(payload.job_id, worker_id=payload.worker_id, error=payload.error)
+            else:
+                application.state.compute_jobs.succeed(
+                    payload.job_id, worker_id=payload.worker_id, result_json=payload.result_json or "{}"
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(status_code=204)
 
     # 语义记忆的检索层（docs 03.6.4 LTM）：记录本体在 SQLite，向量只用于
     # 召回。未配 embedding 端点时 index.enabled=False，语义区块整体不出现，
