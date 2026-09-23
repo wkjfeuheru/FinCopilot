@@ -1042,7 +1042,7 @@ def create_app(
             else:
                 # 对话比服务它的进程更长寿，因此回退到持久化的引用：
                 # 恢复的对话即使在服务端重启后仍能显示其来源。
-                records = memory_store.load_citations(conversation_id)
+                records = memory_store.load_citations(conversation_id, user_id=user.id)
         elif session_id:
             session = registry.sessions.get(session_id)
             if session is None or session.user_id != user.id:
