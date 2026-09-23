@@ -26,7 +26,7 @@ from finharness.auth.store import CurrentUser, UserStore
 from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
 from finharness.config.store import ConfigStore
-from finharness.compute.protocol import ReplayError, SignatureError, TaskSigner
+from finharness.compute.protocol import ReplayError, SignatureError, TaskSigner, allocate_artifact_dir
 from finharness.context.memory.store import MemoryStore
 from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
@@ -315,6 +315,49 @@ def create_app(
             "package_b64": base64.b64encode(package_path.read_bytes()).decode("ascii"),
         }
 
+    def _materialize_worker_blobs(job, result_json: str) -> str:
+        """验证 worker 回传物后才写入所属任务目录，绝不相信其目标路径。"""
+        try:
+            result = json.loads(result_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail="worker 返回的 result_json 非法") from exc
+        if not isinstance(result, dict):
+            raise HTTPException(status_code=422, detail="worker 结果必须是 object")
+        blobs = result.pop("blobs", {})
+        if not blobs:
+            return json.dumps(result, ensure_ascii=False)
+        if not isinstance(blobs, dict) or len(blobs) > 16:
+            raise HTTPException(status_code=422, detail="worker blob 数量非法")
+        destination = allocate_artifact_dir(
+            settings.paths.output_dir,
+            user_id=job.user_id,
+            conversation_id=job.conversation_id,
+            job_id=job.job_id,
+        )
+        artifacts: list[str] = []
+        try:
+            for name, encoded in blobs.items():
+                if not isinstance(name, str) or Path(name).name != name or not name or len(name) > 128:
+                    raise HTTPException(status_code=422, detail="worker blob 名称非法")
+                if not isinstance(encoded, str):
+                    raise HTTPException(status_code=422, detail="worker blob 内容非法")
+                try:
+                    content = base64.b64decode(encoded, validate=True)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail="worker blob 不是 base64") from exc
+                if len(content) > 32 * 1024 * 1024:
+                    raise HTTPException(status_code=422, detail="worker blob 超过大小限制")
+                (destination / name).write_bytes(content)
+                artifacts.append(name)
+        except Exception:
+            # 不保留失败任务的半成品，且目录只可能是本次调用刚创建的。
+            import shutil
+
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+        result["artifacts"] = artifacts
+        return json.dumps(result, ensure_ascii=False)
+
     @application.post("/v1/internal/compute/lease", include_in_schema=False)
     async def lease_compute_job(payload: WorkerLeaseRequest, request: Request) -> dict:
         await _verify_worker_request(request)
@@ -352,8 +395,13 @@ def create_app(
             if payload.error:
                 application.state.compute_jobs.fail(payload.job_id, worker_id=payload.worker_id, error=payload.error)
             else:
+                job = application.state.compute_jobs.get_leased(payload.job_id, worker_id=payload.worker_id)
+                if job is None:
+                    raise HTTPException(status_code=409, detail="任务未被当前 worker 运行")
                 application.state.compute_jobs.succeed(
-                    payload.job_id, worker_id=payload.worker_id, result_json=payload.result_json or "{}"
+                    payload.job_id,
+                    worker_id=payload.worker_id,
+                    result_json=_materialize_worker_blobs(job, payload.result_json or "{}"),
                 )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

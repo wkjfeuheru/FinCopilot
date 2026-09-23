@@ -201,3 +201,13 @@ class ComputeJobStore:
                 "SELECT * FROM compute_jobs WHERE job_id = ? AND user_id = ?", (job_id, user_id)
             ).fetchone()
         return self._row(row) if row is not None else None
+
+    def get_leased(self, job_id: str, *, worker_id: str) -> ComputeJob | None:
+        """供主服务处理 worker 回传物；只接受当前租约持有人。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM compute_jobs WHERE job_id = ? AND lease_owner = ? "
+                "AND status = 'running'",
+                (job_id, worker_id),
+            ).fetchone()
+        return self._row(row) if row is not None else None

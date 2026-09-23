@@ -33,7 +33,7 @@ class TaskPackageError(ValueError):
 
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
-_SAFE_JOB_ID = re.compile(r"^[a-f0-9]{32}$")
+_SAFE_JOB_ID = re.compile(r"^(?:job_)?[a-f0-9]{32}$")
 
 
 class TaskSigner:

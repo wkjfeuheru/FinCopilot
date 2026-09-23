@@ -24,6 +24,23 @@ from finharness.compute.protocol import TaskPackageError, TaskSigner, extract_ta
 TaskHandler = Callable[[Mapping[str, Any], Path], dict[str, Any]]
 
 
+def _docx_export_handler(_job: Mapping[str, Any], input_dir: Path) -> dict[str, Any]:
+    """首个迁移任务：由 worker 把受控 markdown 包导出为 DOCX。"""
+    try:
+        request = json.loads((input_dir / "request.json").read_text(encoding="utf-8"))
+        markdown = request["markdown"]
+        topic = request.get("topic", "")
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise TaskPackageError("docx 任务包缺少合法 request.json") from exc
+    if not isinstance(markdown, str) or not isinstance(topic, str) or len(markdown) > 2_000_000:
+        raise TaskPackageError("docx 任务输入非法或超过大小限制")
+    from finharness.tools.fin.docx_export import export_markdown_to_docx
+
+    output = input_dir.parent / "report.docx"
+    export_markdown_to_docx(markdown, out_path=output, topic=topic)
+    return {"blobs": {"report.docx": base64.b64encode(output.read_bytes()).decode("ascii")}}
+
+
 class WorkerClient:
     """唯一的 worker 出站能力：经签名向主服务领取/完成任务。"""
 
@@ -79,7 +96,7 @@ def main() -> None:
     client = WorkerClient(base_url=base_url, secret=secret)
     try:
         while True:
-            if not client.run_once({}):
+            if not client.run_once({"docx_export": _docx_export_handler}):
                 time.sleep(poll_seconds)
     finally:
         client.close()
