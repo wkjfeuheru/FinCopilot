@@ -20,6 +20,7 @@ dependencies = [
     "pypdf>=5.0",
     "python-docx>=1.2.0",
     "pyyaml>=6.0.3",
+    "qdrant-client>=1.7",
     "scipy>=1.14",
     "tiktoken>=0.14.0",
     "uvicorn[standard]>=0.30",
@@ -35,11 +36,6 @@ dev = [
 observability = [
     "prometheus-client>=0.21",
     "langsmith>=0.1.100",
-]
-# 向量库（docs 03.6.4 语义记忆）：未安装或服务不可用时，检索按
-# "SQLite BLOB 暴力余弦 → 键匹配" 逐级降级，记忆链路不受影响。
-vector = [
-    "qdrant-client>=1.7",
 ]
 
 [tool.setuptools.packages.find]

@@ -192,10 +192,15 @@ def create_app(
         trace_cleanup_task = None
         if trace_store is not None:
             trace_cleanup_task = asyncio.create_task(_trace_cleanup_worker())
-        # 向量回填（docs 03.6.4 LTM）：覆盖"先积累了语义条目、之后才配好
-        # embedding 端点"以及"条目被改写导致向量失效"两种情况。放在启动时
-        # 做一次，避免这些条目直到下次蒸馏才重新可召回。失败无妨——语义
-        # 召回是增强项，键匹配始终在。
+        # 向量维护（docs 03.6.4 LTM）：先把历史版本写在 SQLite BLOB 里的存量
+        # 向量迁入 Qdrant（配了才有动作，失败留下次启动重试），再回填"先积累
+        # 了语义条目、之后才配好 embedding"以及"条目被改写导致向量失效"两种
+        # 情况。放在启动时做一次，避免这些条目直到下次蒸馏才重新可召回。
+        # 失败无妨——语义召回是增强项，键匹配始终在。
+        try:
+            semantic_index.migrate_local_vectors()
+        except Exception:  # noqa: BLE001 - 迁移绝不该阻止服务启动
+            pass
         try:
             for user_id in memory_store.ltm_fact_users():
                 semantic_index.index_pending(user_id=user_id)

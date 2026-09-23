@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS ltm_facts (
     confidence REAL,
     embedding BLOB,
     embedding_model TEXT,
+    indexed_at TEXT,
     updated_at TEXT NOT NULL,
     UNIQUE(user_id, key)
 )
@@ -444,6 +445,10 @@ class MemoryStore:
                     "UPDATE ltm_facts SET fa_uid = ? WHERE id = ?",
                     (self._fa_uid(row["user_id"], row["key"]), int(row["id"])),
                 )
+        if fact_columns and "indexed_at" not in fact_columns:
+            # "已索引到外部向量库"的标记（docs 03.6.4）：配了 Qdrant 的部署
+            # 向量只存 Qdrant，本列是召回回填与 embedded 展示的判据。
+            connection.execute("ALTER TABLE ltm_facts ADD COLUMN indexed_at TEXT")
         if not _notes_has_user_scoped_pk(connection):
             # SQLite 无法就地改主键：建新表-拷贝-替换。判据是主键组成
             # 而非列是否存在——只检查列会漏掉「有 user_id 但主键仍是 key」
@@ -1394,13 +1399,15 @@ class MemoryStore:
             confidence=row["confidence"],
             updated_at=row["updated_at"],
             fa_uid=row["fa_uid"] or self._fa_uid(row["user_id"], row["key"]),
-            has_embedding=row["embedding"] is not None,
+            # 配了 Qdrant 的部署向量在外部库（indexed_at 标记），BLOB 为空；
+            # 未配的部署向量在本表 BLOB。两种部署 embedded 都应为 true。
+            has_embedding=row["embedding"] is not None or row["indexed_at"] is not None,
             id=int(row["id"]),
         )
 
     _LTM_FACT_COLUMNS = (
         "id, fa_uid, user_id, key, statement, kind, subject, source_conversation_id,"
-        " source_ts, confidence, embedding, updated_at"
+        " source_ts, confidence, embedding, embedding_model, indexed_at, updated_at"
     )
 
     def upsert_ltm_fact(
@@ -1444,8 +1451,8 @@ class MemoryStore:
                     "INSERT INTO ltm_facts"
                     " (fa_uid, user_id, key, statement, kind, subject,"
                     " source_conversation_id, source_ts, confidence, embedding,"
-                    " embedding_model, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+                    " embedding_model, indexed_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)",
                     (
                         fa_uid, user_id, clean_key, text, kind, subject,
                         source_conversation_id, source_ts, confidence, now,
@@ -1457,8 +1464,12 @@ class MemoryStore:
                     "UPDATE ltm_facts SET statement = ?, kind = ?, subject = ?,"
                     " source_conversation_id = ?, source_ts = ?,"
                     " confidence = COALESCE(?, confidence), updated_at = ?"
-                    # 表述未变则保留向量；变了就置空，等回填重算。
-                    + ("" if same else ", embedding = NULL, embedding_model = NULL")
+                    # 表述未变则保留向量；变了就置空并撤销索引标记，等回填重算。
+                    + (
+                        ""
+                        if same
+                        else ", embedding = NULL, embedding_model = NULL, indexed_at = NULL"
+                    )
                     + " WHERE user_id = ? AND key = ?",
                     (
                         text, kind, subject, source_conversation_id, source_ts,
@@ -1570,15 +1581,64 @@ class MemoryStore:
     def facts_missing_embedding(
         self, *, user_id: str = "", limit: int = 50
     ) -> list[LtmFactRecord]:
-        """尚未向量化的条目（新写入的、或被改写后向量失效的）。"""
+        """尚未向量化的条目（新写入的、或被改写后向量失效的）。
+
+        配了 Qdrant 的部署向量在外部库（``indexed_at`` 标记），不算缺失；
+        只有 BLOB 与标记都为空的条目才需要回填。
+        """
         with self._connect() as connection:
             rows = connection.execute(
                 f"SELECT {self._LTM_FACT_COLUMNS} FROM ltm_facts"
-                " WHERE user_id = ? AND embedding IS NULL"
+                " WHERE user_id = ? AND embedding IS NULL AND indexed_at IS NULL"
                 " ORDER BY updated_at DESC LIMIT ?",
                 (user_id, int(limit)),
             ).fetchall()
         return [self._row_to_ltm_fact(row) for row in rows]
+
+    def mark_ltm_fact_indexed(self, *, user_id: str, key: str) -> bool:
+        """标记条目已索引到外部向量库（Qdrant 写入成功后调用）。"""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE ltm_facts SET indexed_at = ? WHERE user_id = ? AND key = ?",
+                (_now(), user_id, key),
+            )
+            return cursor.rowcount > 0
+
+    def local_vector_facts(
+        self, *, limit: int = 500
+    ) -> list[tuple[str, str, str, list[float]]]:
+        """仍有本地 BLOB 向量的条目（跨用户），供向外部向量库迁移。
+
+        返回 ``[(user_id, key, fa_uid, 向量), ...]``：向量本体随行带出，
+        迁移不需要二次查询或重新调用 embedding API；user_id 单独给出，
+        因为 ``LtmFactRecord`` 不携带归属字段而 Qdrant 载荷需要它。
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT user_id, key, embedding FROM ltm_facts"
+                " WHERE embedding IS NOT NULL"
+                " ORDER BY updated_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [
+            (
+                row["user_id"],
+                row["key"],
+                self._fa_uid(row["user_id"], row["key"]),
+                self.decode_vector(row["embedding"]),
+            )
+            for row in rows
+        ]
+
+    def clear_ltm_fact_embedding(self, *, user_id: str, key: str) -> bool:
+        """清空本地 BLOB 副本（向量已迁入外部库后调用）；未命中返回 False。"""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE ltm_facts SET embedding = NULL, embedding_model = NULL"
+                " WHERE user_id = ? AND key = ?",
+                (user_id, key),
+            )
+            return cursor.rowcount > 0
 
     def list_fact_vectors(self, *, user_id: str = "") -> list[tuple[str, list[float]]]:
         """该用户全部已向量化条目：``[(fa_uid, vector), ...]``。

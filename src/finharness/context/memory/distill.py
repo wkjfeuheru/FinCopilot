@@ -43,11 +43,14 @@ DISTILL_PROMPT = (
     "- preference：用户对产出形式的偏好（如\"报告要简洁，少用表格\"、\"默认看近三年\"）。\n"
     "每条的 key 是简短稳定的标识（如 industry_maotai、valuation_default、report_style），\n"
     "statement 是自包含的一句话表述；同一 key 再次出现表示更新，会覆盖旧表述。\n"
+    "每条附 confidence（0~1 的小数）：该条目在对话中被表达的确定程度——用户\n"
+    "明确陈述或反复确认的给 0.8 以上，推测、顺带提及或依据不充分的给 0.5 以下。\n"
     "只提取对话中真实出现的内容；没有则给空数组。\n"
     "\n"
     "要求：不得编造；只输出 JSON 对象本身，不要任何前后缀或代码围栏。格式：\n"
     '{"episodes": [{"kind": "decision", "subject": "600519", "summary": "..."}],'
-    ' "facts": [{"kind": "preference", "key": "report_style", "statement": "..."}]}'
+    ' "facts": [{"kind": "preference", "key": "report_style", "statement": "...",'
+    ' "confidence": 0.9}]}'
 )
 
 # 蒸馏转录稿的体量上限：一个对话的全部消息可能非常长，而蒸馏只需要

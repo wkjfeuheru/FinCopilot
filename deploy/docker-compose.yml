@@ -1,4 +1,4 @@
-# FinHarness 生产部署编排：应用 + Caddy 自动 TLS。
+# FinHarness 生产部署编排：应用 + Qdrant 向量库 + Caddy 自动 TLS。
 # 用法见 docs/deploy/aliyun.md。密钥只写同目录 .env（git 忽略），不入库不入镜像。
 #
 # 首次启动前：cp deploy/.env.example deploy/.env 并填入域名与密钥。
@@ -28,6 +28,9 @@ services:
       HITHINK_FINANCE_API_KEY: ${HITHINK_FINANCE_API_KEY:-}
       # 是否开放注册：初始化管理员账号后改回 false 并 docker compose up -d
       FINH_AUTH_ALLOW_REGISTER: ${FINH_AUTH_ALLOW_REGISTER:-false}
+      # 语义记忆向量库（docs 03.6.4）：指向下方 qdrant 服务；向量只存 Qdrant，
+      # SQLite 只留记录本体。服务未起时应用照常运行，仅少一层语义召回。
+      FINH_LTM_VECTOR_DB_URL: ${FINH_LTM_VECTOR_DB_URL:-http://qdrant:6333}
     # 只绑定本机回环：公网流量一律走 Caddy，应用不直接暴露
     expose:
       - "8000"
@@ -37,6 +40,15 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    # 只在内网暴露：仅 app 访问，不经 Caddy 上公网
+    expose:
+      - "6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
 
   caddy:
     image: caddy:2-alpine
@@ -55,3 +67,4 @@ volumes:
   app-data:
   caddy-data:
   caddy-config:
+  qdrant-data:

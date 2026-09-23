@@ -249,7 +249,7 @@ def test_distiller_writes_facts_in_the_same_call(tmp_path):
     provider = JsonProvider(
         '{"episodes": [{"kind": "decision", "summary": "决定用 ROE 衡量盈利"}],'
         ' "facts": [{"kind": "preference", "key": "report_style",'
-        ' "statement": "报告要简洁，少用表格"}]}'
+        ' "statement": "报告要简洁，少用表格", "confidence": 0.9}]}'
     )
 
     async def run():
@@ -263,6 +263,33 @@ def test_distiller_writes_facts_in_the_same_call(tmp_path):
     # 两类记忆共用同一次 LLM 调用——这是"语义默认开启也不加成本"的前提。
     assert len(provider.requests) == 1
     assert store.get_notes(user_id="u1") == {"report_style": "报告要简洁，少用表格"}
+
+
+def test_distilled_fact_confidence_is_persisted(tmp_path):
+    """蒸馏产出带 confidence（0~1）时随条目落库；越界/非数字按 None 处理。"""
+    store = MemoryStore(tmp_path / "memory.db")
+    settings = make_settings(tmp_path)
+    store.ensure_conversation("c_a", user_id="u1", title="茅台分析")
+    store.append_messages("c_a", [_user_msg("茅台属于白酒行业")])
+    provider = JsonProvider(
+        '{"episodes": [], "facts": ['
+        '{"kind": "fact", "key": "industry_maotai", "statement": "茅台属于白酒行业",'
+        ' "confidence": 0.85},'
+        '{"kind": "fact", "key": "wild_claim", "statement": "越界值丢弃",'
+        ' "confidence": 1.5},'
+        '{"kind": "fact", "key": "no_number", "statement": "没有数字"}]}'
+    )
+
+    async def run():
+        distiller = EpisodeDistiller(provider=provider, store=store, settings=settings)
+        return await distiller.distill_conversation("c_a", user_id="u1")
+
+    outcome = asyncio.run(run())
+
+    assert outcome.facts_written == 3
+    assert store.get_ltm_fact_by_key(user_id="u1", key="industry_maotai").confidence == 0.85
+    assert store.get_ltm_fact_by_key(user_id="u1", key="wild_claim").confidence is None
+    assert store.get_ltm_fact_by_key(user_id="u1", key="no_number").confidence is None
 
 
 def test_semantics_can_be_disabled_without_losing_episodes(tmp_path):

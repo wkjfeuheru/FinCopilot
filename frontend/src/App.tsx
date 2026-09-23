@@ -132,6 +132,12 @@ function App() {
     setConversationId(window.localStorage.getItem(storageKeyFor(user.id)));
   }, [user]);
 
+  // 管理员登出/会话过期后换普通用户登录时，view 可能残留为
+  // monitor/admin；回落到工作台，避免渲染无权访问的页面。
+  useEffect(() => {
+    if (user && user.role !== "admin" && view !== "chat") setView("chat");
+  }, [user, view]);
+
   useEffect(() => {
     if (!user) return;
     void refreshConfig().then((data) => {
@@ -336,21 +342,24 @@ function App() {
             >
               工作台
             </Button>
-            <Button
-              size="small"
-              type={view === "monitor" ? "primary" : "default"}
-              onClick={() => setView("monitor")}
-            >
-              运行监控
-            </Button>
+            {/* 运行监控与管理同源门控（users.role='admin'）；普通用户只保留工作台。 */}
             {user.role === "admin" ? (
-              <Button
-                size="small"
-                type={view === "admin" ? "primary" : "default"}
-                onClick={() => setView("admin")}
-              >
-                管理
-              </Button>
+              <>
+                <Button
+                  size="small"
+                  type={view === "monitor" ? "primary" : "default"}
+                  onClick={() => setView("monitor")}
+                >
+                  运行监控
+                </Button>
+                <Button
+                  size="small"
+                  type={view === "admin" ? "primary" : "default"}
+                  onClick={() => setView("admin")}
+                >
+                  管理
+                </Button>
+              </>
             ) : null}
             <button
               type="button"

@@ -1,15 +1,17 @@
 """跨对话语义记忆的向量索引与召回（docs 03.6.4 LTM 语义记忆）。
 
 **记录本体永远在 SQLite（``ltm_facts``）**：治理（查看/编辑/删除/保留）走单一
-事实源，向量库只是检索加速器。因此这里的三层结构是刻意的不对称：
+事实源，向量库只是检索加速器。向量的存放按部署形态二选一：
 
-* ``QdrantVectorStore`` —— 配了服务时用它做 KNN（支持 user 过滤）；
-* ``SqliteVectorStore`` —— 没配服务但配了 embedding 端点时回退到本地暴力余弦，
-  读的正是 ``ltm_facts.embedding`` 这一列，因此列不是死字段；
+* 配了 Qdrant（``ltm.vector_db.url``）——向量只存 Qdrant（支持 user 过滤），
+  ``ltm_facts.indexed_at`` 标记已索引；历史版本写进 BLOB 的存量在启动时
+  迁入 Qdrant 后清空（``migrate_local_vectors``）；
+* 没配 Qdrant 但配了 embedding 端点 —— 向量写进 ``ltm_facts.embedding``
+  BLOB，``SqliteVectorStore`` 做本地暴力余弦（个人工作台规模毫秒级）；
 * 两者都不可用 —— ``SemanticIndex`` 的调用方退回键匹配（``list_ltm_facts``）。
 
-按这个顺序**逐级降级**，任何一层失效都不会让记忆链路断掉；Qdrant 抖动时
-一次召回落到本地余弦，而不是"没有语义记忆"。
+任何一层失效都不会让记忆链路断掉：Qdrant 抖动只损失一次语义召回，条目本体
+与键匹配始终可用。
 """
 
 from __future__ import annotations
@@ -42,6 +44,10 @@ class QdrantVectorStore:
 
     刻意**不**做连接重试或异常上抛：语义召回是增强项，向量库挂掉不该让一轮
     对话变慢或失败。惰性导入 ``qdrant_client``，因此核心依赖里没有它。
+
+    点 ID 用 ``fa_uid`` 的 UUID5 派生值：Qdrant 1.14+ 只接受无符号整数或
+    UUID 作点 ID，不再收任意字符串；派生是确定性的，同一 ``fa_uid`` 永远
+    映射到同一点，治理（删除/覆盖）按 ``fa_uid`` 寻址的语义不变。
     """
 
     def __init__(
@@ -62,6 +68,13 @@ class QdrantVectorStore:
         self._client = client
         self._available: bool | None = None
         self._ensured = False
+
+    @staticmethod
+    def _point_id(fa_uid: str) -> str:
+        """fa_uid → 确定性 UUID（Qdrant 点 ID 合法形式）。"""
+        import uuid
+
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"finharness:fa_uid:{fa_uid}"))
 
     def _connect(self) -> Any | None:
         if self._client is not None:
@@ -131,7 +144,7 @@ class QdrantVectorStore:
                 collection_name=self.collection,
                 points=[
                     qmodels.PointStruct(
-                        id=point_id,
+                        id=self._point_id(point_id),
                         vector=vector,
                         payload={"user_id": user_id, **payload},
                     )
@@ -153,22 +166,28 @@ class QdrantVectorStore:
 
             client.delete(
                 collection_name=self.collection,
-                points_selector=qmodels.PointIdsList(points=[point_id]),
+                points_selector=qmodels.PointIdsList(points=[self._point_id(point_id)]),
             )
             return True
         except Exception:  # noqa: BLE001
             return False
 
     def search(self, *, vector: list[float], user_id: str, limit: int) -> list[str]:
+        """按用户 KNN 检索，返回点 ID 的 ``fa_uid`` 原值（UUID5 逆向映射）。
+
+        新版客户端已移除 ``search``，统一走 ``query_points``。为让召回回表
+        仍按 ``fa_uid`` 寻址，把 UUID5 派生点 ID 映射回原值——存储侧在载荷
+        里保留原 ``fa_uid``，这里直接读回，不做脆弱的字符串逆推。
+        """
         client = self._connect()
         if client is None or not vector:
             return []
         try:
             from qdrant_client import models as qmodels
 
-            hits = client.search(
+            response = client.query_points(
                 collection_name=self.collection,
-                query_vector=vector,
+                query=vector,
                 limit=int(limit),
                 query_filter=qmodels.Filter(
                     must=[
@@ -178,9 +197,15 @@ class QdrantVectorStore:
                         )
                     ]
                 ),
-                with_payload=False,
+                with_payload=True,
             )
-            return [str(hit.id) for hit in hits]
+            results: list[str] = []
+            for hit in response.points:
+                payload = hit.payload or {}
+                fa_uid = payload.get("fa_uid")
+                if fa_uid:
+                    results.append(str(fa_uid))
+            return results
         except Exception:  # noqa: BLE001 - 检索失败即降级为"无向量命中"
             return []
 
@@ -257,8 +282,8 @@ class SemanticIndex:
 
     * ``embedder is None``        → ``enabled=False``，召回交回键匹配；
     * 向量写入失败                → 记忆本体仍然落库，只是检索弱一些；
-    * 主向量库无命中/不可用       → 退回本地 BLOB 余弦（``index_fact`` 始终
-      把向量写一份到 SQLite，正是为了让这条退路成立）。
+    * 无 Qdrant 部署              → 向量写本地 BLOB（``index_fact``），
+      ``SqliteVectorStore`` 用它做余弦检索；配了 Qdrant 则向量只存 Qdrant。
     """
 
     def __init__(
@@ -284,7 +309,12 @@ class SemanticIndex:
         )
 
     def index_fact(self, *, user_id: str, key: str) -> bool:
-        """为一条语义条目计算并写入向量；任何失败都返回 False 而不抛出。"""
+        """为一条语义条目计算并写入向量；任何失败都返回 False 而不抛出。
+
+        向量只存一份，真源按部署形态二选一：配了外部向量库（Qdrant）时
+        向量只进 Qdrant、SQLite 不落 BLOB（``indexed_at`` 标记已索引）；
+        没配时写本地 BLOB，即 ``SqliteVectorStore`` 的检索路径。
+        """
         if not self.enabled:
             return False
         assert self.embedder is not None
@@ -295,21 +325,23 @@ class SemanticIndex:
         vector = self.embedder.embed_one(text)
         if not vector:
             return False
-        # 本地 BLOB 副本先写：它既是无向量库时的检索路径，也是向量库不可用
-        # 时的兜底（见 recall）。
-        self.store.set_ltm_fact_embedding(
-            user_id=user_id, key=key, vector=vector, model=self.embedder.model
-        )
-        if self.vector_store is not None and not isinstance(
-            self.vector_store, SqliteVectorStore
-        ):
-            self.vector_store.upsert(
-                point_id=fact.fa_uid,
-                vector=vector,
-                user_id=user_id,
-                payload={"key": key, "kind": fact.kind},
+        if isinstance(self.vector_store, SqliteVectorStore):
+            # 无向量库部署：BLOB 就是真源，写入即完成索引。
+            self.store.set_ltm_fact_embedding(
+                user_id=user_id, key=key, vector=vector, model=self.embedder.model
             )
-        return True
+            return True
+        if self.vector_store is None:
+            return False
+        indexed = self.vector_store.upsert(
+            point_id=fact.fa_uid,
+            vector=vector,
+            user_id=user_id,
+            payload={"fa_uid": fact.fa_uid, "key": key, "kind": fact.kind},
+        )
+        if indexed:
+            self.store.mark_ltm_fact_indexed(user_id=user_id, key=key)
+        return indexed
 
     def index_pending(self, *, user_id: str, limit: int = 50) -> int:
         """回填尚未向量化的条目（新写入的，或被改写后向量失效的）。"""
@@ -319,6 +351,36 @@ class SemanticIndex:
         return sum(
             1 for fact in pending if self.index_fact(user_id=user_id, key=fact.key)
         )
+
+    def migrate_local_vectors(self, *, limit: int = 500) -> int:
+        """把本地 BLOB 存量向量迁入外部向量库；返回迁移成功的条数。
+
+        历史版本曾把向量双写进 SQLite BLOB，改为"配了 Qdrant 只存 Qdrant"
+        后，这批存量需要在启动时搬家。向量直接取自 BLOB（不重调 embedding
+        API），外部库确认写入成功才清空 BLOB；外部库不可用时不删，下次启动
+        重试。没有外部向量库时无事可做。
+        """
+        if not self.enabled or not isinstance(self.vector_store, QdrantVectorStore):
+            return 0
+        migrated = 0
+        for user_id, key, fa_uid, vector in self.store.local_vector_facts(limit=limit):
+            if not vector:
+                continue
+            fact = self.store.get_ltm_fact_by_key(user_id=user_id, key=key)
+            if fact is None:
+                continue
+            ok = self.vector_store.upsert(
+                point_id=fa_uid,
+                vector=vector,
+                user_id=user_id,
+                payload={"fa_uid": fa_uid, "key": key, "kind": fact.kind},
+            )
+            if not ok:
+                continue
+            self.store.clear_ltm_fact_embedding(user_id=user_id, key=key)
+            self.store.mark_ltm_fact_indexed(user_id=user_id, key=key)
+            migrated += 1
+        return migrated
 
     def unindex_fact(self, fact: LtmFactRecord, *, user_id: str) -> None:
         """删除条目时同步清理向量库中的点（失败不影响删除本身）。"""
@@ -342,8 +404,8 @@ class SemanticIndex:
         命中的 id 回到 SQLite 取正文——向量库只存向量与 id，因此这里
         不存在"两份事实源"的同步问题。
 
-        主向量库无命中或不可用时退回本地 BLOB 余弦：Qdrant 抖动只该让检索
-        慢一点，不该让已经积累的知识凭空消失。
+        无 Qdrant 部署走本地 BLOB 余弦；Qdrant 部署检索失败时本次召回为空，
+        条目本体与键匹配不受影响。
         """
         if not self.enabled or not query.strip():
             return []

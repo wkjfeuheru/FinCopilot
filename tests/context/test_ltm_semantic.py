@@ -8,6 +8,7 @@ import pytest
 from finharness.config.settings import Settings
 from finharness.context.memory.store import LtmFactRecord, MemoryStore
 from finharness.context.memory.vector import (
+    QdrantVectorStore,
     SemanticIndex,
     SqliteVectorStore,
     build_vector_store,
@@ -343,20 +344,126 @@ def test_qdrant_store_degrades_when_the_service_is_unreachable(tmp_path):
     assert backend.delete(point_id="fa_1", user_id="u1") is False
 
 
-def test_semantic_index_falls_back_to_local_vectors_when_qdrant_fails(tmp_path):
-    """Qdrant 挂掉时召回落到本地余弦——记忆不该因为向量库抖动而消失。"""
-    from finharness.context.memory.vector import QdrantVectorStore
+def test_semantic_index_with_unreachable_qdrant_keeps_fact_pending(tmp_path):
+    """Qdrant 配了但挂掉：向量不入库、不置标记，条目保持待回填。
 
+    记录本体已在 SQLite，损失只有"本次没有语义召回"；条目留在回填队列，
+    服务恢复后由启动迁移/回填补上，而不是悄悄丢进本地 BLOB 形成第二真相。
+    """
     store = MemoryStore(tmp_path / "memory.db")
     store.upsert_ltm_fact(user_id="u1", key="maotai", statement="茅台是白酒龙头")
     unavailable = QdrantVectorStore(url="http://127.0.0.1:1", collection="x", timeout_s=0.01)
-    index = SemanticIndex(
-        store=store, embedder=_StubEmbedder(), vector_store=unavailable
+    index = SemanticIndex(store=store, embedder=_StubEmbedder(), vector_store=unavailable)
+
+    assert index.index_pending(user_id="u1") == 0
+    fact = store.get_ltm_fact_by_key(user_id="u1", key="maotai")
+    assert fact.has_embedding is False
+    # 待回填队列保留该条目，服务恢复后可补索引。
+    assert [f.key for f in store.facts_missing_embedding(user_id="u1")] == ["maotai"]
+    assert index.recall(user_id="u1", query="茅台的语义", limit=1) == []
+
+
+class _FakeQdrantClient:
+    """记录 upsert/delete 调用的替身，替代真实 Qdrant 服务。"""
+
+    def __init__(self):
+        self.points = []
+        self._collections: list[str] = []
+
+    def get_collections(self):
+        return type("R", (), {"collections": [type("C", (), {"name": n}) for n in self._collections]})()
+
+    def create_collection(self, collection_name, vectors_config):
+        self._collections.append(collection_name)
+
+    def create_payload_index(self, **kwargs):
+        pass
+
+    def upsert(self, collection_name, points):
+        self.points.extend(points)
+        return True
+
+    def delete(self, collection_name, points_selector):
+        return True
+
+    def query_points(self, collection_name, query, limit, query_filter, with_payload):
+        return type("R", (), {"points": []})()
+
+
+def _qdrant_index(store, client) -> SemanticIndex:
+    from finharness.context.memory.vector import QdrantVectorStore
+
+    return SemanticIndex(
+        store=store,
+        embedder=_StubEmbedder(),
+        vector_store=QdrantVectorStore(url="http://localhost:6333", collection="x", client=client),
     )
 
-    # 写入：向量库那一路失败，但本地 BLOB 副本已落下。
-    assert index.index_pending(user_id="u1") == 1
-    assert store.get_ltm_fact_by_key(user_id="u1", key="maotai").has_embedding is True
-    # 召回：主库返回空 → 退回本地余弦，仍然命中。
-    hits = index.recall(user_id="u1", query="茅台的语义", limit=1)
-    assert [fact.key for fact in hits] == ["maotai"]
+
+def test_qdrant_mode_writes_vector_only_to_qdrant(tmp_path):
+    """配了 Qdrant：向量只进 Qdrant，SQLite 不落 BLOB，以 indexed_at 标记。
+
+    点 ID 是 fa_uid 的确定性 UUID5 派生（Qdrant 1.14+ 不收任意字符串 id），
+    原始 fa_uid 存进载荷供召回回表寻址。
+    """
+    store = MemoryStore(tmp_path / "memory.db")
+    store.upsert_ltm_fact(user_id="u1", key="maotai", statement="茅台是白酒龙头")
+    client = _FakeQdrantClient()
+    index = _qdrant_index(store, client)
+
+    assert index.index_fact(user_id="u1", key="maotai") is True
+
+    fact = store.get_ltm_fact_by_key(user_id="u1", key="maotai")
+    assert fact.has_embedding is True          # 由 indexed_at 承接
+    assert store.local_vector_facts() == []    # 没有本地 BLOB 副本
+    assert store.facts_missing_embedding(user_id="u1") == []  # 已标记，不再回填
+    # 点 ID 已派生为 UUID、原始 fa_uid 在载荷里。
+    assert [str(p.id) for p in client.points] == [
+        QdrantVectorStore._point_id(fact.fa_uid)
+    ]
+    assert [p.payload["fa_uid"] for p in client.points] == [fact.fa_uid]
+
+
+def test_migrate_local_vectors_moves_blob_into_qdrant(tmp_path):
+    """存量 BLOB 向量迁入 Qdrant：成功后清空 BLOB、置标记、Qdrant 收到点。"""
+    store = MemoryStore(tmp_path / "memory.db")
+    store.upsert_ltm_fact(user_id="u1", key="maotai", statement="茅台是白酒龙头")
+    store.set_ltm_fact_embedding(user_id="u1", key="maotai", vector=[1.0, 0.0], model="old")
+    client = _FakeQdrantClient()
+    index = _qdrant_index(store, client)
+
+    assert index.migrate_local_vectors() == 1
+
+    fact = store.get_ltm_fact_by_key(user_id="u1", key="maotai")
+    assert [str(p.id) for p in client.points] == [
+        QdrantVectorStore._point_id(fact.fa_uid)
+    ]
+    assert [p.payload["fa_uid"] for p in client.points] == [fact.fa_uid]
+    assert store.local_vector_facts() == []    # BLOB 已清空
+    assert store.facts_missing_embedding(user_id="u1") == []  # indexed_at 已置
+    assert fact.has_embedding is True
+
+
+def test_migrate_local_vectors_is_noop_without_qdrant(tmp_path):
+    """无向量库部署：BLOB 就是真源，迁移不做任何事。"""
+    store = MemoryStore(tmp_path / "memory.db")
+    store.upsert_ltm_fact(user_id="u1", key="a", statement="茅台")
+    store.set_ltm_fact_embedding(user_id="u1", key="a", vector=[1.0, 0.0])
+    index = SemanticIndex(store=store, embedder=_StubEmbedder(), vector_store=SqliteVectorStore(store))
+
+    assert index.migrate_local_vectors() == 0
+    assert len(store.local_vector_facts()) == 1
+
+
+def test_migrate_local_vectors_keeps_blob_when_qdrant_unreachable(tmp_path):
+    """Qdrant 不可达时不删 BLOB，下次启动重试——不丢已积累的向量。"""
+    from finharness.context.memory.vector import QdrantVectorStore
+
+    store = MemoryStore(tmp_path / "memory.db")
+    store.upsert_ltm_fact(user_id="u1", key="a", statement="茅台")
+    store.set_ltm_fact_embedding(user_id="u1", key="a", vector=[1.0, 0.0])
+    unavailable = QdrantVectorStore(url="http://127.0.0.1:1", collection="x", timeout_s=0.01)
+    index = SemanticIndex(store=store, embedder=_StubEmbedder(), vector_store=unavailable)
+
+    assert index.migrate_local_vectors() == 0
+    assert len(store.local_vector_facts()) == 1
