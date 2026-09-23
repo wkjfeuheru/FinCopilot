@@ -255,6 +255,16 @@ def create_app(
     memory_store = MemoryStore(settings.paths.memory_db)
     application.state.memory_store = memory_store
 
+    # 队列数据库仅由主服务持有；worker 只能经签名内部接口领取任务，绝不能
+    # 直接挂载 state 或打开这个 SQLite 文件。
+    from finharness.compute.queue import ComputeJobStore
+
+    application.state.compute_jobs = ComputeJobStore(
+        settings.paths.compute_jobs_db,
+        max_waiting_per_user=int(settings.compute.max_waiting_per_user),
+        max_attempts=int(settings.compute.max_attempts),
+    )
+
     # 语义记忆的检索层（docs 03.6.4 LTM）：记录本体在 SQLite，向量只用于
     # 召回。未配 embedding 端点时 index.enabled=False，语义区块整体不出现，
     # 记忆的写入与键匹配检索仍然完全可用。

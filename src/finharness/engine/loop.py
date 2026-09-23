@@ -396,7 +396,7 @@ class AgentLoop:
         for message in messages:
             self.memory.append(message, track=False)
         # Citation 必须保留其 id：已存储的摘要会引用它们。
-        self.cite.restore(self.store.load_citations(self.conversation_id))
+        self.cite.restore(self.store.load_citations(self.conversation_id, user_id=self.user_id))
         self.ctx.prior_conclusions = self.store.load_conclusions(self.conversation_id)
         self.ctx.notes = self.store.get_notes(user_id=self.user_id)
         # 跨对话长期记忆（docs 03.6.4 LTM）：最近情节被动注入（首轮一次），
@@ -500,7 +500,7 @@ class AgentLoop:
             return
         self.store.append_messages(self.conversation_id, pending)
         self.memory.pending = []
-        self.store.save_citations(self.conversation_id, self.cite.all())
+        self.store.save_citations(self.conversation_id, self.cite.all(), user_id=self.user_id)
         for symbol in self.ctx.symbols:
             self.store.upsert_symbol(self.conversation_id, symbol)
         # 跨对话情节记忆（docs 03.6.4 LTM）：本轮结论同时以 task_result 情节

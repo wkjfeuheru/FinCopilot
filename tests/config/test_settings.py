@@ -181,6 +181,7 @@ def test_single_underscore_environment_overrides_nested_and_path_fields(monkeypa
     monkeypatch.setenv("FINH_SERVER_ALLOW_REMOTE", "true")
     monkeypatch.setenv("FINH_SERVER_HOST", "0.0.0.0")
     monkeypatch.setenv("FINH_AUTH_SECURE_COOKIE", "true")
+    monkeypatch.setenv("FINH_COMPUTE_REMOTE_WORKER_URL", "http://worker.internal:8080")
     monkeypatch.setenv("FINH_PATHS_OUTPUT_DIR", "generated")
 
     settings = Settings.from_file(path)
@@ -291,6 +292,19 @@ def test_remote_binding_requires_default_permission_mode(tmp_path):
                 {
                     "server": {"host": "0.0.0.0", "allow_remote": True},
                     "permission": {"default_mode": "plan"},
+                },
+            )
+        )
+
+
+def test_remote_binding_requires_remote_compute_worker(tmp_path):
+    with pytest.raises(SettingsError, match="compute.remote_worker_url"):
+        Settings.from_file(
+            write_settings(
+                tmp_path,
+                {
+                    "server": {"host": "0.0.0.0", "allow_remote": True},
+                    "auth": {"secure_cookie": True},
                 },
             )
         )

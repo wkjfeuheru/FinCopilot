@@ -6,6 +6,7 @@ memory 中。
 """
 
 import asyncio
+import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ from finharness.context.tokens import TokenCounter
 from finharness.data.access import DataAccess
 from finharness.data.adapters.base import DataAdapter, FetchResult
 from finharness.data.cache import LocalCache
-from finharness.data.citation import CitationRegistry
+from finharness.data.citation import Citation, CitationRegistry
 from finharness.engine.loop import AgentLoop
 from finharness.permissions.gate import PermissionGate
 from finharness.types import ToolUse
@@ -27,6 +28,61 @@ from test_loop import RecordingTool, ScriptedProvider, StubRegistry, text_round,
 
 # 跨测试共享的词表缓存。
 COUNTER = TokenCounter()
+
+
+def test_legacy_child_tables_are_rebuilt_with_parent_user_id(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE conversations (
+                conversation_id TEXT PRIMARY KEY, title TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_active_at TEXT NOT NULL
+            );
+            CREATE TABLE citations (
+                cid TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, tool TEXT NOT NULL,
+                endpoint TEXT NOT NULL, symbol TEXT, params_json TEXT, rows INTEGER,
+                cols INTEGER, fingerprint TEXT, parquet_path TEXT, from_cache INTEGER, ts TEXT
+            );
+            INSERT INTO conversations VALUES ('c_1', 'title', 't', 't', 't');
+            INSERT INTO citations VALUES ('cit_000001', 'c_1', 'tool', 'endpoint', NULL, '{}', 0, 0, '', NULL, 0, 't');
+            """
+        )
+
+    store = MemoryStore(db_path)
+    assert store.claim_user("u_1") == 1
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute("SELECT user_id FROM citations WHERE conversation_id = 'c_1'").fetchone()
+        columns = {column[1] for column in connection.execute("PRAGMA table_info(messages)")}
+
+    assert row == ("u_1",)
+    assert "user_id" in columns
+
+
+def test_legacy_orphan_child_data_stops_migration(tmp_path):
+    db_path = tmp_path / "orphan.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE conversations (
+                conversation_id TEXT PRIMARY KEY, title TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_active_at TEXT NOT NULL
+            );
+            CREATE TABLE citations (
+                cid TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, tool TEXT NOT NULL,
+                endpoint TEXT NOT NULL, symbol TEXT, params_json TEXT, rows INTEGER,
+                cols INTEGER, fingerprint TEXT, parquet_path TEXT, from_cache INTEGER, ts TEXT
+            );
+            INSERT INTO citations VALUES ('cit_000001', 'missing', 'tool', 'endpoint', NULL, '{}', 0, 0, '', NULL, 0, 't');
+            """
+        )
+
+    try:
+        MemoryStore(db_path)
+    except RuntimeError as exc:
+        assert "孤儿" in str(exc)
+    else:
+        raise AssertionError("孤儿子表记录必须中止迁移")
 
 
 def make_settings(tmp_path, **context) -> Settings:
@@ -87,6 +143,33 @@ def test_conversations_do_not_see_each_others_transcript(tmp_path):
 
     assert [m.content for m in first.memory.raw if m.role == "user"] == ["甲的问题"]
     assert [m.content for m in second.memory.raw if m.role == "user"] == ["乙的问题"]
+
+
+def test_same_citation_id_is_retained_in_each_users_conversation(tmp_path):
+    """租户 B 写入本地编号 cit_000001 不得替换租户 A 的引用。"""
+    store = MemoryStore(tmp_path / "memory.db")
+    store.ensure_conversation("c_a", user_id="u_a")
+    store.ensure_conversation("c_b", user_id="u_b")
+
+    def citation(tool: str) -> Citation:
+        return Citation(
+            cid="cit_000001",
+            tool=tool,
+            endpoint="test:source",
+            symbol=None,
+            params={},
+            ts="2026-09-23T00:00:00+00:00",
+            rows=1,
+            cols=1,
+            fingerprint=tool,
+        )
+
+    store.save_citations("c_a", [citation("user_a")])
+    store.save_citations("c_b", [citation("user_b")])
+
+    assert [item.tool for item in store.load_citations("c_a")] == ["user_a"]
+    assert [item.tool for item in store.load_citations("c_b")] == ["user_b"]
+    assert store.load_citations("c_a", user_id="u_b") == []
 
 
 def test_conclusions_are_scoped_to_their_conversation(tmp_path):

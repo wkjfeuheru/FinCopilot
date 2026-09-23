@@ -34,39 +34,47 @@ CREATE TABLE IF NOT EXISTS conversations (
     title TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    last_active_at TEXT NOT NULL
+    last_active_at TEXT NOT NULL,
+    UNIQUE (user_id, conversation_id)
 )
 """
 
 SCHEMA_MESSAGES = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
     role TEXT NOT NULL,
     content TEXT,
     payload_json TEXT,
     ts TEXT NOT NULL,
-    UNIQUE(conversation_id, seq)
+    UNIQUE(user_id, conversation_id, seq),
+    FOREIGN KEY (user_id, conversation_id)
+        REFERENCES conversations(user_id, conversation_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 )
 """
 
 SCHEMA_SUMMARY_SEGMENTS = """
 CREATE TABLE IF NOT EXISTS summary_segments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
     seq_from INTEGER NOT NULL,
     seq_to INTEGER NOT NULL,
     tier INTEGER NOT NULL DEFAULT 0,
     text TEXT NOT NULL,
     ledger_json TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id, conversation_id)
+        REFERENCES conversations(user_id, conversation_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 )
 """
 
 SCHEMA_CITATIONS = """
 CREATE TABLE IF NOT EXISTS citations (
-    cid TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT '',
+    cid TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
     tool TEXT NOT NULL,
     endpoint TEXT NOT NULL,
@@ -77,30 +85,39 @@ CREATE TABLE IF NOT EXISTS citations (
     fingerprint TEXT NOT NULL DEFAULT '',
     parquet_path TEXT,
     from_cache INTEGER NOT NULL DEFAULT 0,
-    ts TEXT
+    ts TEXT,
+    PRIMARY KEY (user_id, conversation_id, cid)
+    ,FOREIGN KEY (user_id, conversation_id)
+        REFERENCES conversations(user_id, conversation_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 )
 """
 
 SCHEMA_CONCLUSIONS = """
 CREATE TABLE IF NOT EXISTS conclusions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
     subject TEXT NOT NULL,
     text TEXT NOT NULL,
     cids_json TEXT,
     ts TEXT NOT NULL,
-    UNIQUE(conversation_id, subject, text)
+    UNIQUE(user_id, conversation_id, subject, text),
+    FOREIGN KEY (user_id, conversation_id)
+        REFERENCES conversations(user_id, conversation_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 )
 """
 
 SCHEMA_SYMBOLS = """
 CREATE TABLE IF NOT EXISTS conversation_symbols (
+    user_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
     symbol TEXT NOT NULL,
     name TEXT,
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, symbol)
+    PRIMARY KEY (user_id, conversation_id, symbol),
+    FOREIGN KEY (user_id, conversation_id)
+        REFERENCES conversations(user_id, conversation_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 )
 """
 
@@ -177,7 +194,8 @@ CREATE TABLE IF NOT EXISTS ltm_processed (
 # 让停止时已确立的内容在客户端重放后依然可见。
 SCHEMA_TURN_CHECKPOINTS = """
 CREATE TABLE IF NOT EXISTS turn_checkpoints (
-    conversation_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
     status TEXT NOT NULL,
     reason TEXT,
     rounds INTEGER NOT NULL DEFAULT 0,
@@ -185,7 +203,10 @@ CREATE TABLE IF NOT EXISTS turn_checkpoints (
     plan_json TEXT,
     partial_answer TEXT,
     persisted_seq INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, conversation_id),
+    FOREIGN KEY (user_id, conversation_id)
+        REFERENCES conversations(user_id, conversation_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 )
 """
 
@@ -428,6 +449,7 @@ class MemoryStore:
             connection.execute(
                 "ALTER TABLE conversations ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"
             )
+        self._migrate_tenant_children(connection)
         fact_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(ltm_facts)")
         }
@@ -461,6 +483,73 @@ class MemoryStore:
             )
             connection.execute("DROP TABLE notes_legacy")
 
+    @staticmethod
+    def _migrate_tenant_children(connection: sqlite3.Connection) -> None:
+        """为会话子表补直接租户键，并用父对话回填历史数据。
+
+        SQLite 不能原地替换主键/外键，故以重建表完成。所有来源表先检查孤儿；
+        任一张表有孤儿即抛错，事务回滚，绝不以 ``JOIN`` 的副作用静默丢行。
+        """
+        tables = (
+            "messages", "summary_segments", "citations", "conclusions",
+            "conversation_symbols", "turn_checkpoints",
+        )
+        child_columns = {
+            table: {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            for table in tables
+        }
+        conversation_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversations'"
+        ).fetchone()["sql"] or ""
+        if all("user_id" in columns for columns in child_columns.values()) and "UNIQUE (user_id, conversation_id)" in conversation_sql:
+            return
+
+        orphan_count = 0
+        for table in tables:
+            orphan_count += int(connection.execute(
+                f"SELECT COUNT(*) AS n FROM {table} x LEFT JOIN conversations c "
+                "ON c.conversation_id = x.conversation_id WHERE c.conversation_id IS NULL"
+            ).fetchone()["n"])
+        if orphan_count:
+            raise RuntimeError(f"无法迁移会话子表：发现 {orphan_count} 条孤儿记录")
+
+        for table in tables:
+            connection.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+        connection.execute("ALTER TABLE conversations RENAME TO conversations_legacy")
+        connection.execute(SCHEMA_CONVERSATIONS)
+        for schema in (
+            SCHEMA_MESSAGES, SCHEMA_SUMMARY_SEGMENTS, SCHEMA_CITATIONS,
+            SCHEMA_CONCLUSIONS, SCHEMA_SYMBOLS, SCHEMA_TURN_CHECKPOINTS,
+        ):
+            connection.execute(schema)
+        connection.execute(
+            "INSERT INTO conversations (conversation_id, user_id, title, created_at, updated_at, last_active_at) "
+            "SELECT conversation_id, user_id, title, created_at, updated_at, last_active_at "
+            "FROM conversations_legacy"
+        )
+        copies = (
+            ("messages", "id, user_id, conversation_id, seq, role, content, payload_json, ts",
+             "x.id, c.user_id, x.conversation_id, x.seq, x.role, x.content, x.payload_json, x.ts"),
+            ("summary_segments", "id, user_id, conversation_id, seq_from, seq_to, tier, text, ledger_json, created_at",
+             "x.id, c.user_id, x.conversation_id, x.seq_from, x.seq_to, x.tier, x.text, x.ledger_json, x.created_at"),
+            ("citations", "user_id, cid, conversation_id, tool, endpoint, symbol, params_json, rows, cols, fingerprint, parquet_path, from_cache, ts",
+             "c.user_id, x.cid, x.conversation_id, x.tool, x.endpoint, x.symbol, x.params_json, x.rows, x.cols, x.fingerprint, x.parquet_path, x.from_cache, x.ts"),
+            ("conclusions", "id, user_id, conversation_id, subject, text, cids_json, ts",
+             "x.id, c.user_id, x.conversation_id, x.subject, x.text, x.cids_json, x.ts"),
+            ("conversation_symbols", "user_id, conversation_id, symbol, name, first_seen, last_seen",
+             "c.user_id, x.conversation_id, x.symbol, x.name, x.first_seen, x.last_seen"),
+            ("turn_checkpoints", "user_id, conversation_id, status, reason, rounds, turn_index, plan_json, partial_answer, persisted_seq, updated_at",
+             "c.user_id, x.conversation_id, x.status, x.reason, x.rounds, x.turn_index, x.plan_json, x.partial_answer, x.persisted_seq, x.updated_at"),
+        )
+        for table, fields, values in copies:
+            connection.execute(
+                f"INSERT INTO {table} ({fields}) SELECT {values} FROM {table}_legacy x "
+                "JOIN conversations c ON c.conversation_id = x.conversation_id"
+            )
+        for table in tables:
+            connection.execute(f"DROP TABLE {table}_legacy")
+        connection.execute("DROP TABLE conversations_legacy")
+
     def claim_user(self, user_id: str) -> int:
         """把无主（``user_id=''``）的对话、笔记与长期记忆划归指定用户。
 
@@ -471,6 +560,17 @@ class MemoryStore:
                 "UPDATE conversations SET user_id = ? WHERE user_id = ''", (user_id,)
             )
             conversations = cursor.rowcount
+            # 子表冗余的 user_id 必须与父对话一同认领。外键是 deferred，故本
+            # 事务内父/子更新的中间态不会被误判为越权记录。
+            for table in (
+                "messages", "summary_segments", "citations", "conclusions",
+                "conversation_symbols", "turn_checkpoints",
+            ):
+                connection.execute(
+                    f"UPDATE {table} SET user_id = ? WHERE user_id = '' "
+                    "AND conversation_id IN (SELECT conversation_id FROM conversations WHERE user_id = ?)",
+                    (user_id, user_id),
+                )
             connection.execute(
                 "UPDATE notes SET user_id = ? WHERE user_id = ''", (user_id,)
             )
@@ -513,12 +613,34 @@ class MemoryStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def ping(self) -> None:
         """确认记忆数据库可建立连接并执行查询。"""
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
+
+    @staticmethod
+    def _conversation_user(connection: sqlite3.Connection, conversation_id: str) -> str:
+        """在同一事务内取得子表写入所需的直接租户键。
+
+        旧 CLI/测试会直接向尚未显式创建的对话追加数据，保留其单租户语义并
+        以空用户作用域创建父记录；服务路径会先 ``ensure_conversation(...,
+        user_id=...)``，因此绝不会走这条兼容分支。
+        """
+        row = connection.execute(
+            "SELECT user_id FROM conversations WHERE conversation_id = ?", (conversation_id,)
+        ).fetchone()
+        if row is not None:
+            return str(row["user_id"])
+        now = _now()
+        connection.execute(
+            "INSERT INTO conversations (conversation_id, user_id, title, created_at, updated_at, last_active_at) "
+            "VALUES (?, '', NULL, ?, ?, ?)",
+            (conversation_id, now, now, now),
+        )
+        return ""
 
     # -- 对话 ------------------------------------------------------------------
     def ensure_conversation(
@@ -536,6 +658,8 @@ class MemoryStore:
                     (conversation_id, user_id, title, now, now, now),
                 )
             else:
+                if user_id and row["user_id"] != user_id:
+                    raise PermissionError("对话不属于该用户")
                 # 后续传入的标题只在原标题为空时补上，绝不覆盖。
                 connection.execute(
                     "UPDATE conversations SET updated_at = ?, last_active_at = ?, title = COALESCE(title, ?) WHERE conversation_id = ?",
@@ -622,6 +746,7 @@ class MemoryStore:
             return (0, 0)
         now = _now()
         with self._connect() as connection:
+            user_id = self._conversation_user(connection, conversation_id)
             row = connection.execute(
                 "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM messages WHERE conversation_id = ?",
                 (conversation_id,),
@@ -629,6 +754,7 @@ class MemoryStore:
             base = int(row["max_seq"])
             rows = [
                 (
+                    user_id,
                     conversation_id,
                     base + offset,
                     message.role,
@@ -639,7 +765,7 @@ class MemoryStore:
                 for offset, message in enumerate(messages, start=1)
             ]
             connection.executemany(
-                "INSERT INTO messages (conversation_id, seq, role, content, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO messages (user_id, conversation_id, seq, role, content, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
         return (base + 1, base + len(messages))
@@ -769,12 +895,13 @@ class MemoryStore:
         now = _now()
         plan_json = json.dumps(plan, ensure_ascii=False) if plan else None
         with self._connect() as connection:
+            user_id = self._conversation_user(connection, conversation_id)
             connection.execute(
                 "INSERT INTO turn_checkpoints ("
-                " conversation_id, status, reason, rounds, turn_index,"
+                " user_id, conversation_id, status, reason, rounds, turn_index,"
                 " plan_json, partial_answer, persisted_seq, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(conversation_id) DO UPDATE SET"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(user_id, conversation_id) DO UPDATE SET"
                 " status = excluded.status, reason = excluded.reason,"
                 " rounds = excluded.rounds, turn_index = excluded.turn_index,"
                 " plan_json = excluded.plan_json,"
@@ -782,6 +909,7 @@ class MemoryStore:
                 " persisted_seq = excluded.persisted_seq,"
                 " updated_at = excluded.updated_at",
                 (
+                    user_id,
                     conversation_id,
                     status,
                     reason or None,
@@ -851,9 +979,10 @@ class MemoryStore:
         now = _now()
         ledger_json = json.dumps(list(ledger or []), ensure_ascii=False)
         with self._connect() as connection:
+            user_id = self._conversation_user(connection, conversation_id)
             connection.execute(
-                "INSERT INTO summary_segments (conversation_id, seq_from, seq_to, tier, text, ledger_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (conversation_id, int(seq_from), int(seq_to), int(tier), text, ledger_json, now),
+                "INSERT INTO summary_segments (user_id, conversation_id, seq_from, seq_to, tier, text, ledger_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, conversation_id, int(seq_from), int(seq_to), int(tier), text, ledger_json, now),
             )
         return SummarySegment(
             conversation_id=conversation_id,
@@ -890,6 +1019,7 @@ class MemoryStore:
     def replace_summary_segments(self, conversation_id: str, segments: list[SummarySegment]) -> None:
         """重写某对话的分段集合，同时保留各段的 seq 区间。"""
         with self._connect() as connection:
+            user_id = self._conversation_user(connection, conversation_id)
             connection.execute(
                 "DELETE FROM summary_segments WHERE conversation_id = ?",
                 (conversation_id,),
@@ -897,6 +1027,7 @@ class MemoryStore:
             now = _now()
             rows = [
                 (
+                    user_id,
                     conversation_id,
                     int(segment.seq_from),
                     int(segment.seq_to),
@@ -909,17 +1040,27 @@ class MemoryStore:
             ]
             if rows:
                 connection.executemany(
-                    "INSERT INTO summary_segments (conversation_id, seq_from, seq_to, tier, text, ledger_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO summary_segments (user_id, conversation_id, seq_from, seq_to, tier, text, ledger_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
 
     # -- 引用（cid 必须在重启后原样保留） --------------------------------------
-    def save_citations(self, conversation_id: str, citations: list[Citation]) -> None:
+    def save_citations(
+        self, conversation_id: str, citations: list[Citation], *, user_id: str | None = None
+    ) -> None:
         if not citations:
             return
         with self._connect() as connection:
+            owner = connection.execute(
+                "SELECT user_id FROM conversations WHERE conversation_id = ?", (conversation_id,)
+            ).fetchone()
+            if owner is None:
+                raise ValueError(f"对话不存在：{conversation_id}")
+            if user_id is not None and owner["user_id"] != user_id:
+                raise PermissionError("对话不属于该用户")
             rows = [
                 (
+                    owner["user_id"],
                     item.cid,
                     conversation_id,
                     item.tool,
@@ -936,16 +1077,26 @@ class MemoryStore:
                 for item in citations
             ]
             connection.executemany(
-                "INSERT OR REPLACE INTO citations (cid, conversation_id, tool, endpoint, symbol, params_json, rows, cols, fingerprint, parquet_path, from_cache, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO citations (user_id, cid, conversation_id, tool, endpoint, symbol, params_json, rows, cols, fingerprint, parquet_path, from_cache, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, conversation_id, cid) DO UPDATE SET "
+                "tool=excluded.tool, endpoint=excluded.endpoint, symbol=excluded.symbol, "
+                "params_json=excluded.params_json, rows=excluded.rows, cols=excluded.cols, "
+                "fingerprint=excluded.fingerprint, parquet_path=excluded.parquet_path, "
+                "from_cache=excluded.from_cache, ts=excluded.ts",
                 rows,
             )
 
-    def load_citations(self, conversation_id: str) -> list[Citation]:
+    def load_citations(self, conversation_id: str, *, user_id: str | None = None) -> list[Citation]:
         with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT cid, tool, endpoint, symbol, params_json, rows, cols, fingerprint, parquet_path, from_cache, ts FROM citations WHERE conversation_id = ? ORDER BY cid",
-                (conversation_id,),
-            ).fetchall()
+            sql = (
+                "SELECT cid, tool, endpoint, symbol, params_json, rows, cols, fingerprint, "
+                "parquet_path, from_cache, ts FROM citations WHERE conversation_id = ?"
+            )
+            params: tuple[object, ...] = (conversation_id,)
+            if user_id is not None:
+                sql += " AND user_id = ?"
+                params = (conversation_id, user_id)
+            rows = connection.execute(sql + " ORDER BY cid", params).fetchall()
         citations: list[Citation] = []
         for row in rows:
             citations.append(
@@ -971,9 +1122,10 @@ class MemoryStore:
     ) -> None:
         """幂等：同一 subject 下的同一条结论只存储一次。"""
         with self._connect() as connection:
+            user_id = self._conversation_user(connection, conversation_id)
             connection.execute(
-                "INSERT OR IGNORE INTO conclusions (conversation_id, subject, text, cids_json, ts) VALUES (?, ?, ?, ?, ?)",
-                (conversation_id, subject, text, json.dumps(list(cids or []), ensure_ascii=False), _now()),
+                "INSERT OR IGNORE INTO conclusions (user_id, conversation_id, subject, text, cids_json, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, conversation_id, subject, text, json.dumps(list(cids or []), ensure_ascii=False), _now()),
             )
 
     def load_conclusions(self, conversation_id: str, *, limit: int = 20) -> list[ConclusionRecord]:
@@ -1020,9 +1172,10 @@ class MemoryStore:
     def upsert_symbol(self, conversation_id: str, symbol: str, *, name: str | None = None) -> None:
         now = _now()
         with self._connect() as connection:
+            user_id = self._conversation_user(connection, conversation_id)
             connection.execute(
-                "INSERT INTO conversation_symbols (conversation_id, symbol, name, first_seen, last_seen) VALUES (?, ?, ?, ?, ?) ON CONFLICT(conversation_id, symbol) DO UPDATE SET last_seen = excluded.last_seen, name = COALESCE(conversation_symbols.name, excluded.name)",
-                (conversation_id, symbol, name, now, now),
+                "INSERT INTO conversation_symbols (user_id, conversation_id, symbol, name, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, conversation_id, symbol) DO UPDATE SET last_seen = excluded.last_seen, name = COALESCE(conversation_symbols.name, excluded.name)",
+                (user_id, conversation_id, symbol, name, now, now),
             )
 
     def load_symbols(self, conversation_id: str) -> list[str]:
