@@ -290,7 +290,9 @@ class AuthSettings(FrozenModel):
     5 次/小时（**按客户端地址**计数）。设为 0 表示关闭该项限制。
     """
 
-    token_ttl_s: PositiveInt = 14 * 24 * 3600
+    # 会话令牌 TTL（绝对过期）：从登录时刻起算，到期后任意请求返回 401，
+    # 前端收到即回到登录页。会话有服务端状态（auth_sessions 表），改短即生效。
+    token_ttl_s: PositiveInt = 3600
     min_password_len: Annotated[int, Field(ge=8, le=128)] = 8
     secure_cookie: bool = False
     allow_register: bool = True

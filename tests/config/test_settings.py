@@ -26,6 +26,7 @@ def test_settings_defaults_include_complete_contract(tmp_path):
     assert settings.context.max_turns == 30
     assert settings.server.confirm_ttl_s == 120
     assert settings.server.allow_remote is False
+    assert settings.auth.token_ttl_s == 3600
     assert set(settings.providers) >= {"deepseek", "kimi", "glm", "volcano", "qwen", "fake"}
     assert settings.providers["kimi"].kind == "anthropic_compat"
     assert settings.providers["kimi"].base_url == "https://api.moonshot.cn/anthropic/v1"

@@ -194,7 +194,7 @@ class UserStore:
         password: str,
         *,
         min_password_len: int = 8,
-        ttl_s: int = 14 * 24 * 3600,
+        ttl_s: int = 3600,
         claim_legacy: "callable | None" = None,
         bootstrap_admin: bool = False,
     ) -> IssuedSession:
@@ -234,7 +234,7 @@ class UserStore:
         password: str,
         *,
         min_password_len: int = 8,
-        ttl_s: int = 14 * 24 * 3600,
+        ttl_s: int = 3600,
     ) -> IssuedSession:
         """校验凭据并签发会话；失败统一为 ``InvalidCredentials``。"""
         _validate_credentials(username, password, min_password_len=min_password_len)

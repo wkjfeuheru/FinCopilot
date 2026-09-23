@@ -163,7 +163,7 @@
     "allow_remote": true
   },
   "auth": {
-    "token_ttl_s": 1209600,
+    "token_ttl_s": 3600,
     "min_password_len": 8,
     "secure_cookie": true,
     "allow_register": false,
