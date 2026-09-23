@@ -843,3 +843,31 @@ def test_stream_response_sets_anti_buffering_headers(tmp_path) -> None:
 
     assert response.headers["cache-control"] == "no-cache, no-transform"
     assert response.headers["x-accel-buffering"] == "no"
+
+
+def test_chat_survives_unwritable_token_vocab_cache(tmp_path, monkeypatch) -> None:
+    """词表缓存不可写不得把一轮对话打成 500（线上事故回归）。
+
+    生产容器以非 root 运行、仓库根不可写，``TokenCounter`` 初始化里的 ``mkdir``
+    抛 PermissionError，首次对话（AgentLoop 构造时）整个 500。契约是降级为字符
+    近似，因此这里断言：即便词表缓存目录无法创建，本轮仍正常收尾于 ``done``。
+    """
+    # 父路径是文件 → 目录创建必然失败（Windows/Linux 一致的 OSError）。
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(blocker / "tiktoken"))
+
+    # 共享计数器与默认目录都可能已被前序用例构造/环境变量化，重置到干净态。
+    import finharness.context.tokens as tokens_mod
+
+    monkeypatch.setattr(tokens_mod, "_SHARED_COUNTER", None)
+    monkeypatch.setattr(
+        tokens_mod, "VOCAB_CACHE_DIR", blocker / "tiktoken", raising=False
+    )
+
+    client = make_client(FakeProvider(["hello"]), tmp_path=tmp_path)
+    response = client.post("/v1/chat/stream", json={"message": "question"})
+
+    assert response.status_code == 200
+    names = [name for name, _ in parse_events(response.text)]
+    assert names[-1] == "done", response.text[:400]

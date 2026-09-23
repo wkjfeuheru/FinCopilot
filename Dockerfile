@@ -53,9 +53,26 @@ COPY src/ src/
 # 无密钥的远程模式配置（路径指向 /data）；密钥经 Railway Variables 注入
 COPY settings.railway.example.json /app/settings.json
 
+# tiktoken 词表预下载进镜像：默认缓存位置是仓库根 data_cache/tiktoken，而运行时
+# 以非 root 的 app 用户跑、/app 属主为 root——在那里建目录会失败（曾导致首次
+# 对话 500）。预置到 /opt/tiktoken 并显式指定 TIKTOKEN_CACHE_DIR，既避免首次
+# 请求触发约两分钟的下载，也不依赖运行时网络。best-effort：构建期取不到时
+# 只降级为字符估算，绝不因此让镜像构建失败。
+RUN mkdir -p /opt/tiktoken \
+    && TIKTOKEN_CACHE_DIR=/opt/tiktoken /app/.venv/bin/python -c \
+       "import tiktoken; tiktoken.get_encoding('cl100k_base')" \
+    || echo "warn: tiktoken vocab prefetch skipped (runtime will estimate)" \
+    ; chown -R app:app /opt/tiktoken
+
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    PORT=8000
+    PORT=8000 \
+    TIKTOKEN_CACHE_DIR=/opt/tiktoken
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PORT=8000 \
+    TIKTOKEN_CACHE_DIR=/opt/tiktoken
 
 # root 启动仅为接管 root 挂载的 /data Volume（RAILWAY_RUN_UID=0 预检决议）；
 # chown 后降权到非 root 的 app 用户运行 Uvicorn。

@@ -44,3 +44,21 @@ def test_count_many_sums_across_texts():
 
 def test_none_is_treated_as_empty():
     assert TokenCounter().count(None).tokens == 0
+
+
+def test_unwritable_cache_dir_degrades_instead_of_raising(tmp_path):
+    """词表缓存目录不可写时必须降级为估算，而不是抛出。
+
+    线上事故：容器以非 root 运行、仓库根不可写，``TokenCounter`` 初始化里的
+    ``mkdir`` 抛出 ``PermissionError``，把首次对话整个打成 500。类的契约是
+    "编码器不可用时改用字符近似"，因此构造期也不能因缓存目录失败而中断。
+    用「父路径是文件」制造可移植的 OSError（Windows/ Linux 一致）。
+    """
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")
+
+    counter = TokenCounter(cache_dir=blocker / "tiktoken")
+    counted = counter.count("a" * 17)
+
+    assert counted.exact is False
+    assert counted.tokens == int(17 / CHARS_PER_TOKEN)

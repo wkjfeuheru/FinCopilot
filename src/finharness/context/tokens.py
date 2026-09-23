@@ -38,10 +38,17 @@ class TokenCounter:
         # 缓存目录，内容都完全相同。让每个实例指向各自的目录会导致每出现一个
         # 新目录都重新下载该文件（首次使用时实测约 100 秒）。
         directory = Path(cache_dir) if cache_dir is not None else _default_cache_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(directory))
         self._encoder = None
         self._failed = False
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # 缓存目录不可写（只读镜像、非 root 运行时仓库根属主为 root）绝不能
+            # 让构造失败：契约是"编码器不可用时改用字符近似"，把一个观测性的
+            # 缓存目录问题升级成请求 500 就违背了它。
+            self._failed = True
+            return
+        os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(directory))
 
     def _load(self):
         """惰性加载并缓存编码器；失败时记录标记并返回 None。"""
