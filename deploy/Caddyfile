@@ -1,0 +1,14 @@
+# FinHarness 反向代理：Caddy 自动签发并续期 Let's Encrypt 证书。
+# 域名经 deploy/.env 的 DOMAIN 注入。
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# SSE 流式响应：禁缓冲、不限时长，逐帧直通浏览器
+	reverse_proxy app:8000 {
+		flush_interval -1
+		transport http {
+			response_header_timeout 24h
+		}
+	}
+}
