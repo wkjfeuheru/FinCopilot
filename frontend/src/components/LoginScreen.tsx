@@ -1,10 +1,11 @@
 import { useState } from "react";
 import { Alert, Button, Form, Input, Tabs, Typography } from "antd";
 import { login, register } from "../api/auth";
+import type { AuthUser } from "../api/auth";
 
 type Props = {
   /** 登录/注册成功后回传用户身份。 */
-  onSuccess: (user: { id: string; username: string }) => void;
+  onSuccess: (user: AuthUser) => void;
 };
 
 /** 未登录时的整页门：登录与注册共用一块表单。 */

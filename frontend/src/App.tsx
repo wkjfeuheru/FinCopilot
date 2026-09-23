@@ -6,6 +6,7 @@ import { ChatPanel } from "./components/ChatPanel";
 import type { ChatPanelHandle, ChatView } from "./components/ChatPanel";
 import { LoginScreen } from "./components/LoginScreen";
 import { MonitorView } from "./components/MonitorView";
+import { AdminView } from "./components/AdminView";
 import { SessionBar } from "./components/SessionBar";
 import { SettingsModal } from "./components/SettingsModal";
 import { traceFromStoredTurn } from "./components/AgentTrace";
@@ -63,9 +64,9 @@ function activitiesFromView(view: ChatView | undefined): Activity[] {
 function App() {
   // 认证门：null 表示还在探测会话，undefined 表示未登录。
   const [user, setUser] = useState<AuthUser | null | undefined>(undefined);
-  // 顶层视图：工作台与运行监控。不引入路由库，沿用条件渲染（监控是
+  // 顶层视图：工作台、管理（仅管理员）。不引入路由库，沿用条件渲染（管理是
   // 独立只读页，不需要深链）。
-  const [view, setView] = useState<"chat" | "monitor">("chat");
+  const [view, setView] = useState<"chat" | "monitor" | "admin">("chat");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [sessionVersion, setSessionVersion] = useState(0);
@@ -342,6 +343,15 @@ function App() {
             >
               运行监控
             </Button>
+            {user.role === "admin" ? (
+              <Button
+                size="small"
+                type={view === "admin" ? "primary" : "default"}
+                onClick={() => setView("admin")}
+              >
+                管理
+              </Button>
+            ) : null}
             <button
               type="button"
               className="status-pill provider-chip"
@@ -370,6 +380,8 @@ function App() {
         <section className="workspace">
           {view === "monitor" ? (
             <MonitorView />
+          ) : view === "admin" ? (
+            <AdminView />
           ) : (
             <div className="workspace-body">
             <ConversationList

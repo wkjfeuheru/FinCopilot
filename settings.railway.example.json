@@ -167,6 +167,7 @@
     "min_password_len": 8,
     "secure_cookie": true,
     "allow_register": false,
+    "admin_bootstrap": false,
     "login_max_attempts": 10,
     "login_window_s": 300,
     "register_max_attempts": 5,
@@ -184,7 +185,8 @@
     "memory_db": "/data/state/memory.db",
     "auth_db": "/data/state/users.db",
     "config_db": "/data/state/config.db",
-    "secret_key": "/data/state/secret.key"
+    "secret_key": "/data/state/secret.key",
+    "usage_db": "/data/state/usage.db"
   },
   "search": {
     "kind": "tavily",

@@ -26,9 +26,15 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin'))
 )
 """
+
+# 旧库（隔离方案初期建表）没有 role 列；打开时补齐，存量用户一律 'user'。
+MIGRATE_USERS_ROLE = (
+    "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'"
+)
 
 SCHEMA_AUTH_SESSIONS = """
 CREATE TABLE IF NOT EXISTS auth_sessions (
@@ -69,10 +75,19 @@ class InvalidCredentials(UserStoreError):
 
 @dataclass(frozen=True, slots=True)
 class CurrentUser:
-    """认证通过后贯穿整个请求的用户身份。"""
+    """认证通过后贯穿整个请求的用户身份。
+
+    ``role`` 是唯一的管理员判定依据（'user' | 'admin'）：运行监控与管理
+    页面都门控在它上，取代旧的 ``trace_store.admin_users`` 用户名白名单。
+    """
 
     id: str
     username: str
+    role: str = "user"
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +130,16 @@ class UserStore:
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(SCHEMA_USERS)
+            self._migrate(connection)
             connection.execute(SCHEMA_AUTH_SESSIONS)
             connection.execute(INDEX_AUTH_SESSIONS_USER)
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        """存量库升级：缺 role 列则补上（默认 'user'，零数据操作）。"""
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
+        if "role" not in columns:
+            connection.execute(MIGRATE_USERS_ROLE)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=10.0)
@@ -134,20 +157,36 @@ class UserStore:
             row = connection.execute("SELECT COUNT(*) AS n FROM users").fetchone()
         return int(row["n"])
 
+    def list_users(self) -> list[dict[str, str]]:
+        """全部账号（管理页用户总览的数据源）；按注册时间升序。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, username, role, created_at FROM users ORDER BY created_at, id"
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "username": row["username"],
+                "role": row["role"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
     def get_user(self, user_id: str) -> CurrentUser | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, username FROM users WHERE id = ?", (user_id,)
+                "SELECT id, username, role FROM users WHERE id = ?", (user_id,)
             ).fetchone()
-        return CurrentUser(id=row["id"], username=row["username"]) if row else None
+        return CurrentUser(id=row["id"], username=row["username"], role=row["role"]) if row else None
 
     def find_by_username(self, username: str) -> CurrentUser | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, username FROM users WHERE username = ? COLLATE NOCASE",
+                "SELECT id, username, role FROM users WHERE username = ? COLLATE NOCASE",
                 (username,),
             ).fetchone()
-        return CurrentUser(id=row["id"], username=row["username"]) if row else None
+        return CurrentUser(id=row["id"], username=row["username"], role=row["role"]) if row else None
 
     def register(
         self,
@@ -157,16 +196,22 @@ class UserStore:
         min_password_len: int = 8,
         ttl_s: int = 14 * 24 * 3600,
         claim_legacy: "callable | None" = None,
+        bootstrap_admin: bool = False,
     ) -> IssuedSession:
         """注册新用户并立即签发会话。
 
         ``claim_legacy`` 在 users 表原本为空时被调用（传入新 user id），
         用于把单用户时代的存量数据划归第一个注册的用户。
         ``DuplicateUsername`` / ``UserStoreError`` 由调用方映射为 HTTP 状态。
+
+        ``bootstrap_admin``：公网部署产生第一个管理员的开关（运维在环境变量
+        里显式打开，注册完即关闭）。开启期间注册的用户 role='admin'；它不
+        依赖"谁是第一个"，因此第二个注册的管理员也是运维明确授权的。
         """
         _validate_credentials(username, password, min_password_len=min_password_len)
         now = _now()
         user_id = _new_user_id()
+        role = "admin" if bootstrap_admin else "user"
         with self._connect() as connection:
             existing = connection.execute(
                 "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE", (username,)
@@ -175,9 +220,9 @@ class UserStore:
                 raise DuplicateUsername(f"用户名已存在: {username}")
             was_empty = connection.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 0
             connection.execute(
-                "INSERT INTO users (id, username, password_hash, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (user_id, username, hash_password(password), now.isoformat(), now.isoformat()),
+                "INSERT INTO users (id, username, password_hash, created_at, updated_at, role)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, username, hash_password(password), now.isoformat(), now.isoformat(), role),
             )
         if was_empty and claim_legacy is not None:
             claim_legacy(user_id)
@@ -227,12 +272,16 @@ class UserStore:
             return None
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT s.user_id, u.username FROM auth_sessions s"
+                "SELECT s.user_id, u.username, u.role FROM auth_sessions s"
                 " JOIN users u ON u.id = s.user_id"
                 " WHERE s.token_hash = ? AND s.expires_at >= ?",
                 (_token_hash(token), _now().isoformat()),
             ).fetchone()
-        return CurrentUser(id=row["user_id"], username=row["username"]) if row else None
+        return (
+            CurrentUser(id=row["user_id"], username=row["username"], role=row["role"])
+            if row
+            else None
+        )
 
     def revoke(self, token: str) -> bool:
         """撤销一个会话令牌；未知令牌返回 False。"""

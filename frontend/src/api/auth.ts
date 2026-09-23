@@ -1,4 +1,4 @@
-export type AuthUser = { id: string; username: string };
+export type AuthUser = { id: string; username: string; role: "user" | "admin" };
 
 export type AuthSession = {
   token: string;

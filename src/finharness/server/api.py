@@ -38,11 +38,13 @@ from finharness.engine.prompt import system_prompt
 from finharness.hooks.audit import AuditHook, AuditLogWriter, summarize_args
 from finharness.hooks.base import HookChain
 from finharness.observability import build_observer, get_logger, setup_logging
+from finharness.observability.usage_store import UsageStore
 from finharness.permissions.gate import EGRESS_CATEGORY, PermissionGate
 from finharness.provider.fake import FakeProvider
 from finharness.provider.registry import build_provider
 from finharness.provider.resolver import NotConfigured, ProviderResolver
 from finharness.server.auth_api import create_auth_router
+from finharness.server.admin_api import create_admin_router
 from finharness.server.config_api import create_config_router
 from finharness.server.confirm import ConfirmBus
 from finharness.server.distill_sweeper import (
@@ -243,6 +245,10 @@ def create_app(
     application.state.user_store = user_store
     require_user = create_require_user(user_store)
 
+    # 用量账本（管理员页数据源）：每轮一行，永远记录，与 trace 开关解耦。
+    usage_store = UsageStore(settings.paths.usage_db)
+    application.state.usage_store = usage_store
+
     # 对话记忆：一个存储服务所有对话；对话记录、
     # 引用、结论与摘要分段均以 conversation id 为键。
     # （提前构造：首个注册用户的存量认领需要它。）
@@ -311,6 +317,9 @@ def create_app(
                 if settings.auth.claim_legacy_on_first_register
                 else None
             ),
+            # 管理员引导：开启期间注册的用户 role='admin'。运维流程见
+            # AuthSettings.admin_bootstrap——注册完立即关闭。
+            bootstrap_admin=settings.auth.admin_bootstrap,
             login_limiter=login_limiter,
             register_limiter=register_limiter,
         )
@@ -318,6 +327,17 @@ def create_app(
 
     if resolver is None:
         resolver = ProviderResolver(store_factory=store_factory, settings=settings)
+
+    # 管理页（/v1/admin）：require_admin 内含 require_user，未登录 401、
+    # 非管理员 403。数据合并 user_store / memory_store / usage_store 三源。
+    application.include_router(
+        create_admin_router(
+            user_store=user_store,
+            memory_store=memory_store,
+            usage_store=usage_store,
+            require_user=require_user,
+        )
+    )
 
     # 一个缓存服务整个进程；每个会话有自己的引用注册表，
     # 使来源信息限定在该对话内。调用方提供的 DataAccess 按原样使用
@@ -626,15 +646,8 @@ def create_app(
     # 路由内部按 admin_users 白名单二次鉴权。
     from finharness.server.trace_api import create_trace_router
 
-    if trace_store is not None and not trace_cfg.admin_users:
-        get_logger("finharness.server.api").warning(
-            "trace_admin_users_empty",
-            extra={"hint": "trace_store 已启用但 admin_users 为空，监控页对所有人不可见"},
-        )
     application.include_router(
-        create_trace_router(
-            trace_store, list(trace_cfg.admin_users), require_user=require_user
-        )
+        create_trace_router(trace_store, require_user=require_user)
     )
     frontend_dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
     if (frontend_dist / "assets").is_dir():
@@ -661,6 +674,7 @@ def create_app(
             ("user_store", user_store.ping),
             ("memory_store", memory_store.ping),
             ("config_store", lambda: store_factory().ping()),
+            ("usage_store", usage_store.ping),
             ("audit_log_parent", check_audit_log_parent),
         )
         for dependency, check in checks:
@@ -1334,9 +1348,11 @@ def create_app(
                 引擎正常返回但缺少终止事件的兜底。outcome 的 ``trace``（每轮
                 thought/actions/observations）只在引擎正常返回时可得；异常路径
                 落一个终态行即可——事件流已经把过程留下来了。
+
+                用量账本在 trace **之前**落一行：它是计费口径，与 trace 开关
+                解耦——监控关闭时 token/轮次照记不误。落账失败由 UsageStore
+                吞掉（旁路纪律），绝不影响收尾。
                 """
-                if trace_store is None or not trace_run_started:
-                    return
                 outcome = None
                 if task.done() and not task.cancelled():
                     try:
@@ -1348,13 +1364,30 @@ def create_app(
                     succeeded = bool(getattr(outcome, "succeeded", False))
                 elif status == "done":
                     succeeded = True
-                usage = None
+                usage = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_hit_tokens": 0,
+                }
                 if outcome is not None:
                     u = getattr(outcome, "usage", None)
                     usage = {
                         "input_tokens": getattr(u, "input_tokens", 0) or 0,
                         "output_tokens": getattr(u, "output_tokens", 0) or 0,
+                        "cache_hit_tokens": getattr(u, "cache_hit_tokens", 0) or 0,
                     }
+                elapsed_ms = round((time.monotonic() - started) * 1000)
+                usage_store.record_turn(
+                    user_id=user.id,
+                    input_tokens=usage["input_tokens"],
+                    output_tokens=usage["output_tokens"],
+                    cache_hit_tokens=usage["cache_hit_tokens"],
+                    duration_ms=elapsed_ms,
+                    # 账本只关心计费口径的终态：done/stopped/error。
+                    status=status,
+                )
+                if trace_store is None or not trace_run_started:
+                    return
                 trace_store.finish_run(
                     run_id,
                     status=status,

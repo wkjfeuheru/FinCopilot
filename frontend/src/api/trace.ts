@@ -95,13 +95,13 @@ export type TraceFilters = {
 };
 
 /**
- * 监控可用性。三种状态正交，前端据此给出不同的引导：
- * 未启用（提示开启方法）/ 无权限（提示加白名单）/ 可用（渲染数据）。
+ * 监控可用性。两种状态正交，前端据此给出不同的引导：
+ * 未启用（提示开启方法）/ 无权限（提示找运维提权）/ 可用（渲染数据）。
+ * 权限已统一为 users.role='admin'；admin_users 白名单已退役。
  */
 export type TraceStatus = {
   enabled: boolean;
   is_admin: boolean;
-  admin_configured: boolean;
 };
 
 export async function fetchTraceStatus(): Promise<TraceStatus> {

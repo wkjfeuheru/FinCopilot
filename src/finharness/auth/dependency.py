@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 
 from finharness.auth.store import CurrentUser, UserStore
 
@@ -37,3 +37,21 @@ def create_require_user(store: UserStore):
         return user
 
     return require_user
+
+
+def create_require_admin(require_user):
+    """在 ``require_user`` 之上叠加管理员判定：非 admin 403。
+
+    管理员 = ``users.role='admin'``（见 ``UserStore.register`` 的
+    ``bootstrap_admin``）。所有受限端点（管理页、运行监控）共用这一个
+    依赖，权限语义只有一处。
+    """
+
+    def require_admin(
+        request: Request, user: CurrentUser = Depends(require_user)
+    ) -> CurrentUser:
+        if not user.is_admin:
+            raise HTTPException(status_code=403, detail="无管理员权限")
+        return user
+
+    return require_admin

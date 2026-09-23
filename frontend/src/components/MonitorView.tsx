@@ -94,7 +94,8 @@ function MetricCard({ title, value, hint }: { title: string; value: string; hint
   );
 }
 
-function MetricsPanel({ filters }: { filters: TraceFilters }) {
+/** 指标面板；管理页「运行监控」标签复用。 */
+export function MetricsPanel({ filters }: { filters: TraceFilters }) {
   const [metrics, setMetrics] = useState<TraceMetrics | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -191,7 +192,8 @@ function MetricsPanel({ filters }: { filters: TraceFilters }) {
   );
 }
 
-function RunsPanel({ filters }: { filters: TraceFilters }) {
+/** Trace 浏览器；管理页「运行监控」标签复用。 */
+export function RunsPanel({ filters }: { filters: TraceFilters }) {
   const [runs, setRuns] = useState<TraceRun[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -370,8 +372,7 @@ export function MonitorView() {
         title="运行监控未启用"
         lines={[
           "监控默认关闭；启用后即可记录完整 trace 并展示七项指标。",
-          "在 settings.json 中设置 observability.trace_store.enabled = true，",
-          "并把需要查看监控的用户名加入 observability.trace_store.admin_users，然后重启服务。",
+          "在 settings.json 中设置 observability.trace_store.enabled = true，然后重启服务。",
           "也可用环境变量 FINH_OBSERVABILITY_TRACE_STORE_ENABLED=true 启用。",
         ]}
       />,
@@ -382,12 +383,7 @@ export function MonitorView() {
     return shell(
       <MonitorNotice
         title="无监控访问权限"
-        lines={[
-          "当前用户不在监控白名单中。",
-          status.admin_configured
-            ? "请让运维方把你的用户名加入 observability.trace_store.admin_users。"
-            : "当前白名单为空——即使监控已启用，也没有任何用户能看到，请在 settings.json 中补上 admin_users。",
-        ]}
+        lines={["监控仅对管理员（users.role='admin'）开放，请联系运维方提权。"]}
       />,
     );
   }

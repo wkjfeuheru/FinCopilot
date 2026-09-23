@@ -168,6 +168,7 @@
     "min_password_len": 8,
     "secure_cookie": false,
     "allow_register": true,
+    "admin_bootstrap": false,
     "login_max_attempts": 10,
     "login_window_s": 300,
     "register_max_attempts": 5,
@@ -186,6 +187,7 @@
     "auth_db": "state/users.db",
     "config_db": "state/config.db",
     "secret_key": "state/secret.key",
+    "usage_db": "state/usage.db",
     "skills_dir": "skills"
   },
   "search": {

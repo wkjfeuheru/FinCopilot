@@ -69,7 +69,11 @@ def _session_response(
     )
     return {
         "token": session.token,
-        "user": {"id": session.user.id, "username": session.user.username},
+        "user": {
+            "id": session.user.id,
+            "username": session.user.username,
+            "role": session.user.role,
+        },
         "expires_at": session.expires_at,
     }
 
@@ -81,10 +85,14 @@ def create_auth_router(
     secure_cookie: bool,
     allow_register: bool = True,
     claim_legacy=None,
+    bootstrap_admin: bool = False,
     login_limiter: RateLimiter | None = None,
     register_limiter: RateLimiter | None = None,
 ) -> APIRouter:
     """构建认证路由；``claim_legacy`` 见 ``UserStore.register``。
+
+    ``bootstrap_admin``：开启期间注册的用户 role='admin'（管理员引导，
+    见 ``AuthSettings.admin_bootstrap``）。
 
     ``login_limiter`` / ``register_limiter`` 省略时该端点不限速（保持单用户
     本地部署的既有行为）；服务端按 settings 显式注入。
@@ -107,6 +115,7 @@ def create_auth_router(
                 payload.password,
                 ttl_s=ttl_s,
                 claim_legacy=claim_legacy,
+                bootstrap_admin=bootstrap_admin,
             )
         except DuplicateUsername as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -156,6 +165,6 @@ def create_auth_router(
         user = resolve_user(request, store)
         if user is None:
             raise HTTPException(status_code=401, detail="未登录或会话已过期")
-        return {"user": {"id": user.id, "username": user.username}}
+        return {"user": {"id": user.id, "username": user.username, "role": user.role}}
 
     return router

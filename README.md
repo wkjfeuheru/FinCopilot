@@ -96,6 +96,20 @@ Node 构建前端 → `uv sync --locked` 装依赖 → 非 root 运行）、`rai
 选择 `settings.providers` 里预设的 Provider 地址（SSRF 防护），自有密钥经 Fernet 加密
 存储在 Volume 中。
 
+### 管理员初始化（首次部署）
+
+管理员 = `users.role='admin'`，由引导开关产生（`FINH_AUTH_ADMIN_BOOTSTRAP`）：
+
+1. Variables 临时加 `FINH_AUTH_ALLOW_REGISTER=true` 与
+   `FINH_AUTH_ADMIN_BOOTSTRAP=true` → 自动部署
+2. 打开站点注册你的账号（此期间注册的用户都是管理员）
+3. **删除这两个变量** → 此后注册口关闭、新用户一律普通用户
+
+管理入口（header 的「管理」按钮）只对 `role=admin` 用户渲染；用户总览展示全部
+账号的注册信息、对话数、对话轮数与 token 消耗（总累计 + 24h/7d/30d 窗口），
+运行监控并入其中。用量数据来自每轮一行、永远记录的用量账本（`state/usage.db`，
+与 trace 开关无关）。
+
 ## 支持的 Provider
 
 | Provider | 协议 | 密钥环境变量 |
@@ -238,6 +252,9 @@ frontend/           React 19 + TypeScript + antd
 |---|---|---|
 | GET | `/v1/health` | 健康检查（liveness） |
 | GET | `/v1/ready` | 就绪检查：三个 SQLite store ping + 审计目录可写；失败返回 503（Railway 部署健康探针） |
+| GET | `/v1/admin/status` | 管理员门控（`{is_admin}`）；非管理员 403 |
+| GET | `/v1/admin/users?window=all\|24h\|7d\|30d` | 用户总览：注册信息、对话数、轮数、token 消耗（总累计 + 窗口内并列） |
+| GET | `/v1/admin/usage/summary?window=…` | 用量汇总卡片（总用户/窗口活跃/窗口轮数/token） |
 | POST | `/v1/chat/stream` | 流式对话（SSE），主入口 |
 | POST | `/v1/chat/respond` | 回应写确认 / `ask_user` 提问 |
 | POST | `/v1/chat/stop` | 停止当前生成（协作式；保留已取得的数据与结论，可继续） |

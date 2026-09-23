@@ -304,6 +304,11 @@ class AuthSettings(FrozenModel):
     # 默认关闭：这是一个"第一个注册的人拿到全部历史数据"的隐式授权，在对外
     # 部署里等于把存量数据交给任意外部访客。需要时由运维显式打开。
     claim_legacy_on_first_register: bool = False
+    # 管理员引导开关：开启期间注册的用户 role='admin'，关闭后注册的都是
+    # 普通用户。公网部署产生第一个管理员的标准流程：打开本开关（与注册
+    # 开关一起）→ 注册管理员账号 → 删除开关变量。环境变量
+    # FINH_AUTH_ADMIN_BOOTSTRAP，Railway Variables 面板即可操作。
+    admin_bootstrap: bool = False
 
 
 class QuotaSettings(FrozenModel):
@@ -369,8 +374,11 @@ class TracingSettings(FrozenModel):
 class TraceStoreSettings(FrozenModel):
     """运行轨迹持久化（docs 03.14.4）：自建监控平台的数据面。
 
-    纯标准库 SQLite，无额外依赖；``admin_users`` 是可访问监控查询 API 的
-    用户名白名单（users 表无角色列，权限走配置而非 auth schema）。
+    纯标准库 SQLite，无额外依赖。
+
+    ``admin_users`` 已弃用：监控与管理页的权限统一为 ``users.role='admin'``
+    （见 ``UserStore.register`` 的 bootstrap_admin）。字段保留只为旧
+    settings.json 兼容（不报错），**不再参与任何鉴权判断**。
     """
 
     enabled: bool = False
@@ -422,6 +430,8 @@ class PathSettings(FrozenModel):
     # 加密后的供应商配置库与其主密钥（docs 03.13）。
     config_db: Path = Path("state/config.db")
     secret_key: Path = Path("state/secret.key")
+    # 用量账本（管理员页数据源）：每轮一行的 token/轮次记录。
+    usage_db: Path = Path("state/usage.db")
     # Skills 随包分发（docs 03.8）：以本文件为基准解析，
     # 这样无论工作目录如何都能找到目录清单。
     skills_dir: Path = Path(__file__).resolve().parent.parent / "skills"
@@ -679,6 +689,7 @@ class Settings(BaseSettings):
             "paths.auth_db": self.paths.auth_db,
             "paths.config_db": self.paths.config_db,
             "paths.secret_key": self.paths.secret_key,
+            "paths.usage_db": self.paths.usage_db,
         }
         for state_name, state_path in state_files.items():
             for root_name, root in roots.items():
@@ -876,6 +887,7 @@ def _resolve_paths(payload: dict[str, Any], base: Path) -> None:
         ("paths", "auth_db"),
         ("paths", "config_db"),
         ("paths", "secret_key"),
+        ("paths", "usage_db"),
         ("paths", "skills_dir"),
     ):
         target = payload
@@ -1026,6 +1038,7 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
         ("auth", "claim_legacy_on_first_register"),
         bool,
     ),
+    "FINH_AUTH_ADMIN_BOOTSTRAP": (("auth", "admin_bootstrap"), bool),
     "FINH_QUOTA_TURNS_PER_WINDOW": (("quota", "turns_per_window"), int),
     "FINH_QUOTA_WINDOW_S": (("quota", "window_s"), int),
     "FINH_QUOTA_MAX_CONCURRENT_STREAMS": (("quota", "max_concurrent_streams"), int),
@@ -1035,6 +1048,7 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_PATHS_AUTH_DB": (("paths", "auth_db"), Path),
     "FINH_PATHS_CONFIG_DB": (("paths", "config_db"), Path),
     "FINH_PATHS_SECRET_KEY": (("paths", "secret_key"), Path),
+    "FINH_PATHS_USAGE_DB": (("paths", "usage_db"), Path),
     "FINH_PATHS_SKILLS_DIR": (("paths", "skills_dir"), Path),
     "FINH_SEARCH_KIND": (("search", "kind"), Literal["tavily"]),
     "FINH_SEARCH_BASE_URL": (("search", "base_url"), str),

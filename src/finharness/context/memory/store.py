@@ -599,6 +599,22 @@ class MemoryStore:
                 (now, now, conversation_id),
             )
 
+    def conversation_stats_by_user(self) -> dict[str, dict[str, str | int]]:
+        """每用户的对话数与最后活跃时间（管理员页用户总览数据源）。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT user_id, COUNT(*) AS conversations, MAX(last_active_at) AS last_active_at"
+                " FROM conversations GROUP BY user_id"
+            ).fetchall()
+        return {
+            row["user_id"]: {
+                "conversations": int(row["conversations"]),
+                "last_active_at": row["last_active_at"] or "",
+            }
+            for row in rows
+            if row["user_id"]
+        }
+
     # -- 对话记录 --------------------------------------------------------------
     def append_messages(self, conversation_id: str, messages: list[Msg]) -> tuple[int, int]:
         """在单个事务中写入消息；返回分配到的 seq 区间。"""
