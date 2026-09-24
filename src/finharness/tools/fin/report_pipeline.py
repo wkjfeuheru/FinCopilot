@@ -13,7 +13,11 @@ from pathlib import Path
 
 from finharness.config.settings import Settings
 from finharness.data.citation import CitationRegistry
-from finharness.tools.fin.docx_export import DISCLAIMER, DocxExportError, export_markdown_to_docx
+from finharness.tools.fin.docx_export import (
+    DISCLAIMER,
+    DocxExportError,
+    export_markdown_to_docx,
+)
 from finharness.utils.markdown import image_markdown
 
 CITE_RE = re.compile(r"\{cite:(cit_\d+)\}")

@@ -9,10 +9,14 @@
 from __future__ import annotations
 
 from finharness.data.freshness import SeriesSpec, freshness_from_grouped_frame
-from finharness.data.mapping import MACRO_INDICATORS, MACRO_INDICATOR_LABELS, normalize_macro_indicator
+from finharness.data.mapping import (
+    MACRO_INDICATOR_LABELS,
+    MACRO_INDICATORS,
+    normalize_macro_indicator,
+)
 from finharness.data.raw import RawData
+from finharness.shared.declaration import Capability, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 # 一套完整的宏观仪表盘；模型会将其收窄到问题实际需要的指标。
 DEFAULT_INDICATORS = (

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+from finharness.utils.jsonx import stable_dumps
 
 
 @dataclass(slots=True)
@@ -40,7 +41,7 @@ def _cid_ordinal(cid: str) -> int:
 
 def fingerprint_series(records: Any) -> str:
     """表格内容的稳定摘要，不受列顺序噪声影响。"""
-    payload = json.dumps(records, ensure_ascii=False, sort_keys=True, default=str)
+    payload = stable_dumps(records)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

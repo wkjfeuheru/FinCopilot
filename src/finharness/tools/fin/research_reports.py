@@ -27,14 +27,14 @@ from datetime import date, timedelta
 from typing import Literal
 
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
-from finharness.tools.generic.fencing import (
+from finharness.shared.declaration import Capability, Tier, ToolGroup, param, tool
+from finharness.shared.fencing import (
     EXTERNAL_NOTICE,
     RESULT_CLOSE,
     fence,
     neutralize,
 )
+from finharness.tools.base import BaseTool
 
 # 单条结果的 token 预算。研报是"一次抓取、多篇句柄"，比常规数据结果需要更多空间
 # 才能列出全部句柄与预览，因此显式声明高于全局默认值。

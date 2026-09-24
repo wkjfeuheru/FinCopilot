@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import pytest
-
 from finharness.config.settings import ContextSettings, Settings
 from finharness.data.access import DataAccess
 from finharness.tools.generic.pdf import ReadPdfTool
@@ -134,8 +132,8 @@ def test_hostile_page_text_cannot_forge_the_fence(tmp_path):
 
 
 def test_it_is_labelled_read_only_and_generic():
+    from finharness.shared.declaration import Tier
     from finharness.tools.base import PermissionLevel, ToolGroup
-    from finharness.tools.declare import Tier
     from finharness.tools.registry import worker_tool_names
 
     assert ReadPdfTool.permission is PermissionLevel.READ

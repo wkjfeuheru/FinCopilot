@@ -4,6 +4,7 @@ from finharness.config.settings import ContextSettings, Settings
 from finharness.context.memory.working import KEEP_RECENT_ROUNDS, WorkingMemory
 from finharness.context.tokens import TokenCounter
 from finharness.types import Msg, ToolUse
+from tests.conftest import settings_with_cache
 
 # 共享的 counter：tiktoken 的词表获取代价高昂，因此测试复用机器上
 # 已有的缓存，而不是每次重新请求一份新的。
@@ -13,7 +14,7 @@ COUNTER = TokenCounter()
 def make_settings(tmp_path, **context) -> Settings:
     values = {"context_window_tokens": 1000, "compaction_ratio": 0.8}
     values.update(context)
-    return Settings(context=ContextSettings(**values), data={"cache_dir": tmp_path / "cache"})
+    return settings_with_cache(tmp_path, context=ContextSettings(**values))
 
 
 def make_memory(tmp_path, **context) -> WorkingMemory:

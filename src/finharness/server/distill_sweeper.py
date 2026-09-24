@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from finharness.config.settings import Settings
@@ -28,7 +28,7 @@ SCAN_INTERVAL_S = 60.0
 
 def _idle_before(settings: Settings, *, now: datetime | None = None) -> str:
     """闲置判定的时间下界（ISO 字符串，与库中的时间戳同格式）。"""
-    moment = now or datetime.now(timezone.utc)
+    moment = now or datetime.now(UTC)
     return (moment - timedelta(seconds=int(settings.ltm.distill_idle_s))).isoformat(
         timespec="seconds"
     )

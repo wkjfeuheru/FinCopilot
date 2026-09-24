@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from finharness.config.settings import Settings
@@ -20,7 +20,7 @@ from finharness.context.memory.working import KEEP_RECENT_ROUNDS, WorkingMemory
 from finharness.context.tokens import CHARS_PER_TOKEN, truncate_to_tokens
 from finharness.observability import NullObserver
 from finharness.provider.base import Provider
-from finharness.types import Msg, ModelUsage, StreamEvent
+from finharness.types import ModelUsage, Msg, StreamEvent
 
 SUMMARIZE_PROMPT = (
     "请把下面这段研究过程压缩成一段中文摘要，用于后续对话的上下文。要求：\n"

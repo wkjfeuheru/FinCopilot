@@ -10,8 +10,8 @@ from __future__ import annotations
 import asyncio
 
 from finharness.coordinator import SubAgentResult
+from finharness.shared.declaration import Tier
 from finharness.tools.base import PermissionLevel, ToolGroup
-from finharness.tools.declare import Tier
 from finharness.tools.meta.spawn import SpawnAgentTool
 
 

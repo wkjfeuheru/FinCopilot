@@ -16,8 +16,8 @@ from __future__ import annotations
 from typing import Any
 
 from finharness.data.raw import RawData
+from finharness.shared.declaration import Capability, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 _EPISODE_KIND_LABELS = {
     "task_result": "任务结果",

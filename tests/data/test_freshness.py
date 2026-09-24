@@ -12,8 +12,8 @@ from finharness.data.freshness import (
     Freshness,
     SeriesFreshness,
     SeriesSpec,
-    freshness_from_grouped_frame,
     frequency_label,
+    freshness_from_grouped_frame,
 )
 
 

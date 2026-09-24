@@ -14,14 +14,14 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from finharness.utils.text import CHARS_PER_TOKEN
+
 # cl100k_base 是系统所处理的中英混合文本最接近且广泛可用的词表。
 ENCODING_NAME = "cl100k_base"
 # 词表统一缓存在项目本地，独立于数据缓存的布局，这样测试用的临时目录
 # 就不会各自再下载一份副本。
 # parents: [0]=context, [1]=finharness, [2]=src, [3]=repo root
 VOCAB_CACHE_DIR = Path(__file__).resolve().parents[3] / "data_cache" / "tiktoken"
-# 文档约定的回退方案（docs 03.6.3）：中文为主文本约每 token 1.7 个字符。
-CHARS_PER_TOKEN = 1.7
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +86,7 @@ class TokenCounter:
 
 
 def truncate_to_tokens(
-    text: str, counter: "TokenCounter", limit: int, *, marker: str = "…"
+    text: str, counter: TokenCounter, limit: int, *, marker: str = "…"
 ) -> str:
     """把文本裁剪到指定 token 预算，并落在字符边界上。
 
@@ -118,7 +118,7 @@ def _default_cache_dir() -> Path:
     return Path(override) if override else VOCAB_CACHE_DIR
 
 
-_SHARED_COUNTER: "TokenCounter | None" = None
+_SHARED_COUNTER: TokenCounter | None = None
 
 
 def default_counter() -> TokenCounter:

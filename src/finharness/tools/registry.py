@@ -11,11 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from finharness.context.tokens import CHARS_PER_TOKEN
 from finharness.context.trim import DEFAULT_MAX_DESC_LEN, trim_schema
 from finharness.data.access import DataAccess
+from finharness.shared.declaration import PermissionLevel, Tier, ToolGroup
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import PermissionLevel, Tier, ToolGroup
 
 # 工具类经由 loader 注册，使目录扩张时该模块仍可导入。
 from finharness.tools.fin.announcements import GetAnnouncementsTool
@@ -30,7 +29,10 @@ from finharness.tools.fin.dataset import (
 )
 from finharness.tools.fin.financials import GetFinancialsTool
 from finharness.tools.fin.indicators import GetIndicatorsTool
-from finharness.tools.fin.industry import GetIndustryConstituentsTool, GetIndustryPerfTool
+from finharness.tools.fin.industry import (
+    GetIndustryConstituentsTool,
+    GetIndustryPerfTool,
+)
 from finharness.tools.fin.kline import GetKlineTool
 from finharness.tools.fin.macro import GetMacroIndicatorsTool
 from finharness.tools.fin.metrics import CalcMetricsTool
@@ -59,6 +61,7 @@ from finharness.tools.meta.plan import (
 from finharness.tools.meta.preference import RememberPreferenceTool
 from finharness.tools.meta.spawn import SpawnAgentTool
 from finharness.tools.meta.summarize import SummarizeDocumentTool
+from finharness.utils.text import CHARS_PER_TOKEN
 
 ALL_TOOL_CLASSES: tuple[type[BaseTool], ...] = (
     # 金融-数据

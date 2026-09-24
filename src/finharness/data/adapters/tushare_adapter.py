@@ -8,12 +8,12 @@ tushare 不是硬依赖，且需要付费 token，因此本适配器在缺少两
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
-from typing import Any
+from datetime import date
 
 import pandas as pd
 
 from finharness.data.adapters.base import AdapterError, DataAdapter, FetchResult
+from finharness.data.lookback import lookback_stamp
 
 
 def _import_tushare():
@@ -74,7 +74,7 @@ class TushareAdapter(DataAdapter):
     def fetch_kline(self, symbol: str, period: str, adjust: str | None, years: int) -> FetchResult:
         """经 daily 接口获取日线，统一列名并按日期升序排列。"""
         pro = self._pro()
-        start = (date.today() - timedelta(days=365 * max(years, 1) + 30)).strftime("%Y%m%d")
+        start = lookback_stamp(years, extra_days=30)
         end = date.today().strftime("%Y%m%d")
         try:
             df = pro.daily(ts_code=self._ts_code(symbol), start_date=start, end_date=end)
@@ -87,7 +87,7 @@ class TushareAdapter(DataAdapter):
     def fetch_indicators(self, symbol: str, years: int, fields: list[str] | None) -> FetchResult:
         """经 fina_indicator 接口获取财务指标。"""
         pro = self._pro()
-        start = (date.today() - timedelta(days=365 * max(years, 1) + 30)).strftime("%Y%m%d")
+        start = lookback_stamp(years, extra_days=30)
         end = date.today().strftime("%Y%m%d")
         try:
             df = pro.fina_indicator(ts_code=self._ts_code(symbol), start_date=start, end_date=end)
@@ -100,7 +100,7 @@ class TushareAdapter(DataAdapter):
     def fetch_financials(self, symbol: str, statement: str, years: int) -> FetchResult:
         """经 income 接口获取利润表数据。"""
         pro = self._pro()
-        start = (date.today() - timedelta(days=365 * max(years, 1) + 30)).strftime("%Y%m%d")
+        start = lookback_stamp(years, extra_days=30)
         end = date.today().strftime("%Y%m%d")
         try:
             df = pro.income(ts_code=self._ts_code(symbol), start_date=start, end_date=end)

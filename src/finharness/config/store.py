@@ -13,10 +13,11 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 from finharness.config.crypto import SecretCipher
+from finharness.utils.clock import utc_now_iso
+from finharness.utils.sqlite import SqliteStore
 
 
 class ConfigStoreError(RuntimeError):
@@ -78,14 +79,13 @@ INDEX_SINGLE_ACTIVE_PER_USER = (
 )
 
 
-class ConfigStore:
+class ConfigStore(SqliteStore):
     """单文件 SQLite 存储；每条语句都使用绑定参数。"""
 
     def __init__(self, db_path: str | Path, *, cipher: SecretCipher) -> None:
         """打开/创建数据库并确保表结构就绪；``cipher`` 用于加解密 api_key。"""
 
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        super().__init__(db_path)
         self._cipher = cipher
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
@@ -128,20 +128,6 @@ class ConfigStore:
                 "UPDATE provider_configs SET user_id = ? WHERE user_id = ''", (user_id,)
             )
         return cursor.rowcount
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10.0)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    def ping(self) -> None:
-        """确认配置数据库可建立连接并执行查询。"""
-        with self._connect() as connection:
-            connection.execute("SELECT 1").fetchone()
-
-    @staticmethod
-    def _now() -> str:
-        return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     @staticmethod
     def _to_record(row: sqlite3.Row) -> ProviderConfigRecord:
@@ -209,7 +195,7 @@ class ConfigStore:
         返回新创建记录的不可变快照。
         """
 
-        now = self._now()
+        now = utc_now_iso()
         ciphertext = self._cipher.encrypt(api_key) if api_key else None
         try:
             with self._connect() as connection:
@@ -249,7 +235,7 @@ class ConfigStore:
 
         if self.get(config_id, user_id=user_id) is None:
             raise ConfigNotFound(f"配置不存在: {config_id}")
-        now = self._now()
+        now = utc_now_iso()
         try:
             with self._connect() as connection:
                 if api_key is None:
@@ -284,7 +270,7 @@ class ConfigStore:
             )
             connection.execute(
                 "UPDATE provider_configs SET is_active = 1, updated_at = ? WHERE id = ? AND user_id = ?",
-                (self._now(), config_id, user_id),
+                (utc_now_iso(), config_id, user_id),
             )
         record = self.get(config_id, user_id=user_id)
         assert record is not None

@@ -6,13 +6,12 @@
 
 from __future__ import annotations
 
-from finharness.tools.generic.fencing import (
+from finharness.shared.fencing import (
     RESULT_CLOSE,
     close_dangled,
     fence,
     neutralize,
 )
-
 
 # -- neutralize ---------------------------------------------------------------
 

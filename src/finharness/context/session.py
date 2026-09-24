@@ -13,6 +13,7 @@ from datetime import datetime
 from finharness.config.settings import Settings
 from finharness.context.tokens import default_counter, truncate_to_tokens
 from finharness.data.citation import CitationRegistry
+from finharness.utils.clock import today_iso
 
 STEP_STATUSES = ("pending", "done", "fail", "skipped")
 _STATUS_MARK = {"pending": "○", "done": "✓", "fail": "✗", "skipped": "－"}
@@ -20,17 +21,6 @@ _STATUS_MARK = {"pending": "○", "done": "✓", "fail": "✗", "skipped": "－"
 # 内存中保留的结论条数上限。结论按会话累积，且状态块只渲染最后几条，
 # 因此保留最近这些即可；更早的已落库，由 ``prior_conclusions`` 召回。
 CONCLUSION_MEMORY_LIMIT = 50
-
-
-def _today_stamp() -> str:
-    """当前日期（本地时区，ISO）。
-
-    模型此前完全不知道「今天」：全仓的 ``date.today()`` 只服务于适配器的取数窗口与工具
-    默认值，没有任何日期进入上下文。缺少这个锚点，模型无法判断某个数据期是否即当前
-    最新已发布期，也无法把「月度指标尚未发布」与「系统给了旧数据」区分开——它只能
-    把裸期间（如 2026-08）当成可能是过期的值。随状态块逐请求注入，遂使时效判断有据。
-    """
-    return datetime.now().astimezone().date().isoformat()
 
 
 @dataclass(slots=True)
@@ -60,7 +50,7 @@ class PlanStep:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "PlanStep":
+    def from_dict(cls, data: dict) -> PlanStep:
         """从断点还原；未知/缺失字段按默认值处理，损坏的条目交给上层丢弃。"""
         status = str(data.get("status") or "pending")
         if status not in STEP_STATUSES:
@@ -106,7 +96,7 @@ class Plan:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Plan | None":
+    def from_dict(cls, data: dict) -> Plan | None:
         """从断点还原计划；无有效步骤时返回 ``None``（空计划没有恢复价值）。"""
         steps = [
             PlanStep.from_dict(item)
@@ -390,8 +380,13 @@ class ResearchContext:
         按模型对其需求的紧迫程度排列，组合四个不同的面向：当前日期、当前计划、本对话的
         结论、召回的事件，然后是分段的历史摘要。每个面向的形态都刻意不同 —— 见
         记忆包的文档字符串。
+
+        日期锚点是必需的：模型此前完全不知道「今天」——全仓的 ``date.today()`` 只服务
+        于适配器的取数窗口与工具默认值，没有任何日期进入上下文。缺少它，模型无法判断
+        某个数据期是否即当前最新已发布期，也无法把「月度指标尚未发布」与「系统给了旧
+        数据」区分开，只能把裸期间（如 2026-08）当成可能是过期的值。
         """
-        parts: list[str] = [f"当前日期：{_today_stamp()}"]
+        parts: list[str] = [f"当前日期：{today_iso()}"]
         digest = self.plan_digest()
         if digest:
             parts.append(digest)

@@ -1,31 +1,22 @@
 """Anthropic Messages 兼容流式 Provider。"""
 from __future__ import annotations
+
 import json
 from collections.abc import AsyncIterator
 from typing import Any
+
 import httpx
+
+from finharness.provider._compat import (
+    as_network_error,
+    raise_for_status,
+    raise_provider_error,
+)
 from finharness.provider.base import Provider
-from finharness.provider.errors import AuthError, NetworkError, RateLimitError, ServerError, TokenLimitError, is_token_limit_error, parse_retry_after
+from finharness.provider.errors import NetworkError
 from finharness.provider.event_stream import ToolUseAccumulator, iter_sse_data
 from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUseDelta
 
-def _raise_error(error: Any) -> None:
-    """根据 provider 返回的错误内容映射为对应的 provider 异常。"""
-    text = str(error).lower() if not isinstance(error, dict) else " ".join(str(error.get(k, "")) for k in ("type", "code", "message", "error")).lower()
-    if is_token_limit_error(text): raise TokenLimitError("Provider context window exceeded")
-    if any(t in text for t in ("rate_limit", "rate limit", "ratelimit")): raise RateLimitError("Provider rate limit exceeded")
-    if any(t in text for t in ("authentication", "permission", "api_key", "api key", "unauthorized")): raise AuthError("Provider authentication failed")
-    if "server" in text: raise ServerError("Provider server error")
-    raise NetworkError("Provider returned an error")
-
-async def _raise_http_error(response: Any) -> None:
-    """把 4xx 响应细分为上下文超限或一般请求失败（与 OpenAI 兼容层一致）。"""
-    try:
-        body = (await response.aread()).decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001 - 读不到正文时按一般失败处理
-        body = ""
-    if is_token_limit_error(body): raise TokenLimitError("Provider context window exceeded")
-    raise NetworkError(f"Provider request failed ({response.status_code})")
 
 def _convert_tools(tools: list[dict]) -> list[dict]:
     """将函数工具 schema 转换为 Anthropic ``tools`` 格式。"""
@@ -89,15 +80,12 @@ class AnthropicCompatProvider(Provider):
         acc, final = ToolUseAccumulator(), ModelUsage(); seen: set[int] = set()
         try:
             async with self.client.stream("POST", f"{self.base_url}/messages", headers={"x-api-key": self.api_key, "anthropic-version": self.api_version, "content-type": "application/json"}, json=payload) as response:
-                if response.status_code in (401, 403): raise AuthError(f"Provider authentication failed ({response.status_code})")
-                if response.status_code == 429: raise RateLimitError("Provider rate limit exceeded", retry_after_s=parse_retry_after(response.headers.get("Retry-After")))
-                if response.status_code >= 500: raise ServerError(f"Provider server error ({response.status_code})")
-                if response.status_code >= 400: await _raise_http_error(response)
+                await raise_for_status(response)
                 async for data in iter_sse_data(response.aiter_lines(), first_byte_timeout_s=self.first_byte_timeout_s, idle_timeout_s=self.idle_timeout_s):
                     try: event = json.loads(data)
                     except json.JSONDecodeError as exc: raise NetworkError("Provider returned invalid SSE JSON") from exc
                     if not isinstance(event, dict): raise NetworkError("Provider returned invalid SSE payload")
-                    if event.get("type") == "error" or event.get("error") is not None: _raise_error(event.get("error", event))
+                    if event.get("type") == "error" or event.get("error") is not None: raise_provider_error(event.get("error", event))
                     typ = event.get("type")
                     if not isinstance(typ, str):
                         raise NetworkError("Provider returned invalid SSE event type")
@@ -141,6 +129,5 @@ class AnthropicCompatProvider(Provider):
                     elif typ not in {"message_start", "message_delta", "content_block_start", "content_block_delta"}:
                         raise NetworkError("Provider returned invalid SSE event")
         except httpx.HTTPError as exc:
-            retryable = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.WriteError))
-            raise NetworkError(str(exc), retryable=retryable) from exc
+            raise as_network_error(exc) from exc
         final.tool_uses = acc.build(); yield StreamChunk(StreamEvent.MESSAGE_END, final)

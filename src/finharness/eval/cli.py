@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -111,7 +110,7 @@ def cmd_run(args) -> int:
     try:
         settings = Settings.from_file(args.settings)
     except SettingsError as exc:
-        raise SystemExit(str(exc))
+        raise SystemExit(str(exc)) from exc
     settings = settings.model_copy(
         update={"model": settings.model.model_copy(update={"max_turns": args.max_turns})}
     ) if args.max_turns else settings

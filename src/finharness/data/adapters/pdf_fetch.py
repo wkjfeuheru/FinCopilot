@@ -25,8 +25,9 @@ import re
 import socket
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 from urllib.parse import urljoin, urlparse
 
 from finharness.data.adapters.base import AdapterError

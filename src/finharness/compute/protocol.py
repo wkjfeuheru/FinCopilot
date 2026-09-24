@@ -16,8 +16,8 @@ import shutil
 import stat
 import time
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 
 class SignatureError(ValueError):

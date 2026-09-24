@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import threading
 
-
 from finharness.config.settings import ContextSettings, Settings
 from finharness.data.access import DataAccess
 from finharness.tools.generic.files import (
@@ -18,13 +17,14 @@ from finharness.tools.generic.files import (
     ReadFileTool,
     WriteFileTool,
 )
+from tests.conftest import settings_with_cache
 
 
 def make_settings(tmp_path) -> Settings:
-    return Settings(
+    return settings_with_cache(
+        tmp_path,
         context=ContextSettings(),
         paths={"output_dir": tmp_path / "output"},
-        data={"cache_dir": tmp_path / "cache"},
     )
 
 

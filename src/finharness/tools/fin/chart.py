@@ -18,10 +18,14 @@ from pathlib import Path
 import pandas as pd
 
 from finharness.data.raw import RawData
-from finharness.tools.fin.charting import FontUnavailableError, apply_style, resolve_cjk_font
-from finharness.utils.markdown import image_markdown
+from finharness.shared.declaration import Capability, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, ToolGroup, param, tool
+from finharness.tools.fin.charting import (
+    FontUnavailableError,
+    apply_style,
+    resolve_cjk_font,
+)
+from finharness.utils.markdown import image_markdown
 
 CHART_TYPES = ("line", "bar", "candlestick")
 DEFAULT_TITLE = "数据图表"

@@ -22,8 +22,8 @@ import asyncio
 from pathlib import Path
 
 from finharness.data.raw import RawData
+from finharness.shared.declaration import Capability, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, ToolGroup, param, tool
 from finharness.workspace import Workspace
 
 MAX_READ_BYTES = 200_000

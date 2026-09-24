@@ -8,9 +8,11 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+
+from finharness.utils.sqlite import SqliteStore
 
 
 class QueueFullError(RuntimeError):
@@ -57,21 +59,15 @@ CREATE TABLE IF NOT EXISTS compute_queue_state (
 """
 
 
-class ComputeJobStore:
+class ComputeJobStore(SqliteStore):
     """任务状态机：queued → leased → running → 终态。"""
 
     def __init__(self, db_path: str | Path, *, max_waiting_per_user: int = 2, max_attempts: int = 2) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        super().__init__(db_path)
         self.max_waiting_per_user = max_waiting_per_user
         self.max_attempts = max_attempts
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10.0)
-        connection.row_factory = sqlite3.Row
-        return connection
 
     @staticmethod
     def _row(row: sqlite3.Row) -> ComputeJob:

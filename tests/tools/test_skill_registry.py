@@ -7,7 +7,7 @@ from finharness.config.settings import Settings
 from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
 from finharness.data.citation import CitationRegistry
-from finharness.tools.capabilities import Capability
+from finharness.shared.capabilities import Capability
 from finharness.tools.meta.discovery import SearchToolsTool
 from finharness.tools.meta.skills import SkillError, SkillRegistry, route
 

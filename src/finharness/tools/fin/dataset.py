@@ -33,12 +33,26 @@ from finharness.data.mapping import (
     fuyao_required_params,
 )
 from finharness.data.raw import RawData
+from finharness.shared.declaration import Capability, Tier, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 
 # 目录结果里每个数据集最多展示多少个参数名。参数多的端点（期货、基金 F10）有十几个，
 # 全列会把目录本身撑爆，而模型真正需要的是"有这么个数据集、能按什么筛"。
 _MAX_PARAMS_SHOWN = 12
+
+# ``query`` 过滤的说明在两处使用了不同措辞：A 股清单附一个示例，其余清单用短版。
+# 二者按原样保留（描述会被模型读到），提取出来只为避免同一段话在多处漂移。
+_QUERY_DESC_A_SHARE = (
+    "可选：只在**已返回的行**里按名称/代码做子串过滤（不区分大小写），"
+    "用于在几百行的清单里定位某一行（如 query='白酒'）。"
+    "这是本地过滤，不改变发往上游的请求；没匹配到不代表上游没有该项"
+)
+_QUERY_DESC_SHORT = (
+    "可选：只在**已返回的行**里按名称/代码做子串过滤（不区分大小写），"
+    "用于在大清单里定位某一行。本地过滤，不改变上游请求"
+)
+# 期货/期权的 ``params`` 说明完全一致：请求参数由 dataset 决定，故不在此列举。
+_PARAMS_DESC_GENERIC = "数据集参数；必填项见 list_fuyao_datasets"
 
 
 def _find_dataset(catalog: list[dict[str, Any]], dataset: str) -> dict[str, Any] | None:
@@ -402,8 +416,7 @@ class QueryAShareDataTool(_FuyaoDatasetTool):
 
     @param("dataset", desc="数据集名（如 get_a_share_special_data_limit_up_pool、get_a_share_calendar_trading_days、get_a_share_index_constituents_ths_stock_list）；用 list_fuyao_datasets 查看全部")
     @param("params", desc="数据集参数，如 {'symbol': '600519'} 或 {'symbols': ['600519','000858']} 或 {'date': '2026-09-18'}；必填项见 list_fuyao_datasets 的参数列表")
-    @param("query", desc="可选：只在**已返回的行**里按名称/代码做子串过滤（不区分大小写），用于在几百行的清单里定位某一行（如 query='白酒'）。"
-                         "这是本地过滤，不改变发往上游的请求；没匹配到不代表上游没有该项")
+    @param("query", desc=_QUERY_DESC_A_SHARE)
     async def _dispatch(self, *, dataset: str, params: dict[str, Any] | None = None, query: str | None = None) -> RawData:
         return await super()._dispatch(dataset=dataset, params=params, query=query)
 
@@ -429,7 +442,7 @@ class QueryFundDataTool(_FuyaoDatasetTool):
 
     @param("dataset", desc="数据集名（ETF 行情用 get_fund_market_snapshot / get_fund_market_historical；另有 get_fund_portfolio_holdings、get_fund_performance_nav、get_fund_holders_top 等）；用 list_fuyao_datasets(service='fund') 查看全部")
     @param("params", desc="数据集参数，如 {'symbol': '510300'} 或 {'symbols': [...]}；必填项见 list_fuyao_datasets")
-    @param("query", desc="可选：只在**已返回的行**里按名称/代码做子串过滤（不区分大小写），用于在大清单里定位某一行。本地过滤，不改变上游请求")
+    @param("query", desc=_QUERY_DESC_SHORT)
     async def _dispatch(self, *, dataset: str, params: dict[str, Any] | None = None, query: str | None = None) -> RawData:
         return await super()._dispatch(dataset=dataset, params=params, query=query)
 
@@ -453,8 +466,8 @@ class QueryFuturesDataTool(_FuyaoDatasetTool):
     _services = ("futures",)
 
     @param("dataset", desc="数据集名（如 get_futures_varieties_list、get_futures_positions_variety_daily、get_futures_basis_historical）；用 list_fuyao_datasets(service='futures') 查看全部")
-    @param("params", desc="数据集参数；必填项见 list_fuyao_datasets")
-    @param("query", desc="可选：只在**已返回的行**里按名称/代码做子串过滤（不区分大小写），用于在大清单里定位某一行。本地过滤，不改变上游请求")
+    @param("params", desc=_PARAMS_DESC_GENERIC)
+    @param("query", desc=_QUERY_DESC_SHORT)
     async def _dispatch(self, *, dataset: str, params: dict[str, Any] | None = None, query: str | None = None) -> RawData:
         return await super()._dispatch(dataset=dataset, params=params, query=query)
 
@@ -477,8 +490,8 @@ class QueryOptionsDataTool(_FuyaoDatasetTool):
     _services = ("options",)
 
     @param("dataset", desc="数据集名（如 get_options_varieties_list、get_options_contracts_detail）；用 list_fuyao_datasets(service='options') 查看全部")
-    @param("params", desc="数据集参数；必填项见 list_fuyao_datasets")
-    @param("query", desc="可选：只在**已返回的行**里按名称/代码做子串过滤（不区分大小写），用于在大清单里定位某一行。本地过滤，不改变上游请求")
+    @param("params", desc=_PARAMS_DESC_GENERIC)
+    @param("query", desc=_QUERY_DESC_SHORT)
     async def _dispatch(self, *, dataset: str, params: dict[str, Any] | None = None, query: str | None = None) -> RawData:
         return await super()._dispatch(dataset=dataset, params=params, query=query)
 

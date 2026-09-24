@@ -11,17 +11,20 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections.abc import Callable
 from datetime import date, timedelta
-from typing import Any, Callable
+from typing import Any
 
 import pandas as pd
 
 from finharness.data.adapters.base import AdapterError, DataAdapter, FetchResult
+from finharness.data.adapters.pacing import pace
+from finharness.data.adapters.retry import retry_call
+from finharness.data.lookback import lookback_stamp, lookback_start
 from finharness.data.mapping import (
     AKSHARE_ENDPOINTS,
     AKSHARE_INTERFACE_COLUMNS,
     MACRO_INDICATORS,
-    MACRO_INDICATOR_LABELS,
     PEER_COMPANY,
     PEER_IDENTITY_COLUMNS,
     PEER_ROW_TYPE_COLUMN,
@@ -108,7 +111,7 @@ def _slice_years(df: pd.DataFrame, years: int, *, date_col: str = "date") -> pd.
         return df
     frame = df.copy()
     frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
-    cutoff = pd.Timestamp(date.today() - timedelta(days=365 * years))
+    cutoff = pd.Timestamp(lookback_start(years))
     trimmed = frame[frame[date_col] >= cutoff]
     return trimmed if len(trimmed) else frame
 
@@ -174,12 +177,7 @@ class AkShareAdapter(DataAdapter):
         self._health_lock = threading.Lock()
 
     def _throttle(self) -> None:
-        if self.throttle_seconds <= 0:
-            return
-        elapsed = time.monotonic() - self._last_call
-        if elapsed < self.throttle_seconds:
-            time.sleep(self.throttle_seconds - elapsed)
-        self._last_call = time.monotonic()
+        self._last_call = pace(self._last_call, self.throttle_seconds)
 
     # -- 接口健康状态 ---------------------------------------------------------
     def _interface_available(self, interface: str) -> bool:
@@ -309,7 +307,7 @@ class AkShareAdapter(DataAdapter):
         for interface in AKSHARE_ENDPOINTS["kline"]:
             try:
                 if interface == "stock_zh_a_hist":
-                    start = (date.today() - timedelta(days=365 * max(years, 1) + 30)).strftime("%Y%m%d")
+                    start = lookback_stamp(years, extra_days=30)
                     end = date.today().strftime("%Y%m%d")
                     df = self._call(
                         interface,
@@ -328,7 +326,7 @@ class AkShareAdapter(DataAdapter):
                             deadline_s=_KLINE_CANDIDATE_DEADLINE_S,
                         )
                     else:
-                        start = (date.today() - timedelta(days=365 * max(years, 1) + 30)).strftime("%Y%m%d")
+                        start = lookback_stamp(years, extra_days=30)
                         end = date.today().strftime("%Y%m%d")
                         df = self._call(
                             interface,
@@ -448,7 +446,7 @@ class AkShareAdapter(DataAdapter):
     # -- 宏观 / 行业 ----------------------------------------------------------
     def _macro_source_frame(self, source: str, years: int) -> pd.DataFrame:
         """抓取单个宏观接口；调用方按数据源对指标进行分组。"""
-        start = (date.today() - timedelta(days=365 * max(years, 1) + 370)).strftime("%Y%m%d")
+        start = lookback_stamp(years, extra_days=370)
         if source == "pmi":
             return self._call("macro_china_pmi", lambda ak: ak.macro_china_pmi())
         if source == "cpi":
@@ -520,7 +518,7 @@ class AkShareAdapter(DataAdapter):
         if not rows:
             raise AdapterError("宏观接口未返回所选指标的数据")
         combined = pd.concat(rows, ignore_index=True)
-        cutoff = pd.Timestamp(date.today() - timedelta(days=365 * max(years, 1) + 370))
+        cutoff = pd.Timestamp(lookback_start(years, extra_days=370))
         combined = combined[combined["date"] >= cutoff]
         combined = combined.sort_values(["indicator", "date"], ascending=[True, False])
         return FetchResult(df=combined.reset_index(drop=True), interface="macro_china")
@@ -532,14 +530,13 @@ class AkShareAdapter(DataAdapter):
         ``'NoneType' has no attribute 'find_all'``）。这类失败是瞬时的，所以
         一次短暂重试挽救该表的概率远高于其耗费的时间；而硬性失败仍会暴露出来。
         """
-        for attempt in range(attempts):
-            try:
-                return self._call(table, lambda ak, t=table: getattr(ak, t)())
-            except AdapterError:
-                if attempt == attempts - 1:
-                    return None
-                time.sleep(0.6 * (attempt + 1))
-        return None
+        return retry_call(
+            lambda: self._call(table, lambda ak, t=table: getattr(ak, t)()),
+            attempts=attempts,
+            delay_for=lambda attempt: 0.6 * attempt,
+            retry_on=AdapterError,
+            exhausted=None,
+        )
 
     def _sw_code(self, industry: str) -> str:
         """将行业名称/代码解析为申万指数代码（例如 801010）。

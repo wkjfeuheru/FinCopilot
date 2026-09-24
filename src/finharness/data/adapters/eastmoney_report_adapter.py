@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 import pandas as pd
@@ -164,7 +165,7 @@ class EastmoneyReportAdapter(DataAdapter):
         # 显式报错，而不是悄悄省略。
         self.with_text_allowed = with_text_allowed
 
-    def with_pdf_dir(self, pdf_dir: str | Path) -> "EastmoneyReportAdapter":
+    def with_pdf_dir(self, pdf_dir: str | Path) -> EastmoneyReportAdapter:
         """返回一个仅落盘目录不同的副本。
 
         多租户下每个用户必须有各自的 PDF 目录：全文句柄会经 ``read_pdf`` 读回，

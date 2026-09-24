@@ -11,8 +11,8 @@ from pathlib import Path
 import pandas as pd
 
 from finharness.data.raw import RawData
+from finharness.shared.declaration import Capability, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 # 不同报表格式的列关键词不同，故按子串匹配。
 _NET_MARGIN_KEYS = ("销售净利率", "net_margin", "net profit margin")

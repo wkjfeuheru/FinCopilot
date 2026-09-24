@@ -23,10 +23,6 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _freeze_list(value: Any) -> Any:
-    return list(value) if value is not None else []
-
-
 class AnswerExpect(_Model):
     """对面向读者的答案文本的断言。"""
 
@@ -98,18 +94,6 @@ class Expect(_Model):
     safety: SafetyExpect = Field(default_factory=SafetyExpect)
     artifacts: ArtifactExpect = Field(default_factory=ArtifactExpect)
 
-    def is_empty(self) -> bool:
-        return all(
-            not model.model_dump(exclude_defaults=True)
-            for model in (
-                self.answer,
-                self.trajectory,
-                self.citations,
-                self.safety,
-                self.artifacts,
-            )
-        )
-
 
 class Budget(_Model):
     max_tokens: int | None = None
@@ -165,7 +149,7 @@ class EvalCase(_Model):
     budget: Budget = Field(default_factory=Budget)
 
     @model_validator(mode="after")
-    def _exactly_one_form(self) -> "EvalCase":
+    def _exactly_one_form(self) -> EvalCase:
         if self.turns and self.chats:
             raise ValueError("turns 与 chats 只能提供其一")
         if not self.turns and not self.chats:

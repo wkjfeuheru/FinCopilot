@@ -23,14 +23,15 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any
 
 import pandas as pd
 
 from finharness.data.adapters.base import AdapterError, DataAdapter, FetchResult
 from finharness.data.adapters.mcp_client import McpHttpClient, McpToolError
+from finharness.data.adapters.pacing import pace
+from finharness.data.adapters.retry import retry_call
 from finharness.data.adapters.tavily_adapter import system_proxy
 from finharness.data.mapping import (
     FUYAO_ADJUST_MAP,
@@ -229,10 +230,7 @@ class FuyaoMcpAdapter(DataAdapter):
         if self.throttle_seconds <= 0:
             return
         with self._throttle_lock:
-            elapsed = time.monotonic() - self._last_call
-            if elapsed < self.throttle_seconds:
-                time.sleep(self.throttle_seconds - elapsed)
-            self._last_call = time.monotonic()
+            self._last_call = pace(self._last_call, self.throttle_seconds)
 
     def _client(self, service: str) -> McpHttpClient:
         if self._injected is not None:
@@ -295,19 +293,21 @@ class FuyaoMcpAdapter(DataAdapter):
         调用——按报告期逐期取财务指标时，那会把"某一期未披露"升级成"整条序列失败"。
         """
         self._throttle()
-        attempts = _READINESS_RETRY_ATTEMPTS
-        for attempt in range(1, attempts + 1):
+
+        def _fetch_once() -> Any:
             try:
                 payload = self._client(service).call_tool(dataset, arguments)
             except McpToolError as exc:
                 # 工具级错误：重试同样的参数不会有不同结果。
                 raise AdapterError(f"{dataset}: {exc}") from exc
-            try:
-                return self._unwrap(payload)
-            except FuyaoDataNotReady:
-                if attempt >= attempts:
-                    raise
-                time.sleep(_READINESS_RETRY_DELAY_S)
+            return self._unwrap(payload)
+
+        return retry_call(
+            _fetch_once,
+            attempts=_READINESS_RETRY_ATTEMPTS,
+            delay_for=lambda _attempt: _READINESS_RETRY_DELAY_S,
+            retry_on=FuyaoDataNotReady,
+        )
 
     def _dataset_call(
         self, dataset: str, arguments: dict[str, Any], *, service: str | None = None

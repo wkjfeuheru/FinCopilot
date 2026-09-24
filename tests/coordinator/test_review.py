@@ -8,7 +8,7 @@
 import asyncio
 from pathlib import Path
 
-from finharness.coordinator.review import (
+from finharness.shared.review import (
     REVIEW_DONE,
     REVIEW_REUSED,
     REVIEW_SKIPPED,

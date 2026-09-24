@@ -3,16 +3,15 @@
 
 import pytest
 
-from finharness.tools.base import ToolGroup
-from finharness.tools.capabilities import (
-    RESEARCH_CAPABILITIES,
+from finharness.shared.capabilities import (
     Capability,
     UnknownCapabilityError,
     capabilities_of,
     capability_of,
     is_research_capability,
 )
-from finharness.tools.declare import DECLARED_TOOLS
+from finharness.shared.declaration import DECLARED_TOOLS
+from finharness.tools.base import ToolGroup
 from finharness.tools.registry import ALL_TOOL_CLASSES
 
 

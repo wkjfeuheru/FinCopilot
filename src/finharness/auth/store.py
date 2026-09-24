@@ -15,10 +15,12 @@ import re
 import secrets
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 
 from finharness.auth.passwords import hash_password, verify_password
+from finharness.utils.clock import utc_now
+from finharness.utils.sqlite import SqliteStore
 
 SCHEMA_USERS = """
 CREATE TABLE IF NOT EXISTS users (
@@ -99,10 +101,6 @@ class IssuedSession:
     expires_at: str
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -121,12 +119,11 @@ def _validate_credentials(username: str, password: str, *, min_password_len: int
         raise UserStoreError(f"密码至少需要 {max(min_password_len, _PASSWORD_MIN)} 个字符")
 
 
-class UserStore:
+class UserStore(SqliteStore):
     """基于 SQLite 的用户与会话令牌存储；所有语句都使用绑定参数。"""
 
     def __init__(self, db_path: str | Path) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        super().__init__(db_path)
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(SCHEMA_USERS)
@@ -140,16 +137,6 @@ class UserStore:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
         if "role" not in columns:
             connection.execute(MIGRATE_USERS_ROLE)
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10.0)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    def ping(self) -> None:
-        """确认用户数据库可建立连接并执行查询。"""
-        with self._connect() as connection:
-            connection.execute("SELECT 1").fetchone()
 
     # -- 用户 ------------------------------------------------------------------
     def count_users(self) -> int:
@@ -195,7 +182,7 @@ class UserStore:
         *,
         min_password_len: int = 8,
         ttl_s: int = 3600,
-        claim_legacy: "callable | None" = None,
+        claim_legacy: callable | None = None,
         bootstrap_admin: bool = False,
     ) -> IssuedSession:
         """注册新用户并立即签发会话。
@@ -209,7 +196,7 @@ class UserStore:
         依赖"谁是第一个"，因此第二个注册的管理员也是运维明确授权的。
         """
         _validate_credentials(username, password, min_password_len=min_password_len)
-        now = _now()
+        now = utc_now()
         user_id = _new_user_id()
         role = "admin" if bootstrap_admin else "user"
         with self._connect() as connection:
@@ -253,7 +240,7 @@ class UserStore:
     def _issue(self, user_id: str, *, ttl_s: int) -> IssuedSession:
         """生成令牌、落库哈希并清理过期行。"""
         token = f"t_{secrets.token_hex(32)}"
-        now = _now()
+        now = utc_now()
         expires = now + timedelta(seconds=ttl_s)
         with self._connect() as connection:
             connection.execute(
@@ -275,7 +262,7 @@ class UserStore:
                 "SELECT s.user_id, u.username, u.role FROM auth_sessions s"
                 " JOIN users u ON u.id = s.user_id"
                 " WHERE s.token_hash = ? AND s.expires_at >= ?",
-                (_token_hash(token), _now().isoformat()),
+                (_token_hash(token), utc_now().isoformat()),
             ).fetchone()
         return (
             CurrentUser(id=row["user_id"], username=row["username"], role=row["role"])

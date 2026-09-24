@@ -2,9 +2,9 @@
 
 from finharness.factor.engine import (
     FUNCTION_NAMES,
+    MARKET_VARIABLES,
     MAX_DEPTH,
     MAX_WINDOW,
-    MARKET_VARIABLES,
     FactorEngine,
     FactorError,
     FactorInfo,

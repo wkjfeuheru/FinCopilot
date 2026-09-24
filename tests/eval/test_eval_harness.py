@@ -14,7 +14,7 @@ import pytest
 from finharness.eval.aggregate import aggregate, score_case
 from finharness.eval.config import EvalConfig, SetSpec, load_config
 from finharness.eval.report import render_report
-from finharness.eval.runner import CaseRun, CapturedTurn
+from finharness.eval.runner import CapturedTurn, CaseRun
 from finharness.eval.schema import SchemaError, load_cases_dir
 from finharness.types import (
     AgentTurnOutcome,

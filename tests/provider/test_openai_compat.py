@@ -1,13 +1,18 @@
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 
 import httpx
 import pytest
 
+from finharness.provider.errors import (
+    AuthError,
+    NetworkError,
+    RateLimitError,
+    ServerError,
+)
 from finharness.provider.openai_compat import OpenAICompatProvider
-from finharness.provider.errors import AuthError, NetworkError, RateLimitError, ServerError
 from finharness.types import ModelUsage, Msg, StreamEvent, ToolUse, ToolUseDelta
 
 
@@ -313,7 +318,7 @@ def test_openai_retry_after_supports_http_dates_and_ignores_invalid_values(retry
     if isinstance(retry_after, str):
         header = retry_after
     else:
-        header = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=retry_after))
+        header = format_datetime(datetime.now(UTC) + timedelta(seconds=retry_after))
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, headers={"Retry-After": header})

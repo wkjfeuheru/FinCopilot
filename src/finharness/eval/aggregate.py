@@ -11,6 +11,7 @@ from typing import Any
 
 from finharness.eval.config import EvalConfig
 from finharness.eval.runner import CaseRun
+from finharness.eval.schema import EvalCase
 from finharness.eval.scorers import (
     DimensionScore,
     score_efficiency,
@@ -18,7 +19,6 @@ from finharness.eval.scorers import (
     score_task,
     score_trajectory,
 )
-from finharness.eval.schema import EvalCase
 
 
 @dataclass(slots=True)

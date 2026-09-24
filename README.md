@@ -43,7 +43,7 @@ cd frontend && npm install && npm run dev
 
 首次使用需要注册一个账号：登录页可切换
 「注册新账号」，用户名 2–32 个字符，密码至少 8 位。所有对话、偏好与
-模型供应商配置都按账号隔离（见 [docs/modules/03.13-auth.md](docs/modules/03.13-auth.md)）。
+模型供应商配置都按账号隔离（见 [docs/modules/03.17-auth.md](docs/modules/03.17-auth.md)）。
 若这是从单用户版本升级而来，第一个注册的账号会自动继承原有的对话与配置。
 
 ### 生产部署（单端口）
@@ -302,7 +302,7 @@ python -m finharness.eval run --set smoke                # 真实 Provider（需
 ```
 
 - 用例在 `evals/cases/*.yaml`（v2.0：200 条 × 5 维度，`evals/README.md` 为权威文档；
-  旧人工题库归档于 `docs/archive/`）；判定看**行为模式**而非字面文本。
+  v1.x 人工题库已被 v2.0 取代，不再随仓库分发）；判定看**行为模式**而非字面文本。
 - 产出 `evals/runs/<ts>_<set>/report.md`：四维度表、加权综合分、红线门禁结论、失败用例轨迹。
 - 引擎为轨迹评估记录每步 `Thought/Action/Observation`（含被拒绝的调用），见 `AgentTurnOutcome.trace`。
 - **首次真实运行前需校准 `evals/config.yaml` 的效率预算**（当前为估计基线）。

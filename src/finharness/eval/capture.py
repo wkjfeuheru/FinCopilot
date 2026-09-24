@@ -32,9 +32,6 @@ class RecordingSink:
     async def emit(self, event: EngineEvent) -> None:
         self.events.append(event)
 
-    def of_kind(self, kind: str) -> list[dict[str, Any]]:
-        return [event.data for event in self.events if event.kind == kind]
-
 
 class InteractionChannel:
     """依据策略应答 ask_user 与写操作确认提示。
@@ -75,9 +72,6 @@ class InteractionChannel:
     async def confirm(self, name: str, args: dict) -> bool:
         """权限门禁的 ``confirm`` 回调：返回写操作是否获批。"""
         return await self.ask("confirm", name, []) == "y"
-
-    def asked_user(self) -> bool:
-        return any(item.kind == "question" for item in self.log)
 
 
 @dataclass(slots=True)

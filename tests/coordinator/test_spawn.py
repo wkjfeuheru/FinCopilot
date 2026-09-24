@@ -20,6 +20,7 @@ from finharness.engine.cost import SessionStats
 from finharness.provider.base import Provider
 from finharness.tools.registry import worker_tool_names
 from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
+from tests.conftest import settings_with_cache
 
 
 class Adapter(DataAdapter):
@@ -87,9 +88,9 @@ class FetchingProvider(Provider):
 
 
 def make_settings(tmp_path, **context) -> Settings:
-    return Settings(
+    return settings_with_cache(
+        tmp_path,
         context=ContextSettings(**context),
-        data={"cache_dir": tmp_path / "cache"},
         paths={"output_dir": tmp_path / "output"},
     )
 

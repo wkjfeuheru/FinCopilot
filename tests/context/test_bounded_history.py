@@ -9,7 +9,9 @@
 * 截断后 ``discarded`` 与真实消息序号对齐，后续压缩不会重复摘要。
 """
 
-import asyncio
+
+import sys
+from pathlib import Path
 
 from finharness.config.settings import ContextSettings, Settings
 from finharness.context.memory.store import MemoryStore
@@ -19,12 +21,10 @@ from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
 from finharness.permissions.gate import PermissionGate
 from finharness.types import Msg, ToolUse
-
-import sys
-from pathlib import Path
+from tests.conftest import settings_with_cache
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
-from test_loop import ScriptedProvider, StubRegistry, RecordingTool, text_round  # noqa: E402
+from test_loop import ScriptedProvider, StubRegistry  # noqa: E402
 
 COUNTER = TokenCounter()
 
@@ -32,7 +32,7 @@ COUNTER = TokenCounter()
 def make_settings(tmp_path, **context) -> Settings:
     values = {"context_window_tokens": 100000}
     values.update(context)
-    return Settings(context=ContextSettings(**values), data={"cache_dir": tmp_path / "cache"})
+    return settings_with_cache(tmp_path, context=ContextSettings(**values))
 
 
 def seed_rounds(store: MemoryStore, conversation_id: str, rounds: int) -> int:

@@ -21,7 +21,8 @@ from finharness.context.session import Plan, PlanStep, ResearchContext
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
 from finharness.provider.base import Provider
-from finharness.types import ModelUsage, StreamChunk, StreamEvent
+from finharness.types import StreamChunk, StreamEvent
+from tests.conftest import settings_with_cache
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 from test_loop import (  # noqa: E402
@@ -33,9 +34,8 @@ from test_loop import (  # noqa: E402
 
 
 def make_settings(tmp_path) -> Settings:
-    return Settings(
-        context=ContextSettings(context_window_tokens=100000),
-        data={"cache_dir": tmp_path / "cache"},
+    return settings_with_cache(
+        tmp_path, context=ContextSettings(context_window_tokens=100000)
     )
 
 

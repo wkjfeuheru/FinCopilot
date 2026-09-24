@@ -16,14 +16,14 @@ from pathlib import Path
 from finharness.data.adapters.base import AdapterError
 from finharness.data.adapters.pdf_fetch import read_pdf_pages
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
-from finharness.tools.generic.fencing import (
+from finharness.shared.declaration import Capability, Tier, ToolGroup, param, tool
+from finharness.shared.fencing import (
     EXTERNAL_NOTICE,
     RESULT_CLOSE,
     fence,
     neutralize,
 )
+from finharness.tools.base import BaseTool
 from finharness.workspace import Workspace
 
 # 默认返回页数：一页足以为读者提供上下文，又不至于让首次读取就撑满结果预算。

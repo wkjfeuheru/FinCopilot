@@ -16,7 +16,12 @@ from test_loop import (  # noqa: E402
     tool_round,
 )
 
-from finharness.config.settings import ContextSettings, PermissionSettings, Settings, ToolSettings
+from finharness.config.settings import (
+    ContextSettings,
+    PermissionSettings,
+    Settings,
+    ToolSettings,
+)
 from finharness.context.session import ResearchContext
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop

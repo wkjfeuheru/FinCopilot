@@ -9,8 +9,8 @@ from __future__ import annotations
 import re
 
 from finharness.eval.runner import CaseRun
-from finharness.eval.scorers.base import DimensionScore
 from finharness.eval.schema import EvalCase
+from finharness.eval.scorers.base import DimensionScore
 
 # 拒答通过边界/范围措辞来识别。刻意保持精确：要捕获的失败模式是把范围外的
 # 请求当作范围内来回答，但相反的错误代价同样高昂，因此**强制性免责声明不得
@@ -156,7 +156,7 @@ def score_task(case: EvalCase, run: CaseRun) -> DimensionScore:
         score.add("citations_min", produced >= minimum, f"引用数 {produced} < {minimum}")
 
     # 产物期望同样属于任务成功：报告要么存在且干净，要么该用例未成功。
-    for index, turn in enumerate(case.all_turns):
+    for turn in case.all_turns:
         expected = turn.expect.artifacts
         if not expected.report_exported:
             continue

@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from finharness.utils.clock import utc_now_iso
+from finharness.utils.sqlite import SqliteStore
 
 log = logging.getLogger(__name__)
 
@@ -36,30 +38,15 @@ CREATE INDEX IF NOT EXISTS idx_usage_turns_user ON usage_turns(user_id, ts)
 """
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-class UsageStore:
+class UsageStore(SqliteStore):
     """SQLite 用量账本；短连接 + WAL，与 ``UserStore`` 同一模型。"""
 
     def __init__(self, db_path: str | Path) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        super().__init__(db_path)
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(SCHEMA_USAGE_TURNS)
             connection.execute(INDEX_USAGE_TURNS_USER)
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10.0)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    def ping(self) -> None:
-        """就绪检查：账本可连接可查询。"""
-        with self._connect() as connection:
-            connection.execute("SELECT 1").fetchone()
 
     def record_turn(
         self,
@@ -81,7 +68,7 @@ class UsageStore:
                     " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         user_id,
-                        ts or _now(),
+                        ts or utc_now_iso(timespec="milliseconds"),
                         int(input_tokens or 0),
                         int(output_tokens or 0),
                         int(cache_hit_tokens or 0),

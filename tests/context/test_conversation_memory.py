@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from finharness.config.settings import ContextSettings, PermissionSettings, Settings
+from finharness.config.settings import ContextSettings, Settings
 from finharness.context.memory.store import MemoryStore
 from finharness.context.session import ResearchContext
 from finharness.context.tokens import TokenCounter
@@ -22,9 +22,16 @@ from finharness.data.citation import Citation, CitationRegistry
 from finharness.engine.loop import AgentLoop
 from finharness.permissions.gate import PermissionGate
 from finharness.types import ToolUse
+from tests.conftest import settings_with_cache
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
-from test_loop import RecordingTool, ScriptedProvider, StubRegistry, text_round, tool_round  # noqa: E402
+from test_loop import (  # noqa: E402
+    RecordingTool,
+    ScriptedProvider,
+    StubRegistry,
+    text_round,
+    tool_round,
+)
 
 # 跨测试共享的词表缓存。
 COUNTER = TokenCounter()
@@ -88,7 +95,7 @@ def test_legacy_orphan_child_data_stops_migration(tmp_path):
 def make_settings(tmp_path, **context) -> Settings:
     values = {"context_window_tokens": 100000}
     values.update(context)
-    return Settings(context=ContextSettings(**values), data={"cache_dir": tmp_path / "cache"})
+    return settings_with_cache(tmp_path, context=ContextSettings(**values))
 
 
 def build_loop(
@@ -301,10 +308,8 @@ class CountingAdapter(DataAdapter):
 
 def test_follow_up_on_the_same_symbol_reuses_recalled_data(tmp_path):
     """针对已取过的 symbol 的第二个问题不得重新取数。"""
-    adapter = CountingAdapter()
     store = MemoryStore(tmp_path / "memory.db")
     settings = make_settings(tmp_path)
-    data = DataAccess([adapter], cache=LocalCache(tmp_path / "cache"), settings=settings)
 
     tool = RecordingTool("get_indicators", content="ROE 数据")
     # 工具替身必须暴露与 adapter 服务相同的名称。
@@ -376,7 +381,6 @@ def test_episode_records_a_pointer_to_the_data(tmp_path):
 
 def test_memory_is_capped_by_short_mem_cap(tmp_path):
     settings = make_settings(tmp_path, short_mem_cap=3)
-    options = {"symbol": "600519"}
 
     async def run():
         loop = build_loop(

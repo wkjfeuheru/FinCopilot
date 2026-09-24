@@ -15,8 +15,8 @@ from finharness.config.settings import ContextSettings, Settings
 from finharness.data.access import DataAccess
 from finharness.data.adapters.base import DataAdapter, FetchResult
 from finharness.data.cache import LocalCache
+from finharness.shared.declaration import Tier
 from finharness.tools.base import PermissionLevel, ToolGroup
-from finharness.tools.declare import Tier
 from finharness.tools.fin.research_reports import GetResearchReportsTool
 from finharness.tools.registry import review_tool_names
 
@@ -158,7 +158,7 @@ def test_every_report_gets_a_handle_before_any_preview(tmp_path):
 
 def test_the_tool_declares_a_budget_above_the_global_default(tmp_path):
     """研报一次要给多篇句柄，因此显式声明高于全局默认的预算。"""
-    from finharness.tools.budget import resolve_result_budget
+    from finharness.shared.budget import resolve_result_budget
 
     tool, _ = make_tool(tmp_path, make_frame(1))
     settings = Settings(context=ContextSettings(max_result_tokens=1000))

@@ -10,12 +10,10 @@ from __future__ import annotations
 import pandas as pd
 
 from finharness.data.raw import RawData
+from finharness.shared.declaration import Capability, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, ToolGroup, param, tool
+from finharness.tools.fin.window import note_actual_window
 
-# 实际区间远短于请求区间，说明数据源的历史用完了（次新股、接口变更），
-# 而不是这条序列只是"年份还短"。
-_SHORT_WINDOW_RATIO = 0.8
 # 样本数低于此值时，分位不够稳定，需要提示：
 # 寥寥几个点会让"第 90 分位"多半只是样本量造成的假象。
 _MIN_PERCENTILE_SAMPLES = 60
@@ -63,7 +61,11 @@ class GetValuationTool(BaseTool):
             ), [raw]
 
         lines: list[str] = [f"估值指标：{column}"]
-        self._note_window(lines, df, raw)
+        note_actual_window(
+            lines, df, raw,
+            year_param="lookback_years",
+            citation_note="引用分位时须说明实际区间，不得表述为“近 {requested} 年分位”。",
+        )
         self._note_percentile(lines, df, column)
         # 传入完整数据框：``trim_dataframe`` 自身会限制行数，
         # 且只有看到整条序列，它才能报告省略了多少行。
@@ -95,31 +97,6 @@ class GetValuationTool(BaseTool):
             if str(name) != "date" and pd.to_numeric(df[name], errors="coerce").notna().any()
         ]
         return numeric[-1] if len(numeric) == 1 else None
-
-    @staticmethod
-    def _note_window(lines: list[str], df: pd.DataFrame, raw: RawData) -> None:
-        """说明实际覆盖的区间，避免短序列被重新贴上标签。"""
-        if "date" not in df.columns:
-            return
-        dates = pd.to_datetime(df["date"], errors="coerce").dropna()
-        if not len(dates):
-            return
-        first, last = dates.min().date(), dates.max().date()
-        lines.append(f"- 数据区间：{first} ~ {last}（共 {len(df)} 条）")
-        requested = None
-        try:
-            requested = int((raw.params or {}).get("lookback_years"))
-        except (TypeError, ValueError):
-            requested = None
-        if not requested or requested <= 0:
-            return
-        span_days = (last - first).days
-        if span_days < 365 * requested * _SHORT_WINDOW_RATIO:
-            lines.append(
-                f"- 注意：实际区间约 {span_days} 天，明显短于请求的 {requested} 年"
-                "（该标的可能上市较晚或数据不足）；引用分位时须说明实际区间，"
-                f"不得表述为“近 {requested} 年分位”。"
-            )
 
     @staticmethod
     def _note_percentile(lines: list[str], df: pd.DataFrame, column: str) -> None:

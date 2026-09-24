@@ -7,13 +7,7 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
-from typing import Any
-
-from finharness.eval.config import EvalConfig
-from finharness.eval.runner import CaseRun
-from finharness.eval.schema import EvalCase
 
 
 @dataclass(slots=True)

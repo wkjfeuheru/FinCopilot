@@ -34,7 +34,7 @@ class Msg:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def user(cls, content: str) -> "Msg":
+    def user(cls, content: str) -> Msg:
         return cls(role="user", content=content)
 
 

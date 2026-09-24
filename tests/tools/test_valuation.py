@@ -14,14 +14,14 @@ from finharness.data.adapters.base import DataAdapter, FetchResult
 from finharness.data.cache import LocalCache
 from finharness.data.raw import RawData
 from finharness.tools.fin.valuation import GetValuationTool
+from tests.conftest import settings_with_cache
 
 INDICATOR = "市盈率(TTM)"
 
 
 def make_settings(tmp_path) -> Settings:
-    return Settings(
-        context=ContextSettings(max_result_tokens=1000, trim_rows=20),
-        data={"cache_dir": tmp_path / "cache"},
+    return settings_with_cache(
+        tmp_path, context=ContextSettings(max_result_tokens=1000, trim_rows=20)
     )
 
 

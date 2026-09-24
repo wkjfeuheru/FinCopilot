@@ -8,8 +8,8 @@ from pydantic import BaseModel, Field
 
 from finharness.context.session import PlanStep
 from finharness.data.raw import RawData
+from finharness.shared.declaration import Capability, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, ToolGroup, param, tool
 
 
 class PlanStepInput(BaseModel):

@@ -8,9 +8,9 @@ from pathlib import Path
 import httpx
 
 from finharness.config.settings import Settings, SettingsError
+from finharness.provider.anthropic_compat import AnthropicCompatProvider
 from finharness.provider.fake import FakeProvider
 from finharness.provider.openai_compat import OpenAICompatProvider
-from finharness.provider.anthropic_compat import AnthropicCompatProvider
 
 
 def _build_client(*, first_byte_timeout_s: float, idle_timeout_s: float) -> httpx.AsyncClient:

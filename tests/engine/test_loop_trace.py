@@ -6,19 +6,15 @@ tool round 会将其丢弃的草稿文本保留为 ``thought``，被拒绝的调
 """
 
 import asyncio
-import json
 
-from finharness.engine.loop import AgentLoop
 from finharness.permissions.modes import Verdict
 from finharness.tools.registry import ToolRegistry
 from finharness.types import ToolUse
-
 from tests.engine.test_loop import (
     RecordingTool,
     ScriptedProvider,
     StubRegistry,
     make_loop,
-    message_end,
     text_round,
     tool_round,
 )

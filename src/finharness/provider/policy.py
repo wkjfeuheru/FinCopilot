@@ -1,4 +1,9 @@
-"""用户 Provider 地址在本地与远程部署下的统一安全策略。"""
+"""用户 Provider 地址在本地与远程部署下的统一安全策略。
+
+放在 provider 层而非 server 层：唯一使用它的是 provider 解析与配置写入，
+而把它留在 server 会让 provider → server 形成逆向依赖。它只依赖
+``config.settings``，因此下沉到 provider 后不再引入任何环。
+"""
 
 from __future__ import annotations
 

@@ -7,8 +7,7 @@
 
 import pytest
 
-from finharness.tools.base import BaseTool
-from finharness.tools.declare import (
+from finharness.shared.declaration import (
     DECLARED_TOOLS,
     Capability,
     DeclarationError,
@@ -17,6 +16,7 @@ from finharness.tools.declare import (
     param,
     tool,
 )
+from finharness.tools.base import BaseTool
 
 
 @tool(

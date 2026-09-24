@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import inspect
+import io
 import json
 import os
 import re
@@ -19,10 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from finharness.compute.queue import ComputeJobStore
-from finharness.compute.protocol import MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES
 from finharness.compute.process_tree import ProcessTree
-
+from finharness.compute.protocol import MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES
+from finharness.compute.queue import ComputeJobStore
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 

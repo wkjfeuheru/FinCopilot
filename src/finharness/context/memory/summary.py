@@ -42,7 +42,7 @@ class SummaryLayer:
         store: MemoryStore | None,
         counter: TokenCounter,
         budget_tokens: int = 0,
-    ) -> "SummaryLayer":
+    ) -> SummaryLayer:
         layer = cls(
             conversation_id=conversation_id,
             counter=counter,

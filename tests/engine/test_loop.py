@@ -7,10 +7,10 @@ from finharness.config.settings import ContextSettings, Settings, ToolSettings
 from finharness.engine.cost import SessionStats
 from finharness.engine.loop import AgentLoop
 from finharness.engine.retry import RetryPolicy
-from finharness.tools.base import PermissionLevel
 from finharness.provider.base import Provider
 from finharness.provider.errors import RateLimitError
 from finharness.provider.fake import FakeProvider
+from finharness.tools.base import PermissionLevel
 from finharness.tools.registry import ToolRegistry
 from finharness.types import (
     AgentTurnOutcome,

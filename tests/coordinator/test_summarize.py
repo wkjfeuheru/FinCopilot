@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from finharness.coordinator.summarize import (
+from finharness.shared.summarize import (
     Chunk,
     MapResult,
     batch_chunks,

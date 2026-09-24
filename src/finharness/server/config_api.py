@@ -26,9 +26,9 @@ from finharness.config.store import (
 )
 from finharness.provider.base import Provider
 from finharness.provider.errors import ProviderError
+from finharness.provider.policy import validate_user_provider_url
 from finharness.provider.registry import build_provider_from_fields
 from finharness.provider.resolver import ProviderResolver
-from finharness.server.provider_policy import validate_user_provider_url
 from finharness.types import ModelUsage, Msg, StreamEvent
 
 SUPPORTED_KINDS = {"openai_compat", "anthropic_compat", "fake"}

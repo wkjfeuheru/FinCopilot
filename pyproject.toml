@@ -30,6 +30,9 @@ dependencies = [
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+    "mypy>=1.14",
+    "import-linter>=2.1",
 ]
 # 可观测性后端（docs 03.14）：核心依赖不含它们，未安装时 metrics/tracing
 # 自动降级为 no-op，只有日志（纯标准库）始终可用。
@@ -65,3 +68,74 @@ addopts = "-m 'not smoke'"
 markers = [
     "smoke: hits real providers/data sources; needs network and credentials",
 ]
+
+# ---------------------------------------------------------------------------
+# 质量门禁（离线，不依赖网络）。目标是"只拦真错误"，因此刻意不启用 E501
+# （本项目有意使用长行——工具描述与表格）与 E701/E702（紧凑的单行分支）。
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 200
+target-version = "py313"
+
+[tool.ruff.lint]
+# F  = pyflakes 正确性（未用导入/变量、未定义名、f-string 缺占位符）
+# I  = isort 导入排序；UP = pyupgrade 语法现代化
+# B  = bugbear：除下方忽略的若干类外，其余（如 B904 异常链）一律启用
+# C4 = comprehension 简化
+select = ["F", "I", "UP", "B", "C4"]
+ignore = [
+    # FastAPI 依赖注入的标准写法就是在默认参数里调用 Depends()。
+    "B008",
+    # 适配器把 loop 变量捕获进 lambda，但每次迭代都同步调用，不是延迟绑定 bug。
+    "B023",
+    # zip() 两侧长度由构造逻辑保证一致；显式 strict 会让既有调用点被迫改语义。
+    "B905",
+    # 抽象基类故意只用 NotImplementedError 模板方法而非 @abstractmethod。
+    "B024",
+    # pytest 断言裸 Exception 是刻意的"任何失败都算通过"用例。
+    "B017",
+    # 与 str 混用的枚举保留 str+Enum（改用 StrEnum 是一次独立的行为评估）。
+    "UP042",
+    # PEP 695 泛型语法（class Foo[T]）与现有 Generic 写法等价，不做强制迁移。
+    "UP046",
+    "UP047",
+    # 百分号格式化只在测试 PDF 夹具里出现，不值得为一个字符串改风格。
+    "UP031",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试允许私有成员访问、循环变量未用等表达自由；只保留正确性检查。
+"tests/**" = ["B007"]
+
+[tool.mypy]
+python_version = "3.13"
+# 缺失的第三方类型存根不阻断检查。
+ignore_missing_imports = true
+# 渐进式收紧：只强制检查已清零的共享模块（见下方 files）。
+files = [
+    "src/finharness/utils/clock.py",
+    "src/finharness/utils/sqlite.py",
+    "src/finharness/utils/jsonx.py",
+    "src/finharness/utils/text.py",
+    "src/finharness/provider/_compat.py",
+    "src/finharness/provider/errors.py",
+    "src/finharness/data/lookback.py",
+    "src/finharness/data/adapters/pacing.py",
+    "src/finharness/data/adapters/retry.py",
+    "src/finharness/tools/fin/window.py",
+    # shared/：跨 tools 与 engine 的纯函数与声明层（declaration.py 因
+    # pydantic create_model 动态建模型的既有告警暂未纳入）。
+    "src/finharness/shared/agents.py",
+    "src/finharness/shared/budget.py",
+    "src/finharness/shared/capabilities.py",
+    "src/finharness/shared/fencing.py",
+    "src/finharness/shared/numbers.py",
+    "src/finharness/shared/review.py",
+    "src/finharness/shared/summarize.py",
+]
+# 新代码默认宽松，避免一次引入上千条历史告警；随模块逐个纳入 files 再收紧。
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+
+# 分层契约见仓库根的 .importlinter（独立文件，避免与 pyproject 的 [tool.*] 段合并）。

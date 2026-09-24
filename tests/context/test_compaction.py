@@ -7,13 +7,14 @@ from finharness.config.settings import ContextSettings, Settings
 from finharness.context.compaction import AutoCompactor
 from finharness.context.memory.working import WorkingMemory
 from finharness.context.session import ResearchContext
+from finharness.context.tokens import TokenCounter
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
 from finharness.hooks.audit import AuditHook, AuditLogWriter
 from finharness.hooks.base import HookChain
 from finharness.permissions.gate import PermissionGate
-from finharness.context.tokens import TokenCounter
-from finharness.types import Msg, ModelUsage, StreamChunk, StreamEvent, ToolUse
+from finharness.types import Msg, ToolUse
+from tests.conftest import settings_with_cache
 
 # 共享词表缓存：获取代价高昂，不能在每个测试中重复进行。
 COUNTER = TokenCounter()
@@ -27,17 +28,14 @@ from test_loop import (  # noqa: E402
     ScriptedProvider,
     Sink,
     StubRegistry,
-    RecordingTool,
-    make_loop,
     text_round,
-    tool_round,
 )
 
 
 def make_settings(tmp_path, **context) -> Settings:
     values = {"context_window_tokens": 600, "compaction_ratio": 0.5}
     values.update(context)
-    return Settings(context=ContextSettings(**values), data={"cache_dir": tmp_path / "cache"})
+    return settings_with_cache(tmp_path, context=ContextSettings(**values))
 
 
 def build_loop(tmp_path, provider, *, registry=None, output=None, settings=None, hooks=None):
@@ -233,8 +231,8 @@ def test_compaction_summary_is_observed_and_accounted(tmp_path):
 
     此前这次调用的 token 完全不计入会话成本，算是成本视图里的一个真实缺口。
     """
-    from finharness.observability.observer import Observer
     from finharness.observability.metrics import MetricsRecorder
+    from finharness.observability.observer import Observer
 
     settings = make_settings(tmp_path)
     ctx = ResearchContext(cite=CitationRegistry(), settings=settings)

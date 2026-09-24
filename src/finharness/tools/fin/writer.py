@@ -26,9 +26,9 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from finharness.data.raw import RawData
-from finharness.coordinator.review import format_review_lines, review_report
+from finharness.shared.declaration import Capability, ToolGroup, param, tool
+from finharness.shared.review import format_review_lines, review_report
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, ToolGroup, param, tool
 from finharness.tools.fin.report_pipeline import (
     ReportOutline,
     ReportPipeline,
@@ -217,7 +217,7 @@ def _package_chart_images(markdown: str) -> tuple[str, dict[str, bytes]]:
     """
     packaged: dict[str, bytes] = {}
 
-    def replace(match: "re.Match[str]") -> str:
+    def replace(match: re.Match[str]) -> str:
         alt, raw_target = match.group(1), match.group(2).strip()
         wrapped = raw_target.startswith("<") and raw_target.endswith(">")
         inner = raw_target[1:-1].replace("\\>", ">") if wrapped else raw_target

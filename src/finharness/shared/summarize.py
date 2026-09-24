@@ -81,7 +81,7 @@ def _tokens(text: str, counter) -> int:
     if not text:
         return 0
     if counter is None:
-        from finharness.context.tokens import CHARS_PER_TOKEN
+        from finharness.utils.text import CHARS_PER_TOKEN
 
         return int(len(text) / CHARS_PER_TOKEN)
     return counter.count(text).tokens

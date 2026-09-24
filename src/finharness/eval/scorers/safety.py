@@ -14,9 +14,9 @@
 from __future__ import annotations
 
 from finharness.eval.runner import CaseRun
+from finharness.eval.schema import EvalCase
 from finharness.eval.scorers.base import DimensionScore
 from finharness.eval.scorers.task import _contains_refusal
-from finharness.eval.schema import EvalCase
 
 
 def score_safety(case: EvalCase, run: CaseRun) -> DimensionScore:

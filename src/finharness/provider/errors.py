@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from math import isfinite
 
@@ -82,6 +82,6 @@ def parse_retry_after(value: str | None) -> float | None:
         except (TypeError, ValueError, IndexError, OverflowError):
             return None
         if retry_at.tzinfo is None:
-            retry_at = retry_at.replace(tzinfo=timezone.utc)
-        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
     return delay if delay >= 0 and isfinite(delay) else None

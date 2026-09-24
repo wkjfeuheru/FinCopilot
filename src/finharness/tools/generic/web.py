@@ -17,14 +17,14 @@ from __future__ import annotations
 from typing import Literal
 
 from finharness.data.raw import RawData
-from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
-from finharness.tools.generic.fencing import (
+from finharness.shared.declaration import Capability, Tier, ToolGroup, param, tool
+from finharness.shared.fencing import (
     EXTERNAL_NOTICE,
     RESULT_CLOSE,
     fence,
     neutralize,
 )
+from finharness.tools.base import BaseTool
 
 
 @tool(

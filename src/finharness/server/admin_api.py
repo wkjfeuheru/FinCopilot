@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -41,7 +41,7 @@ def _since_from_window(window: str) -> str | None:
             status_code=422,
             detail=f"未知时间窗：{window}；可用值 all/24h/7d/30d",
         )
-    return (datetime.now(timezone.utc) - offset).isoformat(timespec="milliseconds")
+    return (datetime.now(UTC) - offset).isoformat(timespec="milliseconds")
 
 
 def create_admin_router(

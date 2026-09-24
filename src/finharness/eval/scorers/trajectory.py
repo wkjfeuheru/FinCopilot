@@ -8,8 +8,8 @@
 from __future__ import annotations
 
 from finharness.eval.runner import CaseRun
-from finharness.eval.scorers.base import DimensionScore
 from finharness.eval.schema import EvalCase
+from finharness.eval.scorers.base import DimensionScore
 
 # 各组成部分的相对权重；按实际出现的权重做归一化。
 _W_REQUIRED = 0.40

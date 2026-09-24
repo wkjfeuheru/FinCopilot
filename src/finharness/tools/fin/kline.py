@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import pandas as pd
-
 from finharness.data.raw import RawData
+from finharness.shared.declaration import Capability, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, ToolGroup, param, tool
-
-# 窗口长度比请求的短这么多，说明数据源已无更多数据（次新股、停牌），
-# 而非序列只是“时间尚短”。
-_SHORT_WINDOW_RATIO = 0.8
+from finharness.tools.fin.window import note_actual_window
 
 
 @tool(
@@ -42,7 +37,11 @@ class GetKlineTool(BaseTool):
         if "date" in df.columns:
             df = df.sort_values("date", ascending=False).reset_index(drop=True)
         lines: list[str] = []
-        self._note_actual_window(lines, df, raw)
+        note_actual_window(
+            lines, df, raw,
+            year_param="years",
+            citation_note="引用时不得表述为“近 {requested} 年”，应以上述实际区间为准。",
+        )
         if "close" in df.columns:
             closes = df["close"].astype(float)
             lines.append("区间摘要：")
@@ -62,33 +61,3 @@ class GetKlineTool(BaseTool):
         )
         body = "\n".join(lines) + "\n\n近期明细：\n" + detail
         return body, [raw]
-
-    @staticmethod
-    def _note_actual_window(lines: list[str], df: pd.DataFrame, raw: RawData) -> None:
-        """说明实际覆盖的区间，避免对过短的序列错误标注。
-
-        对次新股调用 ``get_kline(years=N)`` 只会返回它已有的那些交易日；
-        若不给出实际边界，调用方可能把这个短序列当作“近 N 年”来引用。
-        该提示让这种不匹配变得明确。
-        """
-        if "date" not in df.columns:
-            return
-        dates = pd.to_datetime(df["date"], errors="coerce").dropna()
-        if not len(dates):
-            return
-        first, last = dates.min().date(), dates.max().date()
-        lines.append(f"- 数据区间：{first} ~ {last}（共 {len(df)} 条）")
-        requested = None
-        try:
-            requested = int((raw.params or {}).get("years"))
-        except (TypeError, ValueError):
-            requested = None
-        if not requested or requested <= 0:
-            return
-        span_days = (last - first).days
-        if span_days < 365 * requested * _SHORT_WINDOW_RATIO:
-            lines.append(
-                f"- 注意：实际区间约 {span_days} 天，明显短于请求的 {requested} 年"
-                "（该标的可能上市较晚或数据不足）；引用时不得表述为"
-                f"“近 {requested} 年”，应以上述实际区间为准。"
-            )

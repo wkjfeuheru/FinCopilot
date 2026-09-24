@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from finharness.eval.config import EvalConfig
 from finharness.eval.runner import CaseRun
-from finharness.eval.scorers.base import DimensionScore
 from finharness.eval.schema import EvalCase
+from finharness.eval.scorers.base import DimensionScore
 
 
 def _ratio(actual: float, budget: float | None) -> tuple[float, bool]:

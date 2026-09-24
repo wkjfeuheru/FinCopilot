@@ -216,7 +216,10 @@ def test_annual_periods_respect_the_april_disclosure_deadline():
 
 def test_period_count_is_capped_regardless_of_the_requested_span():
     """请求数必须是有界常量，而不是会话长度的函数。"""
-    from finharness.data.mapping import FUYAO_INDICATOR_MAX_PERIODS, fuyao_report_periods
+    from finharness.data.mapping import (
+        FUYAO_INDICATOR_MAX_PERIODS,
+        fuyao_report_periods,
+    )
 
     assert len(fuyao_report_periods(50, today=date(2026, 9, 20))) == FUYAO_INDICATOR_MAX_PERIODS
 

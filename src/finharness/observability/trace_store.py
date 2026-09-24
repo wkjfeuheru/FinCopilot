@@ -18,12 +18,13 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from finharness.observability.redact import redact, redact_text, summarize_args
+from finharness.utils.clock import utc_now_iso
+from finharness.utils.sqlite import SqliteStore
 
 log = logging.getLogger(__name__)
 
@@ -106,26 +107,16 @@ ON trace_rounds(run_id, turn)
 _BLOCK_VERDICTS = ("denied", "blocked")
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-class TraceStore:
+class TraceStore(SqliteStore):
     """SQLite trace 库；同一线程模型与 ``MemoryStore`` 一致（短连接 + WAL）。"""
 
     def __init__(self, db_path: str | Path, *, capture_payloads: bool = True) -> None:
-        self.db_path = Path(db_path)
+        super().__init__(db_path, check_same_thread=False)
         self.capture_payloads = capture_payloads
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._seq: dict[str, int] = {}
         self._init_db()
 
     # ── 基础设施 ──────────────────────────────────────────────
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        return connection
 
     def _init_db(self) -> None:
         try:
@@ -176,7 +167,7 @@ class TraceStore:
                         conversation_id,
                         eval_case_id,
                         self._text(input),
-                        _now(),
+                        utc_now_iso(timespec="milliseconds"),
                     ),
                 )
         except sqlite3.Error:
@@ -242,7 +233,7 @@ class TraceStore:
                         json.dumps(per_agent, ensure_ascii=False, default=str) if per_agent else None,
                         json.dumps(citations, ensure_ascii=False) if citations else None,
                         json.dumps(plan, ensure_ascii=False, default=str) if plan else None,
-                        _now(),
+                        utc_now_iso(timespec="milliseconds"),
                         None,
                         run_id,
                     ),
@@ -298,7 +289,7 @@ class TraceStore:
         """按保留期清理过期运行；返回删除的行数（0 或失败时为 0）。"""
         if retention_days <= 0:
             return 0
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat(
             timespec="milliseconds"
         )
         removed = 0
@@ -455,7 +446,7 @@ class TraceStore:
         """七项运行指标 + 停止原因拆解 + 每工具失败榜 + 首次跑偏轮次分布。"""
         where, params = self._run_filters(source=source, user_id=user_id, since=since, until=until)
         result: dict[str, Any] = {
-            "generated_at": _now(),
+            "generated_at": utc_now_iso(timespec="milliseconds"),
             "filters": {"source": source, "user_id": user_id, "since": since, "until": until},
         }
         try:

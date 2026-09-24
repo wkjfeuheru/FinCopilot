@@ -101,12 +101,12 @@ class PermissionGate:
         self,
         *,
         settings,
-        confirm: "Callable[[str, dict], Awaitable[bool]] | None" = None,
+        confirm: Callable[[str, dict], Awaitable[bool]] | None = None,
         deny_patterns: tuple[str, ...] | None = None,
         mode: PermissionMode | None = None,
         conversation_id: str = "local",
         confirmed_categories: set[str] | None = None,
-        confirm_egress: "Callable[[str, dict], Awaitable[bool]] | None" = None,
+        confirm_egress: Callable[[str, dict], Awaitable[bool]] | None = None,
     ) -> None:
         self.settings = settings
         # ``mode`` 规范化后再存：下方对 AUTO 的判定用 ``is`` 比较枚举成员，而签名虽然

@@ -14,7 +14,10 @@ from finharness.data.mapping import (
     normalize_index,
     normalize_macro_indicator,
 )
-from finharness.tools.fin.industry import GetIndustryConstituentsTool, GetIndustryPerfTool
+from finharness.tools.fin.industry import (
+    GetIndustryConstituentsTool,
+    GetIndustryPerfTool,
+)
 from finharness.tools.fin.macro import GetMacroIndicatorsTool
 
 

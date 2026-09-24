@@ -11,8 +11,8 @@ import httpx
 from finharness.config.settings import ProviderSettings, Settings
 from finharness.config.store import ConfigStore, ProviderConfigRecord
 from finharness.provider.base import Provider
+from finharness.provider.policy import validate_user_provider_url
 from finharness.provider.registry import build_provider_from_fields
-from finharness.server.provider_policy import validate_user_provider_url
 
 
 class NotConfigured(RuntimeError):

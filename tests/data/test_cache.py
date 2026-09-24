@@ -19,7 +19,7 @@ def test_lookup_key_is_date_independent_and_param_sensitive():
 
 
 def test_cache_key_changes_with_date_endpoint_and_params():
-    base = dict(endpoint="akshare:x", params={"symbol": "600519"}, data_date="2026-01-01")
+    base = {"endpoint": "akshare:x", "params": {"symbol": "600519"}, "data_date": "2026-01-01"}
 
     assert make_cache_key(**base) != make_cache_key(**{**base, "data_date": "2026-01-02"})
     assert make_cache_key(**base) != make_cache_key(**{**base, "endpoint": "tushare:x"})

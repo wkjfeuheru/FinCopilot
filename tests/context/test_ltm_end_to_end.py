@@ -20,13 +20,14 @@ from finharness.engine.loop import AgentLoop
 from finharness.permissions.gate import PermissionGate
 from finharness.server.distill_sweeper import distill_user_backlog, sweep_once
 from finharness.tools.registry import ToolRegistry
+from tests.conftest import settings_with_cache
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
-from test_loop import ScriptedProvider, text_round, tool_round  # noqa: E402
+from test_loop import ScriptedProvider, text_round  # noqa: E402
 
 
 def make_settings(tmp_path) -> Settings:
-    return Settings(data={"cache_dir": tmp_path / "cache"})
+    return settings_with_cache(tmp_path)
 
 
 def build_loop(tmp_path, provider, *, conversation_id, store, user_id="u1", semantic_index=None):

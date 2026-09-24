@@ -8,6 +8,7 @@ from finharness.permissions.gate import PermissionGate, ReadOnlyGate
 from finharness.permissions.modes import PermissionMode, Verdict
 from finharness.tools.base import PermissionLevel
 from finharness.workspace import Workspace
+from tests.conftest import settings_with_cache
 
 
 @dataclass
@@ -20,9 +21,8 @@ class FakeTool:
 
 
 def make_settings(tmp_path, *, mode="default") -> Settings:
-    return Settings(
-        permission=PermissionSettings(default_mode=mode),
-        data={"cache_dir": tmp_path / "cache"},
+    return settings_with_cache(
+        tmp_path, permission=PermissionSettings(default_mode=mode)
     )
 
 

@@ -1,0 +1,105 @@
+; 分层契约（docs/modules/FinHarness架构与模块详细设计.md §1.5、§1.6）。
+;
+; 目的：阻止新代码引入逆向依赖，让设计文档声明的分层在 CI 里可执行，而不是
+; 依赖人肉 review。这里只固化**当前已经满足**的规则，因此契约一开始就是绿的。
+;
+; 检查：lint-imports（import-linter）
+
+[importlinter]
+root_package = finharness
+
+[importlinter:contract:shared-is-lowest]
+name = shared 是共享底层：不依赖任何上层子包
+type = forbidden
+source_modules =
+    finharness.shared
+forbidden_modules =
+    finharness.auth
+    finharness.compute
+    finharness.context
+    finharness.coordinator
+    finharness.data
+    finharness.engine
+    finharness.eval
+    finharness.factor
+    finharness.hooks
+    finharness.observability
+    finharness.permissions
+    finharness.provider
+    finharness.server
+    finharness.tools
+    finharness.workspace
+
+[importlinter:contract:tools-no-upward]
+name = tools 不依赖 engine/server/coordinator
+type = forbidden
+source_modules =
+    finharness.tools
+forbidden_modules =
+    finharness.coordinator
+    finharness.engine
+    finharness.server
+
+[importlinter:contract:engine-no-server]
+name = engine 不依赖 server
+type = forbidden
+source_modules =
+    finharness.engine
+forbidden_modules =
+    finharness.server
+
+[importlinter:contract:utils-is-lowest]
+name = utils 是最底层：不依赖任何 finharness 子包
+type = forbidden
+source_modules =
+    finharness.utils
+forbidden_modules =
+    finharness.auth
+    finharness.compute
+    finharness.config
+    finharness.context
+    finharness.coordinator
+    finharness.data
+    finharness.engine
+    finharness.eval
+    finharness.factor
+    finharness.hooks
+    finharness.observability
+    finharness.permissions
+    finharness.provider
+    finharness.server
+    finharness.tools
+    finharness.workspace
+
+[importlinter:contract:data-no-upward]
+name = data 不依赖上层
+type = forbidden
+source_modules =
+    finharness.data
+forbidden_modules =
+    finharness.context
+    finharness.coordinator
+    finharness.engine
+    finharness.server
+    finharness.tools
+
+[importlinter:contract:provider-no-upward]
+name = provider 不依赖服务/工具/引擎层
+type = forbidden
+source_modules =
+    finharness.provider
+forbidden_modules =
+    finharness.coordinator
+    finharness.engine
+    finharness.server
+    finharness.tools
+
+[importlinter:contract:config-no-upward]
+name = config 不依赖上层
+type = forbidden
+source_modules =
+    finharness.config
+forbidden_modules =
+    finharness.engine
+    finharness.server
+    finharness.tools

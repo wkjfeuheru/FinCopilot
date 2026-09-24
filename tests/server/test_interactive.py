@@ -225,7 +225,6 @@ def test_egress_remember_suppresses_the_next_prompt(tmp_path):
     from finharness.permissions.gate import PermissionGate
     from tests.permissions.test_gate import FakeTool, make_settings
 
-    bus = ConfirmBus(ttl_s=1.0)
     settings = make_settings(tmp_path)
     confirmed: set[str] = set()
     prompts = 0

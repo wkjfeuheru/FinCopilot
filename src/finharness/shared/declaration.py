@@ -18,9 +18,10 @@ Pydantic 无法表达的描述与约束（``desc`` / ``min_length`` / 自定义�
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Annotated, Any, Callable, Literal, get_type_hints
+from typing import Annotated, Any, Literal, get_type_hints
 
 from pydantic import BaseModel, Field, create_model
 from pydantic import model_validator as _model_validator
@@ -49,7 +50,7 @@ class Capability(str, Enum):
     """工具用途。当两个工具可互相替代时，它们共享同一能力；能力不同意味着工作本身
     确实不同。
 
-    它定义在声明模块，是因为"这个工具是干什么的"本身就是一项声明；``tools/capabilities.py``
+    它定义在声明模块，是因为"这个工具是干什么的"本身就是一项声明；``shared/capabilities.py``
     在此之上提供*按能力使用它*的推理（哪些能力代表真正的研究工作、如何从文本推断意图）。
     """
 

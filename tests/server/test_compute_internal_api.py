@@ -1,9 +1,9 @@
-import json
-import base64
 import asyncio
-import pytest
+import base64
+import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from finharness.compute.protocol import TaskSigner

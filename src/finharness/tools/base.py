@@ -15,19 +15,19 @@ from typing import Any
 import pandas as pd
 from pydantic import BaseModel, ValidationError
 
-from finharness.context.tokens import CHARS_PER_TOKEN
 from finharness.data.access import DataAccess, DataUnavailableError
 from finharness.data.raw import RawData
-from finharness.tools.budget import (
+from finharness.shared.budget import (
     FULL_DETAIL_MULTIPLIER,
     resolve_result_budget,
 )
-from finharness.tools.declare import (
+from finharness.shared.declaration import (
     PermissionLevel,
     ToolGroup,
     ToolSpec,
 )
 from finharness.types import ToolResult
+from finharness.utils.text import CHARS_PER_TOKEN
 
 MAX_RENDER_ROWS = 20
 MAX_RENDER_COLS = 12
@@ -113,7 +113,7 @@ class BaseTool(ABC):
         取不到说明该类未经 ``@tool`` 装饰——那是声明缺陷，在构造/使用点直接失败，
         而不是让工具带着空能力与空参数字段继续跑。
         """
-        from finharness.tools.declare import declared
+        from finharness.shared.declaration import declared
 
         return declared(type(self).name)
 
@@ -402,7 +402,7 @@ class BaseTool(ABC):
         return "（" + "；".join(parts) + "。" + tail + "）"
 
     def _result_token_budget(self, *, detail: str = "summary") -> int:
-        """本工具结果可用的 token 预算，由 :mod:`finharness.tools.budget` 单点解析。
+        """本工具结果可用的 token 预算，由 :mod:`finharness.shared.budget` 单点解析。
 
         渲染侧与引擎侧读同一个数字，因此 ``detail="full"`` 的放大不会被引擎的裁剪
         再收回去（那曾使这个逃生口半失效）。

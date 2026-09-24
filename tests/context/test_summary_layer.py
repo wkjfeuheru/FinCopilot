@@ -1,6 +1,5 @@
 """分段摘要：累积、合并、ledger 与注入渲染。"""
 
-from finharness.config.settings import Settings
 from finharness.context.memory.store import MemoryStore
 from finharness.context.memory.summary import SummaryLayer
 from finharness.context.tokens import TokenCounter

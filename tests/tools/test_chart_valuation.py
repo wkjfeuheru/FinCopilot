@@ -9,9 +9,14 @@ import pytest
 from finharness.config.settings import Settings
 from finharness.data.access import DataAccess
 from finharness.data.citation import CitationRegistry, fingerprint_frame
-from finharness.tools.fin.charting import CJK_FONT_CANDIDATES, FontUnavailableError, resolve_cjk_font
 from finharness.tools.fin.chart import MakeChartTool
+from finharness.tools.fin.charting import (
+    CJK_FONT_CANDIDATES,
+    FontUnavailableError,
+    resolve_cjk_font,
+)
 from finharness.tools.fin.valuation_calc import CalcValuationTool
+from tests.conftest import settings_with_cache
 
 
 class Ctx:
@@ -22,9 +27,7 @@ class Ctx:
 
 
 def make_settings(tmp_path) -> Settings:
-    return Settings(
-        paths={"output_dir": tmp_path / "output"}, data={"cache_dir": tmp_path / "cache"}
-    )
+    return settings_with_cache(tmp_path, paths={"output_dir": tmp_path / "output"})
 
 
 def kline_frame(rows: int = 90) -> pd.DataFrame:

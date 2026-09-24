@@ -5,7 +5,12 @@ import httpx
 import pytest
 
 from finharness.provider.anthropic_compat import AnthropicCompatProvider
-from finharness.provider.errors import AuthError, NetworkError, RateLimitError, ServerError
+from finharness.provider.errors import (
+    AuthError,
+    NetworkError,
+    RateLimitError,
+    ServerError,
+)
 from finharness.types import ModelUsage, Msg, StreamEvent, ToolUse, ToolUseDelta
 
 

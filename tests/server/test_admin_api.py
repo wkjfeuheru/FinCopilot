@@ -7,8 +7,6 @@ usage.db（token/轮数）。
 
 from __future__ import annotations
 
-import json
-
 from fastapi.testclient import TestClient
 
 from finharness.auth.store import UserStore

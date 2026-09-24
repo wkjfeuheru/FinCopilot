@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from finharness.config.settings import ContextSettings, Settings
-from finharness.context.session import ResearchContext, PlanStep
+from finharness.context.session import PlanStep, ResearchContext
 from finharness.context.tokens import TokenCounter
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
@@ -18,18 +18,26 @@ from finharness.hooks.audit import AuditHook, AuditLogWriter
 from finharness.hooks.base import HookChain
 from finharness.permissions.gate import PermissionGate
 from finharness.types import ToolUse
+from tests.conftest import settings_with_cache
 
 # 共享的词汇表缓存：抓取它代价高昂，绝不能在每个测试中重复进行。
 COUNTER = TokenCounter()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
-from test_loop import RecordingTool, ScriptedProvider, Sink, StubRegistry, text_round, tool_round  # noqa: E402
+from test_loop import (  # noqa: E402
+    RecordingTool,
+    ScriptedProvider,
+    Sink,
+    StubRegistry,
+    text_round,
+    tool_round,
+)
 
 
 def make_settings(tmp_path, **context) -> Settings:
     values = {"max_identical_tool_calls": 3, "max_turns": 10}
     values.update(context)
-    return Settings(context=ContextSettings(**values), data={"cache_dir": tmp_path / "cache"})
+    return settings_with_cache(tmp_path, context=ContextSettings(**values))
 
 
 def build_loop(tmp_path, provider, *, registry=None, output=None, settings=None, hooks=None, plan=False):

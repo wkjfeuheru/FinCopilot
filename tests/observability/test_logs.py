@@ -4,7 +4,11 @@ import json
 import logging
 
 from finharness.observability.context import bind_trace
-from finharness.observability.logs import JsonFormatter, TraceContextFilter, setup_logging
+from finharness.observability.logs import (
+    JsonFormatter,
+    TraceContextFilter,
+    setup_logging,
+)
 
 
 def _render(record: logging.LogRecord) -> dict:

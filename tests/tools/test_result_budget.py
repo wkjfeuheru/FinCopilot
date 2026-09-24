@@ -15,9 +15,9 @@ import pandas as pd
 from finharness.config.settings import ContextSettings, Settings, ToolSettings
 from finharness.data.access import DataAccess
 from finharness.data.raw import RawData
+from finharness.shared.budget import UNBOUNDED_RESULT_TOKENS, resolve_result_budget
+from finharness.shared.declaration import Capability, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.budget import UNBOUNDED_RESULT_TOKENS, resolve_result_budget
-from finharness.tools.declare import Capability, tool
 
 # -- 解析优先级 ---------------------------------------------------------------
 
@@ -100,6 +100,7 @@ class _FrameTool(BaseTool):
 
 def _run_loop_and_capture(settings: Settings, *, detail: str) -> str:
     from finharness.engine.loop import AgentLoop  # noqa: F401 - 触发循环注册
+    from finharness.types import ToolUse
     from tests.engine.test_loop import (
         ScriptedProvider,
         StubRegistry,
@@ -107,7 +108,6 @@ def _run_loop_and_capture(settings: Settings, *, detail: str) -> str:
         text_round,
         tool_round,
     )
-    from finharness.types import ToolUse
 
     tool = _FrameTool(_access(settings))
     provider = ScriptedProvider(

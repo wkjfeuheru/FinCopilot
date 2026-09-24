@@ -23,6 +23,25 @@ on:
         default: smoke
 
 jobs:
+  lint:
+    name: 静态检查（ruff / mypy / 分层契约）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: ruff（正确性与导入排序）
+        run: ruff check src tests
+      - name: mypy（已清零的共享模块）
+        run: mypy
+      - name: 分层契约（import-linter）
+        run: lint-imports
+
   offline:
     name: 离线测试（不含 smoke）
     runs-on: ubuntu-latest

@@ -10,19 +10,17 @@
 """
 
 import asyncio
+import sys
 from pathlib import Path
-
-import pytest
 
 from finharness.config.settings import ContextSettings, Settings
 from finharness.context.memory.store import MemoryStore
-from finharness.context.session import Plan, PlanStep, ResearchContext
+from finharness.context.session import ResearchContext
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop, StopSignal
 from finharness.provider.base import Provider
 from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
-
-import sys
+from tests.conftest import settings_with_cache
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 from test_loop import (  # noqa: E402
@@ -61,9 +59,8 @@ class StopAfterProvider(Provider):
 
 
 def make_settings(tmp_path) -> Settings:
-    return Settings(
-        context=ContextSettings(context_window_tokens=100000),
-        data={"cache_dir": tmp_path / "cache"},
+    return settings_with_cache(
+        tmp_path, context=ContextSettings(context_window_tokens=100000)
     )
 
 

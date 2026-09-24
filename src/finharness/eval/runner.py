@@ -16,7 +16,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,7 @@ from finharness.hooks.audit import AuditHook, AuditLogWriter
 from finharness.hooks.base import HookChain
 from finharness.permissions.gate import PermissionGate
 from finharness.tools.registry import ToolRegistry
+from finharness.utils.jsonx import stable_dumps
 
 
 @dataclass(slots=True)
@@ -54,9 +55,6 @@ class CaseRun:
     @property
     def case_id(self) -> str:
         return self.case.id
-
-    def all_traces(self) -> list[Any]:
-        return [round_trace for turn in self.turns for round_trace in turn.trace]
 
     def called_tools(self) -> list[str]:
         """实际执行成功的工具名（observation ok=True）。"""
@@ -89,9 +87,6 @@ class CaseRun:
                     if reason is None or reason in error:
                         names.append(observation.name)
         return names
-
-    def all_interactions(self) -> list[Any]:
-        return [item for turn in self.turns for item in turn.interactions]
 
     # -- 轨迹分析辅助方法 ---------------------------------------------------
     def executed_sequence(self) -> list[str]:
@@ -128,15 +123,6 @@ class CaseRun:
             if done and done[-1].get("plan"):
                 return True
         return False
-
-    def plan_max_revision(self) -> int:
-        revisions = [
-            int(event.data.get("revision", 1))
-            for turn in self.turns
-            for event in turn.events
-            if event.kind == "plan_progress"
-        ]
-        return max(revisions, default=0)
 
     def loaded_skills(self) -> list[str]:
         """本次运行注入的方法论，从 ``context_routed`` 事件中读取。
@@ -272,7 +258,7 @@ def build_data_access(settings: Settings, *, offline: bool) -> DataAccess:
 def _fingerprint(args: Any) -> str:
     """对调用参数做稳定的 JSON 渲染，用于检测重复调用。"""
     try:
-        return json.dumps(args or {}, sort_keys=True, ensure_ascii=False, default=str)
+        return stable_dumps(args or {})
     except (TypeError, ValueError):
         return str(args)
 
@@ -352,7 +338,7 @@ class EvalRunner:
         settings = isolate_settings(self.base_settings, case_dir)
         record = CaseRun(
             case=case,
-            started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            started_at=datetime.now(UTC).isoformat(timespec="seconds"),
             run_dir=str(case_dir),
         )
 
@@ -506,7 +492,7 @@ def build_manifest(
 ) -> dict[str, Any]:
     """记录生成本次运行的要素：模型、provider、环境、代码版本。"""
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
         "set": set_name,
         "cases": case_count,
         "offline": offline,

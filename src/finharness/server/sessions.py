@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from finharness.types import StopSignal
 from finharness.compute.executor import ComputeExecutor, ComputeResult, ComputeTask
-from collections.abc import Mapping
+from finharness.types import StopSignal
 
 
 @dataclass(frozen=True)

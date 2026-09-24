@@ -1,6 +1,5 @@
 """二期：跨对话语义记忆（facts）与向量检索（docs 03.6.4）。"""
 
-import asyncio
 
 import httpx
 import pytest
@@ -11,17 +10,16 @@ from finharness.context.memory.vector import (
     QdrantVectorStore,
     SemanticIndex,
     SqliteVectorStore,
-    build_vector_store,
     _cosine,
+    build_vector_store,
 )
 from finharness.provider.embeddings import Embedder, _parse_embeddings, build_embedder
+from tests.conftest import settings_with_cache
 
 
 def make_settings(tmp_path, **ltm) -> Settings:
     values = {**ltm}
-    return Settings(
-        ltm=values, data={"cache_dir": tmp_path / "cache"}
-    )
+    return settings_with_cache(tmp_path, ltm=values)
 
 
 # --- 存储层：语义条目 -------------------------------------------------------

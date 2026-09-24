@@ -10,7 +10,7 @@
   会把会话的协调器注入进来。因此 map/reduce 走既有的 ``Coordinator.spawn``——同一套
   子代理、可观测性与用量记账。
 * **id 是契约，顺序不是。** 子代理并发返回、分片超过一批还要分批，所以每片带稳定
-  id，归并前按 id 重排（见 ``coordinator/summarize.py``）。丢失的片如实标注缺失。
+  id，归并前按 id 重排（见 ``shared/summarize.py``）。丢失的片如实标注缺失。
 * **摘要之外保留原文。** 摘要必然损失细节，所以结果里给出分片明细与源文件路径，
   需要核对原话时可用 ``read_pdf`` / ``read_file`` 下钻。
 """
@@ -23,15 +23,21 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, model_validator
 
-from finharness.coordinator import GENERAL_FOCUS
-from finharness.coordinator.numbers import (
+from finharness.context.tokens import default_counter
+from finharness.data.adapters.base import AdapterError
+from finharness.data.adapters.pdf_fetch import extract_pdf_pages
+from finharness.data.raw import RawData
+from finharness.shared.agents import GENERAL_FOCUS
+from finharness.shared.declaration import Capability, Tier, ToolGroup, tool
+from finharness.shared.fencing import EXTERNAL_NOTICE, neutralize
+from finharness.shared.numbers import (
     CLIP_MARKER,
     find_gaps,
     page_span,
     pages_for_anchor,
     repair_task,
 )
-from finharness.coordinator.summarize import (
+from finharness.shared.summarize import (
     MapResult,
     batch_chunks,
     document_outline,
@@ -43,13 +49,7 @@ from finharness.coordinator.summarize import (
     reduce_task,
     split_document,
 )
-from finharness.context.tokens import default_counter
-from finharness.data.adapters.base import AdapterError
-from finharness.data.adapters.pdf_fetch import extract_pdf_pages
-from finharness.data.raw import RawData
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, Tier, ToolGroup, tool
-from finharness.tools.generic.fencing import EXTERNAL_NOTICE, neutralize
 from finharness.workspace import Workspace
 
 # 结果声明一个较宽的预算：它要容纳一份全局摘要 + 分片索引 + 路径，但仍是有界的。
@@ -83,7 +83,7 @@ class SummarizeInput(BaseModel):
     title: str | None = Field(default=None, description="文档标题，可选；用于结果抬头")
 
     @model_validator(mode="after")
-    def _require_a_source(self) -> "SummarizeInput":
+    def _require_a_source(self) -> SummarizeInput:
         if not (self.text and self.text.strip()) and not (self.path and self.path.strip()):
             raise ValueError("必须提供 text 或 path 之一")
         return self
@@ -160,7 +160,7 @@ class SummarizeDocumentTool(BaseTool):
         )
 
         detail_path = self._save_detail(
-            resolved_title, body, [item for item in ordered]
+            resolved_title, body, list(ordered)
         )
         note = f"分片缺漏：{'、'.join(missing)}" if missing else ""
         return self._result(

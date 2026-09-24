@@ -22,6 +22,7 @@ from finharness.types import (
     StreamEvent,
     ToolUse,
 )
+from tests.conftest import settings_with_cache
 
 
 class Adapter(DataAdapter):
@@ -75,9 +76,9 @@ def tool_round(*tool_uses: ToolUse) -> list[StreamChunk]:
 
 
 def make_settings(tmp_path, **context) -> Settings:
-    return Settings(
+    return settings_with_cache(
+        tmp_path,
         context=ContextSettings(**context),
-        data={"cache_dir": tmp_path / "cache"},
         paths={"output_dir": tmp_path / "output"},
     )
 

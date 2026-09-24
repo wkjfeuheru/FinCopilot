@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -21,6 +20,7 @@ from finharness.data.cache import LocalCache, make_lookup_key
 from finharness.data.citation import fingerprint_series
 from finharness.data.mapping import UnknownExchangePrefix, normalize_valuation_indicator
 from finharness.data.raw import RawData
+from finharness.utils.clock import local_now_iso
 
 
 class DataUnavailableError(RuntimeError):
@@ -40,11 +40,6 @@ def validate_symbol(symbol: str) -> str:
     if not re.fullmatch(r"\d{6}", str(symbol)):
         raise ValueError("symbol must be a 6-digit A-share code")
     return symbol
-
-
-def _now_stamp() -> str:
-    """本次取数的抓取时刻，与缓存条目所用的时间戳格式一致（本地时区、秒级）。"""
-    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _data_date(df: pd.DataFrame | None, fallback: str) -> str:
@@ -162,7 +157,7 @@ class DataAccess:
             interface = result.interface if isinstance(result, FetchResult) else kind
             endpoint = f"{adapter.name}:{interface}"
             data_date = _data_date(df, LocalCache.today())
-            fetched_at = _now_stamp()
+            fetched_at = local_now_iso()
             if self.cache is not None:
                 entry = await self.cache.put(
                     lookup_key=lookup_key,

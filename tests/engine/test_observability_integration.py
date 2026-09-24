@@ -5,7 +5,6 @@ import asyncio
 from finharness.observability import NullObserver
 from finharness.observability.observer import Observer
 from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
-
 from tests.engine.test_loop import (  # noqa: E402 - 复用既有替身
     RecordingTool,
     ScriptedProvider,

@@ -10,8 +10,6 @@ from __future__ import annotations
 import asyncio
 import re
 
-import pytest
-
 from finharness.config.settings import ContextSettings, Settings
 from finharness.coordinator.reviewer import SubAgentResult
 from finharness.data.access import DataAccess
@@ -155,7 +153,7 @@ def test_a_failed_chunk_is_reported_as_missing_not_hidden(tmp_path):
 
 def test_more_chunks_than_one_batch_are_dispatched_in_batches(tmp_path):
     """分片数超过单批上限时自动分批，而不是一次派发超过上限的任务。"""
-    from finharness.coordinator.summarize import MAX_TASKS_PER_BATCH
+    from finharness.shared.summarize import MAX_TASKS_PER_BATCH
 
     coordinator = StubCoordinator()
     tool = make_tool(tmp_path, coordinator)
@@ -233,8 +231,8 @@ def test_a_local_pdf_can_be_summarized_by_path(tmp_path):
 
 
 def test_it_is_lazy_and_read_only(tmp_path):
+    from finharness.shared.declaration import Tier
     from finharness.tools.base import PermissionLevel, ToolGroup
-    from finharness.tools.declare import Tier
 
     assert SummarizeDocumentTool.permission is PermissionLevel.READ
     assert SummarizeDocumentTool.group is ToolGroup.META

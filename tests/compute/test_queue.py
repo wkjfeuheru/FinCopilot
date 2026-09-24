@@ -1,5 +1,6 @@
-from finharness.compute.queue import ComputeJobStore, QueueFullError
 import pytest
+
+from finharness.compute.queue import ComputeJobStore, QueueFullError
 
 
 @pytest.mark.parametrize("finish", ["succeed", "fail"])

@@ -12,10 +12,11 @@ from finharness.tools.meta.memory import (
     SearchMemoryTool,
     UpdateMemoryTool,
 )
+from tests.conftest import settings_with_cache
 
 
 def make_settings(tmp_path) -> Settings:
-    return Settings(data={"cache_dir": tmp_path / "cache"})
+    return settings_with_cache(tmp_path)
 
 
 # --- 存储层：写入 / 去重 / 检索 / 保留 ---------------------------------------

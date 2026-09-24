@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -20,9 +20,8 @@ from typing import Any
 
 import httpx
 
-from finharness.compute.protocol import TaskPackageError, TaskSigner
 from finharness.compute.executor import ComputeTask, LocalProcessComputeExecutor
-
+from finharness.compute.protocol import TaskPackageError, TaskSigner
 
 TaskHandler = Callable[[Mapping[str, Any], Path], dict[str, Any]]
 
@@ -56,7 +55,7 @@ def _docx_export_handler(_job: Mapping[str, Any], input_dir: Path) -> dict[str, 
 def _absolutize_images(markdown: str, input_dir: Path) -> str:
     """把引用包内文件的图片目标改写为绝对路径；其余引用原样保留。"""
 
-    def replace(match: "re.Match[str]") -> str:
+    def replace(match: re.Match[str]) -> str:
         prefix, target, suffix = match.group(1), match.group(2), match.group(3)
         wrapped = target.startswith("<") and target.endswith(">")
         inner = target[1:-1].replace("\\>", ">") if wrapped else target

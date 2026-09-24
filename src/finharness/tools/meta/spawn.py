@@ -17,10 +17,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from finharness.coordinator import GENERAL_FOCUS, MAX_SPAWN_TASKS
 from finharness.data.raw import RawData
+from finharness.shared.agents import GENERAL_FOCUS, MAX_SPAWN_TASKS
+from finharness.shared.declaration import Capability, Tier, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 
 _TASKS_HELP = (
     "并行子任务列表，每项须自包含（谁、要什么、材料在哪）。"

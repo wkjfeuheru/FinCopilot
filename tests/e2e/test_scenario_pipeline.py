@@ -22,9 +22,9 @@ from finharness.data.access import DataAccess
 from finharness.data.adapters.base import DataAdapter, FetchResult
 from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry, fingerprint_frame
-from finharness.tools.fin.charting import FontUnavailableError, resolve_cjk_font
 from finharness.tools.fin.backtest import RunBacktestTool
 from finharness.tools.fin.chart import MakeChartTool
+from finharness.tools.fin.charting import FontUnavailableError, resolve_cjk_font
 from finharness.tools.fin.macro import GetMacroIndicatorsTool
 from finharness.tools.meta.skills import SkillRegistry
 from finharness.tools.registry import ToolRegistry

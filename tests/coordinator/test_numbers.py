@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from finharness.coordinator.numbers import (
+from finharness.shared.numbers import (
     CLIP_MARKER,
     MAX_GAPS,
     find_gaps,
@@ -14,7 +14,6 @@ from finharness.coordinator.numbers import (
     pages_for_anchor,
     repair_task,
 )
-
 
 # -- 缺口识别 -----------------------------------------------------------------
 

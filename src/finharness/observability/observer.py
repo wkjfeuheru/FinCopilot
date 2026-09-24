@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from finharness.observability.context import TraceContext, bind_trace, current_trace
 
@@ -142,7 +143,7 @@ class Span:
 
     __slots__ = ("_observer", "_handle", "_started", "_first_token_at", "_attrs", "_usage", "_ended", "_error")
 
-    def __init__(self, observer: "Observer", handle: Any | None = None) -> None:
+    def __init__(self, observer: Observer, handle: Any | None = None) -> None:
         self._observer = observer
         self._handle = handle
         self._started = time.monotonic()

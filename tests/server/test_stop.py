@@ -23,7 +23,6 @@ from finharness.context.memory.store import MemoryStore
 from finharness.provider.base import Provider
 from finharness.server.api import create_app
 from finharness.types import ModelUsage, Msg, StopSignal, StreamChunk, StreamEvent
-
 from tests.server.conftest import authed_client, register_and_login
 
 

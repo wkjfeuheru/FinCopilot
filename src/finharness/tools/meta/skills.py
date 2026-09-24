@@ -32,7 +32,7 @@ from pathlib import Path
 
 import yaml
 
-from finharness.tools.declare import Capability
+from finharness.shared.declaration import Capability
 
 FILE_DIRS = ("references", "assets")
 
@@ -389,7 +389,7 @@ def _researched_capabilities() -> set[Capability]:
 
     以函数而非模块常量取回，避免 ``capabilities`` 与本模块在导入期相互引用。
     """
-    from finharness.tools.capabilities import RESEARCH_CAPABILITIES
+    from finharness.shared.capabilities import RESEARCH_CAPABILITIES
 
     return RESEARCH_CAPABILITIES
 

@@ -5,8 +5,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from finharness.data.raw import RawData
+from finharness.shared.declaration import Capability, Tier, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 
 
 def _default_since() -> str:

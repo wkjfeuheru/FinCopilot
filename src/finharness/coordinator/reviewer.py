@@ -34,9 +34,9 @@ from finharness.config.settings import Settings
 from finharness.data.access import DataAccess
 from finharness.data.citation import CitationRegistry, ScopedCitationRegistry
 
-RISK_FOCUS = "risk"
-# 通用聚焦：一个隔离的 worker，消费交给它的材料，而不是自行获取。
-GENERAL_FOCUS = "general"
+# 聚焦名与派发上限是 tools.spawn_agent 与协调器之间的**协议**，因此定义在
+# shared（tools 也要读它），这里只消费。
+from finharness.shared.agents import GENERAL_FOCUS, MAX_SPAWN_TASKS, RISK_FOCUS
 
 # 读取研报，重新获取并交叉核对其中若干数字，然后写出复核意见。三轮曾经过紧：
 # 一份有几个数字需要核验的研报会在写出任何意见之前就耗尽轮次（表现为
@@ -45,9 +45,6 @@ GENERAL_FOCUS = "general"
 REVIEW_MAX_TURNS = 6
 # worker 读取其材料并写出结论；它不获取数据，因此需要的轮次远少于复核者。
 WORKER_MAX_TURNS = 4
-# 一次 spawn 调用最多可携带多少任务。每个任务都会变成一个并发的子代理并消耗
-# 自己的 token，因此不设上限的列表会让单次调用耗尽整个会话预算。
-MAX_SPAWN_TASKS = 8
 
 
 @dataclass(frozen=True, slots=True)

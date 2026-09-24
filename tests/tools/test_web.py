@@ -14,8 +14,8 @@ from finharness.config.settings import ContextSettings, Settings
 from finharness.data.access import DataAccess
 from finharness.data.adapters.tavily_adapter import TavilyAdapter
 from finharness.data.cache import LocalCache
+from finharness.shared.declaration import Tier
 from finharness.tools.base import PermissionLevel, ToolGroup
-from finharness.tools.declare import Tier
 from finharness.tools.generic.web import WebSearchTool
 from finharness.tools.registry import review_tool_names
 

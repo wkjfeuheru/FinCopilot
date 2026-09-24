@@ -22,6 +22,7 @@ from finharness.permissions.gate import PermissionGate
 from finharness.provider.base import Provider
 from finharness.tools.registry import ToolRegistry
 from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
+from tests.conftest import settings_with_cache
 
 
 class DispatchProvider(Provider):
@@ -66,9 +67,9 @@ class DispatchProvider(Provider):
 
 
 def make_settings(tmp_path) -> Settings:
-    return Settings(
+    return settings_with_cache(
+        tmp_path,
         permission=PermissionSettings(default_mode="auto"),
-        data={"cache_dir": tmp_path / "cache"},
         paths={"output_dir": tmp_path / "output"},
     )
 

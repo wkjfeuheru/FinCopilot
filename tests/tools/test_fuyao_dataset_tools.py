@@ -12,8 +12,6 @@ import json
 import re
 
 import httpx
-import pandas as pd
-import pytest
 
 from finharness.config.settings import DataSettings, Settings
 from finharness.data.access import DataAccess
@@ -513,7 +511,7 @@ def test_an_enum_default_is_disclosed(tmp_path):
 
 def test_the_fund_tool_description_advertises_etf_market_data():
     """A 股行情工具只覆盖个股，因此 ETF 价格的唯一入口必须在基金工具的描述里。"""
-    from finharness.tools.declare import declared
+    from finharness.shared.declaration import declared
 
     description = QueryFundDataTool.description
 

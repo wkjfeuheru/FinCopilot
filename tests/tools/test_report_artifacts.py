@@ -115,8 +115,8 @@ def test_write_report_must_be_confirmed_because_it_has_no_whitelisted_path(tmp_p
 
 def test_make_chart_is_read_only_so_it_skips_confirmation(tmp_path):
     """按文档 3.4.1，图表属于产物；无需审批。"""
-    from finharness.tools.fin.chart import MakeChartTool
     from finharness.tools.base import PermissionLevel
+    from finharness.tools.fin.chart import MakeChartTool
 
     assert MakeChartTool.permission is PermissionLevel.READ
 

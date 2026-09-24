@@ -8,7 +8,6 @@
 import pytest
 
 from finharness.context.memory.store import MemoryStore
-from finharness.context.session import Plan, PlanStep
 
 
 def test_checkpoint_roundtrips_all_fields(tmp_path):

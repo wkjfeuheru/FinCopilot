@@ -127,7 +127,7 @@ AgentLoop 内部事件(文本增量/工具状态/计划/结论/确认请求)统�
 | ADR-8 | 记忆分层（§3.6.4）：L1 工作/L2 短期在内存（`list[Msg]`/事件环）；对话内持久化为 SQLite `memory.db`；**跨对话长期记忆 = `ltm_episodes` 情节表 + `ltm_facts` 语义表（按 `user_id` 作用域；情节 task_result 每轮结构化写入 + decision/excerpt 懒蒸馏，语义与偏好同一次调用产出）**；`MEMORY.md` 不做（改只读端点）；语义检索走向量召回（远程 embedding + Qdrant，三级降级到本地 BLOB 余弦/键匹配） | JSONL 事件库 / 纯 markdown 单文件 / 语义也只做键匹配 | L1/L2 进程即会话无需回放；情节需幂等去重（内容哈希）、语义需 UPSERT 覆盖（同键只能有一个版本的真相）；语义条目无稳定键，键匹配召回太弱，故护栏由"跨会话语义召回"真实需求触发（2026-09 已触发） |
 | ADR-9 | 流式输出走 **FastAPI SSE 接口层**，与 CLI 双入口并存 | 仅 CLI / 用 WebSocket 替代 | REPL 保证本地演示与脚本化验收；HTTP 让任意前端接入；SSE 语义贴合"流式文本+工具状态"，实现与调试成本最低（选 WebSocket 则前端与代理复杂度更高，收益不足） |
 | ADR-10 | 可观测性为**尽力而为的三层**（JSON 日志 / Prometheus 指标 / LangSmith 追踪），后端缺失即降级 no-op，追踪不引入 LangChain | 可观测性失败即中断 / 引入 LangChain 自动埋点 | 观测绝不该破坏一次回合（同 ADR-5 的审计原则）；prometheus-client/langsmith 走可选 extra，核心安装保持精简；用 RunTree 低层 API 表达 Span 树，避免为一个后端引入整套框架 |
-| ADR-11 | **加载不由模型发起**：`load_tool`/`load_skill`/`list_skills` 三个工具删除。激活改为引擎发起（检索即激活 + 直接调用即激活），方法论由路由层按能力注入；工具元数据与参数改由 `@tool`/`@param` 声明（`tools/declare.py`） | 保留两段式加载（ADR-3）/ 预注入全部 schema | ① 注册层本就知道全部工具，"该不该给"是引擎能判断的事，做成工具只换来一次纯往返；② 模型不该管理自己的提示词里放什么，而"要不要加载方法"在模型发出调用前就已可从文本判定；③ 删除两个加载入口后子代理沙箱更严——ADR-3 时代"受限目录无 META 组"主要是为了堵住 `load_tool` 这条自我扩权的路，现在这条路不存在了；④ 声明集中后，能力表/懒加载清单/settings 名单三份手工映射随之退役，漏改只在运行期暴露的问题一并消失 |
+| ADR-11 | **加载不由模型发起**：`load_tool`/`load_skill`/`list_skills` 三个工具删除。激活改为引擎发起（检索即激活 + 直接调用即激活），方法论由路由层按能力注入；工具元数据与参数改由 `@tool`/`@param` 声明（`shared/declaration.py`） | 保留两段式加载（ADR-3）/ 预注入全部 schema | ① 注册层本就知道全部工具，"该不该给"是引擎能判断的事，做成工具只换来一次纯往返；② 模型不该管理自己的提示词里放什么，而"要不要加载方法"在模型发出调用前就已可从文本判定；③ 删除两个加载入口后子代理沙箱更严——ADR-3 时代"受限目录无 META 组"主要是为了堵住 `load_tool` 这条自我扩权的路，现在这条路不存在了；④ 声明集中后，能力表/懒加载清单/settings 名单三份手工映射随之退役，漏改只在运行期暴露的问题一并消失 |
 
 ### 1.5 模块依赖规则
 
@@ -135,6 +135,43 @@ AgentLoop 内部事件(文本增量/工具状态/计划/结论/确认请求)统�
 - 禁止反向依赖：`data/` 不得 import `tools/` 或 `engine/`；`tools/` 不得 import `cli/`。
 - 每个包内 `__init__.py` 只导出公共类型，外部一律经包门面访问。
 - 显式依赖注入：`Settings / LocalCache / CitationRegistry / AuditWriter` 在 `cli.main()` 组装后传入各层构造器，模块内部不自行实例化（便于测试替身）。
+
+#### 1.5.1 实际分层与 `shared/`（2026-09 修订）
+
+上面 §1.1 的 L1–L6 是**概念分层**（谁依赖谁的业务语义）。落到代码，存在两条无法用
+L1–L6 表达的**同层与跨层复用**，它们曾以逆向 import 的形式出现：
+
+- `engine/loop.py` 需要工具声明层、按能力的意图推断、结果预算解析、围栏中和——这些
+  同时也被 `tools/` 内部依赖，放在 `tools/` 就得到 `engine ↔ tools` 的环；
+- `tools/fin/writer.py`、`tools/meta/summarize.py` 需要研报复核编排、分片归并、数字
+  缺漏检测——这些纯函数住在 `coordinator/`，于是 `tools → coordinator` 反向依赖。
+
+因此引入 **`shared/` 包**承载这些"被 tools 与 engine 共同依赖的纯函数与声明"，
+它位于二者**之下**（与 `utils/` 同级），消除上述逆向依赖：
+
+```
+        engine ──▶ shared ◀── tools          （shared 被二者共同依赖，二者互不依赖）
+        coordinator ──▶ shared
+        tools ──▶ data / shared / utils
+```
+
+`shared/` 内容：`declaration.py`（`@tool`/`@param`/`ToolSpec`）、`capabilities.py`
+（能力意图推断）、`budget.py`（结果预算解析）、`fencing.py`（第三方文本围栏）、
+`agents.py`（聚焦名与派发上限的协议取值）、`numbers.py`/`review.py`/`summarize.py`
+（原属 `coordinator/` 的纯分析件）。`coordinator/` 收窄为多代理**编排**
+（`reviewer.py`：派生隔离子代理），成为 tools 与 engine 之上的消费者。
+
+恒定规则（由仓库根 `.importlinter` 的契约在 CI 强制）：
+
+- `shared/` 与 `utils/` 是最底层：只依赖 `config` / `types`，不得依赖任何上层；
+- `tools/` 不得依赖 `coordinator` / `engine` / `server`；
+- `engine/` 不得依赖 `server`；
+- `data/` 不得依赖 `context` / `coordinator` / `engine` / `server` / `tools`；
+- `provider/` 不得依赖 `coordinator` / `engine` / `server` / `tools`；
+- `config/` 不得依赖 `engine` / `server` / `tools`。
+
+`CHARS_PER_TOKEN` 等纯文本常量随之下沉到 `utils/text.py`，使 `context` 不再是它的
+唯一来源。新增跨层共享的纯函数一律放 `shared/`，**不要**为了复用而向上反向 import。
 
 ---
 
@@ -239,11 +276,12 @@ class OutputSink(Protocol):
 | **provider/ —— 模型提供层** | [03.2-provider.md](docs/modules/03.2-provider.md) | 厂商差异归一化：anthropic/openai 兼容端点映射为 §2 StreamChunk / Msg；SSE 事件解析、错误分级、重试与超时 |
 | **engine/ —— Agent Loop 核心** | [03.3-engine.md](docs/modules/03.3-engine.md) | 模型-工具闭环（AgentLoop.run / _execute_one 治理执行链）；并行 gather、重试、成本记账与四条不变量 |
 | **tools/ —— 金融工具集** | [03.4-tools.md](docs/modules/03.4-tools.md) | 32 工具权威表（resident=24 / lazy=8）；BaseTool/RawData 契约；ToolRegistry 两段式激活；重点工具实现设计 |
+| **shared/ —— 跨层共享纯函数与声明** | [03.4-tools.md](docs/modules/03.4-tools.md) | 被 tools 与 engine 共同依赖的纯函数与声明（§1.5.1）：`declaration`/`capabilities`/`budget`/`fencing`/`agents` + 原 coordinator 的 `numbers`/`review`/`summarize` |
 | **data/ —— 数据适配、缓存与溯源** | [03.5-data.md](docs/modules/03.5-data.md) | DataAccess 门面、DataAdapter 防腐层与降级、LocalCache（SQLite 索引+parquet）、CitationRegistry。附存储设计 §4.1/§4.2 |
 | **context/ —— 上下文工程** | [03.6-context.md](docs/modules/03.6-context.md) | trim 裁剪器、ResearchContext、Auto-Compaction、L1/L2/L3 三层记忆机制。附存储设计 §4.4（memory.db + MEMORY.md 只读视图） |
 | **permissions/ + hooks/ —— 治理层** | [03.7-governance.md](docs/modules/03.7-governance.md) | PermissionGate 判定、deny/sandbox 规则、Hook 链与 AuditHook 审计。附存储设计 §4.3（audit.jsonl schema） |
 | **skills/ —— 投研方法论库** | [03.8-skills.md](docs/modules/03.8-skills.md) | 与 anthropics/skills 兼容的目录/格式（frontmatter schema）；各 Skill 内容要点；加载与去重 |
-| **研报生成管道（原 report/，2026-09 按消费者归属解散）** | [03.9-report.md](docs/modules/03.9-report.md) | ReportPipeline 渲染（校验/模板/引用与图表注入/无引用数字校验）+ docx 导出，位于 tools/fin/；终审编排位于 coordinator/review.py |
+| **研报生成管道（原 report/，2026-09 按消费者归属解散）** | [03.9-report.md](docs/modules/03.9-report.md) | ReportPipeline 渲染（校验/模板/引用与图表注入/无引用数字校验）+ docx 导出，位于 tools/fin/；终审编排位于 shared/review.py |
 | **coordinator/ —— 多智能体（阶段二，演示级）** | [03.10-coordinator.md](docs/modules/03.10-coordinator.md) | 主 Agent 派生子任务上下文、回收结论摘要与 cid；风险终审 Agent 演示点 |
 | **cli.py —— 进程入口与 REPL（CLI 形态）** | [03.11-cli.md](docs/modules/03.11-cli.md) | 依赖组装（composition root）与命令分派；REPL 命令表（含 /memory、/quit 三层记忆语义）；研报非交互模式 |
 | **server/ —— HTTP/SSE 接口层（FastAPI，v1.1）** | [03.12-server.md](docs/modules/03.12-server.md) | SSE 事件协议、SessionRegistry、ConfirmBus、路由清单、简易 Web 聊天页与本模块验收点 |
@@ -514,48 +552,60 @@ finharness/
 │   ├── types.py                    # §2 共享契约
 │   ├── cli.py                      # §3.11
 │   ├── config/
-│   │   └── settings.py             # pydantic-settings + validate()
+│   │   ├── settings.py             # Settings 本体 + 跨节/启动校验（门面，重导出下二者）
+│   │   ├── settings_models.py      # 各配置节的嵌套模型与字段级校验
+│   │   └── settings_loading.py     # settings.json 读取、深合并、FINH_ 白名单、路径解析
 │   ├── engine/
-│   │   ├── loop.py                 # AgentLoop / ContextAssembler
-│   │   ├── stream.py               # SSE→StreamChunk、tool_use 增量归并
+│   │   ├── loop.py                 # AgentLoop / ContextAssembler（含 PlanProgressMixin）
+│   │   ├── plan_progress.py        # 计划偏离/能力错配/停滞的软信号（loop 的 mixin）
 │   │   ├── retry.py / cost.py
-│   │   └── governance.py           # _execute_one 治理执行链（依赖注入 gate/hooks）
+│   │   └── prompt.py
+│   ├── shared/                     # 被 tools 与 engine 共同依赖的纯函数与声明（§1.5.1）
+│   │   ├── declaration.py          # @tool/@param/ToolSpec/DECLARED_TOOLS
+│   │   ├── capabilities.py         # 能力意图推断
+│   │   ├── budget.py               # 工具结果 token 预算单点解析
+│   │   ├── fencing.py              # 第三方文本围栏与中和
+│   │   ├── agents.py               # 聚焦名与派发上限（tools↔coordinator 协议）
+│   │   └── numbers.py / review.py / summarize.py   # 原 coordinator 的纯分析件
 │   ├── provider/
 │   │   ├── base.py                 # Provider ABC / Msg
 │   │   ├── anthropic_compat.py / openai_compat.py
 │   │   ├── registry.py             # build_provider
-│   │   └── errors.py
+│   │   └── errors.py / policy.py   # 错误分类 / 用户 provider 地址安全策略
 │   ├── tools/
 │   │   ├── base.py                 # BaseTool/RawData/ToolResult
 │   │   ├── registry.py             # ToolRegistry / search 索引 / activate
 │   │   ├── fin/                    # quote kline financials indicators valuation
 │   │   │                          # announcements peers news calc_metrics
-│   │   │                          # calc_valuation backtest pdf chart report
-│   │   ├── generic/                # read_file write_file run_python web_search
+│   │   │                          # calc_valuation backtest chart report_pipeline
+│   │   ├── generic/                # read_file write_file read_pdf web_search
 │   │   └── meta/                   # research_plan search_tools ask_user
 │   │                              # spawn_agent summarize_document preference
 │   ├── data/
 │   │   ├── access.py               # DataAccess 门面（降级编排）
 │   │   ├── adapters/ base.py akshare_adapter.py fuyao_adapter.py
 │   │   │            mcp_client.py tavily_adapter.py eastmoney_report_adapter.py
+│   │   │            tushare_adapter.py pacing.py retry.py
 │   │   ├── mapping.py              # 列名映射单一事实
-│   │   ├── cache.py / citation.py
+│   │   ├── cache.py / citation.py / lookback.py
 │   │   └── errors.py
 │   ├── context/
-│   │   ├── trim.py / session.py / compaction.py
+│   │   ├── trim.py / session.py / compaction.py / tokens.py
 │   │   └── memory/                   # 记忆三层（§3.6.4）
-│   │       └── working_memory.py / short_term.py / long_term.py
+│   │       └── working.py / short_term.py / store.py / records.py / vector.py / distill.py
 │   ├── permissions/
 │   │   ├── modes.py / gate.py / rules.py   # 含 SandboxScanner
 │   ├── hooks/
 │   │   ├── base.py / audit.py
-│   ├── skills/                     # 8 × SKILL.md（见 §3.8.1）
+│   ├── skills/                     # 4 × SKILL.md（见 §3.8.1）
 │   ├── utils/                      # 跨层通用件（准入门槛：无领域语义、无层依赖）
 │   │   ├── compat.py                # pandas/akshare 运行时垫片（__init__ 导入即应用）
+│   │   ├── clock.py / sqlite.py / jsonx.py / text.py
 │   │   └── markdown.py              # CommonMark 图片链接转义（report 渲染与 chart 共用）
-│   ├── coordinator/                # 多智能体（§3.10）：reviewer.py / review.py（终审编排）
+│   ├── coordinator/                # 多智能体（§3.10）：reviewer.py（子代理编排）
 │   ├── server/                     # v1.1 HTTP/SSE 接口层（§3.12）
 │   │   ├── api.py / sse.py / sessions.py / confirm.py
+│   │   ├── compute_api.py          # /v1/internal/compute/*（签名 worker 接口）
 │   │   └── static/                 # chat.html / chat.js / style.css
 │   └── session_deps.py             # 依赖组装公共类型（composition root 数据类）
 ├── tests/                          # 对齐上述分层（§8，含 tests/server/）

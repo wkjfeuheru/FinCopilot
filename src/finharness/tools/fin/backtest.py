@@ -23,9 +23,9 @@ import pandas as pd
 
 from finharness.data.frames import persist_frame
 from finharness.data.raw import RawData
-from finharness.factor.engine import FactorEngine, FactorError
+from finharness.factor.engine import FactorEngine
+from finharness.shared.declaration import Capability, Tier, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
-from finharness.tools.declare import Capability, Tier, ToolGroup, param, tool
 
 TRADING_DAYS = 252
 MAX_POOL_SIZE = 300
@@ -355,7 +355,7 @@ class RunBacktestTool(BaseTool):
         # 调仓窗口内的前向收益：t 时刻的信号预测 t+1..t+h。
         forward = closes.shift(-rebalance) / closes - 1
 
-        lines = [f"# 横截面因子回测", "", f"因子表达式：`{factor_expr}`", ""]
+        lines = ["# 横截面因子回测", "", f"因子表达式：`{factor_expr}`", ""]
         lines.append(f"股票池：{len(closes.columns)} 只 · 区间 {closes.index.min().date()} ~ {closes.index.max().date()}")
         lines.append(f"分组：{groups} 组 · 调仓周期：{rebalance} 日 · 成本 {cost_bps:.0f}bp + 滑点 {slippage_bps:.0f}bp")
         # 截断必须写在结果里：否则 500 只的指数被静默取前 300 只，用户会把

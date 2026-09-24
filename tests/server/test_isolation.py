@@ -22,7 +22,12 @@ class EchoProvider:
         self.seen_user_turns: list[int] = []
 
     async def stream(self, *, system, messages, tools, usage):
-        from finharness.types import STATE_VIEW_META, ModelUsage, StreamChunk, StreamEvent
+        from finharness.types import (
+            STATE_VIEW_META,
+            ModelUsage,
+            StreamChunk,
+            StreamEvent,
+        )
 
         # 只数真实提问：会话研究状态视图以 user 角色随请求追加，但不是用户轮次。
         turns = sum(
@@ -148,7 +153,6 @@ def test_notes_are_per_user(tmp_path):
     client_a, headers_a, client_b, headers_b = make_two_users(tmp_path)
     store = client_a.app.state.memory_store
     user_a = client_a.finharness_user["id"]
-    user_b = client_b.finharness_user["id"]
     store.set_note("report_style", "A 的偏好", user_id=user_a)
 
     a_notes = client_a.get("/v1/memory", headers=headers_a).json()["notes"]

@@ -20,6 +20,7 @@ from finharness.permissions.gate import PermissionGate
 from finharness.provider.base import Provider
 from finharness.tools.registry import ToolRegistry
 from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
+from tests.conftest import settings_with_cache
 
 
 class RoleBranchingProvider(Provider):
@@ -57,11 +58,11 @@ def text_round(*parts: str) -> list[StreamChunk]:
 
 
 def make_settings(tmp_path) -> Settings:
-    return Settings(
+    return settings_with_cache(
+        tmp_path,
         # write_report 是没有白名单路径的 WRITE tool，因此需要
         # 确认通道；auto 模式是非交互场景下的等价物。
         permission=PermissionSettings(default_mode="auto"),
-        data={"cache_dir": tmp_path / "cache"},
         paths={"output_dir": tmp_path / "output"},
     )
 

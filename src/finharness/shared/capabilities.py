@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-from finharness.tools.declare import (
+from finharness.shared.declaration import (
     DECLARED_TOOLS,
     Capability,
     DeclarationError,

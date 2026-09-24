@@ -1,5 +1,6 @@
 import json
 
+import httpx
 import pytest
 
 from finharness.config.settings import SettingsError
@@ -7,7 +8,6 @@ from finharness.provider.anthropic_compat import AnthropicCompatProvider
 from finharness.provider.fake import FakeProvider
 from finharness.provider.openai_compat import OpenAICompatProvider
 from finharness.provider.registry import build_provider
-import httpx
 
 
 @pytest.mark.parametrize(

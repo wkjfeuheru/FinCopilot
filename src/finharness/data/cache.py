@@ -17,13 +17,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from finharness.utils.jsonx import stable_dumps
+from finharness.utils.sqlite import SqliteStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,19 +51,19 @@ class CacheEntry:
 
 def make_cache_key(*, endpoint: str, params: dict[str, Any], data_date: str) -> str:
     """``sha256(endpoint|normalized-params|data_date)[:16]``（docs 3.5.3）。"""
-    normalized = json.dumps(params, ensure_ascii=False, sort_keys=True, default=str)
-    digest = hashlib.sha256(f"{endpoint}|{normalized}|{data_date}".encode("utf-8")).hexdigest()
+    normalized = stable_dumps(params)
+    digest = hashlib.sha256(f"{endpoint}|{normalized}|{data_date}".encode()).hexdigest()
     return digest[:16]
 
 
 def make_lookup_key(*, kind: str, params: dict[str, Any]) -> str:
     """与日期无关的请求形状摘要，用于检索。"""
-    normalized = json.dumps(params, ensure_ascii=False, sort_keys=True, default=str)
-    digest = hashlib.sha256(f"{kind}|{normalized}".encode("utf-8")).hexdigest()
+    normalized = stable_dumps(params)
+    digest = hashlib.sha256(f"{kind}|{normalized}".encode()).hexdigest()
     return digest[:16]
 
 
-class LocalCache:
+class LocalCache(SqliteStore):
     """进程内缓存门面。所有语句均使用绑定参数。"""
 
     def __init__(self, cache_dir: str | Path) -> None:
@@ -69,7 +71,7 @@ class LocalCache:
         self.root.mkdir(parents=True, exist_ok=True)
         self.parquet_root = self.root / "parquet"
         self.parquet_root.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.root / "index.db"
+        super().__init__(self.root / "index.db", check_same_thread=False)
         self._hits = 0
         self._misses = 0
         self._write_lock = asyncio.Lock()
@@ -83,11 +85,6 @@ class LocalCache:
             )
             connection.execute("CREATE INDEX IF NOT EXISTS idx_cache_endpoint ON cache_index(endpoint)")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_cache_data_date ON cache_index(data_date)")
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        return connection
 
     # -- 读取 -----------------------------------------------------------------
     def get(self, lookup_key: str) -> tuple[pd.DataFrame, CacheEntry] | None:
@@ -172,7 +169,7 @@ class LocalCache:
         file_path = month_dir / f"{cache_key}.parquet"
         df.to_parquet(file_path, engine="pyarrow", index=False)
         created = datetime.now().astimezone().isoformat(timespec="seconds")
-        params_json = json.dumps(params, ensure_ascii=False, sort_keys=True, default=str)
+        params_json = stable_dumps(params)
         cols_json = json.dumps([str(c) for c in df.columns], ensure_ascii=False)
         with self._connect() as connection:
             connection.execute(
@@ -197,30 +194,6 @@ class LocalCache:
             misses=self._misses,
             hit_ratio=(self._hits / total) if total else 0.0,
         )
-
-    def gc(self, *, min_entries: int = 1000) -> int:
-        """清理过期的索引行及其载荷；缓存较小时跳过。"""
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT cache_key, file_path, ttl_days, created_ts FROM cache_index"
-            ).fetchall()
-            if len(rows) < min_entries:
-                return 0
-            removed = 0
-            for row in rows:
-                entry = CacheEntry(
-                    cache_key=row["cache_key"], lookup_key="", endpoint="", params_json="",
-                    data_date="", rows=0, file_path=row["file_path"],
-                    ttl_days=int(row["ttl_days"]), created_ts=row["created_ts"],
-                )
-                if not self._is_expired(entry):
-                    continue
-                connection.execute(
-                    "DELETE FROM cache_index WHERE cache_key = ?", (row["cache_key"],)
-                )
-                Path(row["file_path"]).unlink(missing_ok=True)
-                removed += 1
-        return removed
 
     @staticmethod
     def today() -> str:

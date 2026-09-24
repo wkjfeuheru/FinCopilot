@@ -24,7 +24,7 @@ from finharness.context.memory.store import (
 )
 from finharness.observability import NullObserver
 from finharness.provider.base import Provider
-from finharness.types import Msg, ModelUsage, StreamEvent
+from finharness.types import ModelUsage, Msg, StreamEvent
 
 DISTILL_PROMPT = (
     "你将从一段已完成的投资研究对话中提取值得长期记住的记忆。\n"

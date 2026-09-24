@@ -17,8 +17,6 @@ from finharness.observability.trace_store import TraceStore
 from finharness.provider.fake import FakeProvider
 from finharness.server.api import create_app
 
-from tests.server.conftest import register_and_login
-
 
 def _settings(
     tmp_path,
