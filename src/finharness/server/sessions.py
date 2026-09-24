@@ -13,6 +13,21 @@ import uuid
 from dataclasses import dataclass, field
 
 from finharness.types import StopSignal
+from finharness.compute.executor import ComputeExecutor, ComputeResult, ComputeTask
+from collections.abc import Mapping
+
+
+@dataclass(frozen=True)
+class SessionCompute:
+    """服务端绑定会话身份，业务任务只提供类型与输入。"""
+    executor: ComputeExecutor
+    user_id: str
+    conversation_id: str
+
+    async def execute(self, *, kind: str, files: Mapping[str, bytes], timeout_s: float = 120) -> ComputeResult:
+        return await self.executor.execute(ComputeTask(
+            self.user_id, self.conversation_id, kind, files, timeout_s=timeout_s
+        ))
 
 
 class SessionBusyError(RuntimeError):
@@ -34,6 +49,7 @@ class ServerSession:
     # 当前在飞请求的停止信号（docs 03.3）。挂在会话上而非 loop 上，因为
     # 停止端点在 loop 之外运行，需要一条够得到它的路径；请求结束时清空。
     stop_signal: StopSignal | None = field(default=None)
+    compute: SessionCompute | None = None
 
 
 def new_conversation_id() -> str:
@@ -41,9 +57,11 @@ def new_conversation_id() -> str:
 
 
 class SessionRegistry:
-    def __init__(self, loop_factory, ttl_s: int = 1800, busy_timeout_s: int | None = None):
+    def __init__(self, loop_factory, ttl_s: int = 1800, busy_timeout_s: int | None = None,
+                 compute_executor: ComputeExecutor | None = None):
         self.loop_factory = loop_factory
         self.ttl_s = ttl_s
+        self.compute_executor = compute_executor
         # 一个 busy 会话正常也会在若干秒内结束；持续 busy 远超这个时长只可能是
         # 请求被遗弃（流被丢弃、异常逃逸导致 ``release`` 没跑到）。此类条目若
         # 永不回收，就会永久占着一个 AgentLoop 与它的整条记忆。
@@ -103,6 +121,8 @@ class SessionRegistry:
             loop=self.loop_factory(session_id, resolved_conversation, user_id),
             created_at=now,
             last_active=now,
+            compute=SessionCompute(self.compute_executor, user_id, resolved_conversation)
+            if self.compute_executor is not None else None,
         )
         self.sessions[session_id] = session
         return session

@@ -50,7 +50,11 @@ def test_declaring_single_tenant_is_accepted(tmp_path):
 
 def test_single_tenant_injection_is_rejected_when_listening_remotely(tmp_path):
     """多租户（远程监听）下共用一份数据面是隔离失效，不是配置选项。"""
-    settings = make_settings(tmp_path, server={"allow_remote": True, "host": "0.0.0.0"})
+    settings = make_settings(
+        tmp_path,
+        server={"allow_remote": True, "host": "0.0.0.0"},
+        compute={"remote_worker_url": "http://worker.internal:8080"},
+    )
 
     with pytest.raises(ValueError, match="allow_remote"):
         create_app(

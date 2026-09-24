@@ -102,6 +102,9 @@ class BaseTool(ABC):
         self.ctx = ctx
         # 元工具会检视并激活目录（search_tools）。
         self.registry = registry
+        # 声明了 ``needs_compute`` 的工具由循环注入会话绑定的隔离计算通道
+        # （docs 03.15）；未注入时为 None，工具回退进程内执行。
+        self.compute: Any | None = None
 
     @property
     def spec(self) -> ToolSpec:

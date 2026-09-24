@@ -17,6 +17,9 @@ services:
     volumes:
       - app-data:/data
     environment:
+      FINH_COMPUTE_REMOTE_WORKER_URL: http://worker:8080
+      # 由 .env 提供的内部 HMAC；必须与 worker 相同，且不可复用业务密钥。
+      FINH_COMPUTE_HMAC_SECRET: ${FINH_COMPUTE_HMAC_SECRET}
       # Provider 密钥经 .env 注入；未配置的项为空字符串，等同未设置
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
@@ -34,6 +37,16 @@ services:
     # 只绑定本机回环：公网流量一律走 Caddy，应用不直接暴露
     expose:
       - "8000"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - edge
+      - compute
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/v1/ready', timeout=5)\""]
       interval: 30s
@@ -50,6 +63,28 @@ services:
     volumes:
       - qdrant-data:/qdrant/storage
 
+  worker:
+    image: finharness:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # worker 无 Volume、无 Provider/搜索密钥，也没有外网所在的 edge 网络。
+    user: "10001:10001"
+    entrypoint: ["python", "-m", "finharness.compute.worker"]
+    environment:
+      FINH_COMPUTE_APP_URL: http://app:8000
+      FINH_COMPUTE_HMAC_SECRET: ${FINH_COMPUTE_HMAC_SECRET}
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - compute
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
@@ -62,9 +97,16 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    networks:
+      - edge
 
 volumes:
   app-data:
   caddy-data:
   caddy-config:
   qdrant-data:
+
+networks:
+  edge:
+  compute:
+    internal: true

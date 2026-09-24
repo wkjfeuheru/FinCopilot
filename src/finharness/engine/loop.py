@@ -110,6 +110,7 @@ class AgentLoop:
         coordinator: Any | None = None,
         observer: Any | None = None,
         semantic_index: Any | None = None,
+        compute: Any | None = None,
         call_type: str = "main",
         route_skills: bool = True,
     ) -> None:
@@ -150,6 +151,9 @@ class AgentLoop:
         self.coordinator = (
             coordinator if coordinator is not None else self._build_coordinator(counter=counter)
         )
+        # 隔离计算通道（docs 03.15）：由服务端注入会话绑定的 SessionCompute，
+        # 未注入（CLI/eval/本地）时为 None，声明了 needs_compute 的工具回退进程内。
+        self.compute = compute
         # L1 memory 拥有对话记录及其记账；循环负责编排。
         # 可以注入一个 counter，以便调用方共享同一份词表缓存。
         self.memory = WorkingMemory(ctx=self.ctx, settings=settings, counter=counter)
@@ -396,7 +400,7 @@ class AgentLoop:
         for message in messages:
             self.memory.append(message, track=False)
         # Citation 必须保留其 id：已存储的摘要会引用它们。
-        self.cite.restore(self.store.load_citations(self.conversation_id))
+        self.cite.restore(self.store.load_citations(self.conversation_id, user_id=self.user_id))
         self.ctx.prior_conclusions = self.store.load_conclusions(self.conversation_id)
         self.ctx.notes = self.store.get_notes(user_id=self.user_id)
         # 跨对话长期记忆（docs 03.6.4 LTM）：最近情节被动注入（首轮一次），
@@ -500,7 +504,7 @@ class AgentLoop:
             return
         self.store.append_messages(self.conversation_id, pending)
         self.memory.pending = []
-        self.store.save_citations(self.conversation_id, self.cite.all())
+        self.store.save_citations(self.conversation_id, self.cite.all(), user_id=self.user_id)
         for symbol in self.ctx.symbols:
             self.store.upsert_symbol(self.conversation_id, symbol)
         # 跨对话情节记忆（docs 03.6.4 LTM）：本轮结论同时以 task_result 情节
@@ -1851,6 +1855,11 @@ class AgentLoop:
         # 构建协调器，因此由循环把会话的协调器交给它。
         if getattr(tool, "needs_coordinator", False) and self.coordinator is not None:
             tool.coordinator = self.coordinator
+        # 隔离计算通道同样是"工具自己够不到、由循环交给它"（docs 03.15）：
+        # 会话身份（user/conversation）只在此处可知，工具不该自己拼。
+        # 未配置远程 worker 时为 None，工具按声明回退进程内执行。
+        if getattr(tool, "needs_compute", False) and self.compute is not None:
+            tool.compute = self.compute
         # 长时间工具上报中间进展：call_id 与工具名由循环补齐，工具只描述进展内容，
         # 无需知道自己在对话里的调用标识。这不是装饰——服务端心跳是 SSE 注释帧，
         # 客户端看门狗只在真实事件到达时才重置，静默数分钟的工具会被判为卡死而掐断。

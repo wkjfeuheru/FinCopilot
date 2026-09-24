@@ -413,6 +413,17 @@ class ServerSettings(FrozenModel):
     allow_remote: bool = False
 
 
+class ComputeSettings(FrozenModel):
+    """主服务向隔离计算 worker 派发任务的契约。"""
+
+    # 空值只允许本机开发、CLI 与 eval；远程多租户服务必须配置该地址。
+    remote_worker_url: str | None = None
+    hmac_secret_env: str = "FINH_COMPUTE_HMAC_SECRET"
+    lease_seconds: PositiveInt = 60
+    max_waiting_per_user: PositiveInt = 2
+    max_attempts: PositiveInt = 2
+
+
 class PathSettings(FrozenModel):
     """产物、缓存与**状态**三类路径。
 
@@ -434,6 +445,9 @@ class PathSettings(FrozenModel):
     secret_key: Path = Path("state/secret.key")
     # 用量账本（管理员页数据源）：每轮一行的 token/轮次记录。
     usage_db: Path = Path("state/usage.db")
+    # 仅主服务可读写：任务队列与待处理输入包，绝不挂给 worker 或 agent。
+    compute_jobs_db: Path = Path("state/compute_jobs.db")
+    compute_packages_dir: Path = Path("state/compute_packages")
     # Skills 随包分发（docs 03.8）：以本文件为基准解析，
     # 这样无论工作目录如何都能找到目录清单。
     skills_dir: Path = Path(__file__).resolve().parent.parent / "skills"
@@ -556,6 +570,7 @@ class Settings(BaseSettings):
     audit: AuditSettings = Field(default_factory=AuditSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     server: ServerSettings = Field(default_factory=ServerSettings)
+    compute: ComputeSettings = Field(default_factory=ComputeSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     quota: QuotaSettings = Field(default_factory=QuotaSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
@@ -660,6 +675,12 @@ class Settings(BaseSettings):
                 raise SettingsError(
                     "server.allow_remote=true 时 auth.secure_cookie 必须为 true"
                 )
+            worker_url = self.compute.remote_worker_url
+            parsed_worker = urlparse(worker_url or "")
+            if parsed_worker.scheme not in {"http", "https"} or not parsed_worker.netloc:
+                raise SettingsError(
+                    "server.allow_remote=true 时 compute.remote_worker_url 必须是远程 worker 地址"
+                )
         if require_api_key and provider.kind != "fake":
             env_key = provider.env_key
             if env_key is None or not os.getenv(env_key):
@@ -692,6 +713,8 @@ class Settings(BaseSettings):
             "paths.config_db": self.paths.config_db,
             "paths.secret_key": self.paths.secret_key,
             "paths.usage_db": self.paths.usage_db,
+            "paths.compute_jobs_db": self.paths.compute_jobs_db,
+            "paths.compute_packages_dir": self.paths.compute_packages_dir,
         }
         for state_name, state_path in state_files.items():
             for root_name, root in roots.items():
@@ -890,6 +913,8 @@ def _resolve_paths(payload: dict[str, Any], base: Path) -> None:
         ("paths", "config_db"),
         ("paths", "secret_key"),
         ("paths", "usage_db"),
+        ("paths", "compute_jobs_db"),
+        ("paths", "compute_packages_dir"),
         ("paths", "skills_dir"),
     ):
         target = payload
@@ -1028,6 +1053,11 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_SERVER_CONFIRM_TTL_S": (("server", "confirm_ttl_s"), int),
     "FINH_SERVER_STATIC_DIR": (("server", "static_dir"), Path),
     "FINH_SERVER_ALLOW_REMOTE": (("server", "allow_remote"), bool),
+    "FINH_COMPUTE_REMOTE_WORKER_URL": (("compute", "remote_worker_url"), str),
+    "FINH_COMPUTE_HMAC_SECRET_ENV": (("compute", "hmac_secret_env"), str),
+    "FINH_COMPUTE_LEASE_SECONDS": (("compute", "lease_seconds"), int),
+    "FINH_COMPUTE_MAX_WAITING_PER_USER": (("compute", "max_waiting_per_user"), int),
+    "FINH_COMPUTE_MAX_ATTEMPTS": (("compute", "max_attempts"), int),
     "FINH_AUTH_TOKEN_TTL_S": (("auth", "token_ttl_s"), int),
     "FINH_AUTH_MIN_PASSWORD_LEN": (("auth", "min_password_len"), int),
     "FINH_AUTH_SECURE_COOKIE": (("auth", "secure_cookie"), bool),
@@ -1051,6 +1081,8 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_PATHS_CONFIG_DB": (("paths", "config_db"), Path),
     "FINH_PATHS_SECRET_KEY": (("paths", "secret_key"), Path),
     "FINH_PATHS_USAGE_DB": (("paths", "usage_db"), Path),
+    "FINH_PATHS_COMPUTE_JOBS_DB": (("paths", "compute_jobs_db"), Path),
+    "FINH_PATHS_COMPUTE_PACKAGES_DIR": (("paths", "compute_packages_dir"), Path),
     "FINH_PATHS_SKILLS_DIR": (("paths", "skills_dir"), Path),
     "FINH_SEARCH_KIND": (("search", "kind"), Literal["tavily"]),
     "FINH_SEARCH_BASE_URL": (("search", "base_url"), str),

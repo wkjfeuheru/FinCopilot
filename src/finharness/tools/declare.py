@@ -134,6 +134,10 @@ class ToolSpec:
     review_eligible: bool = True
     needs_interactive: bool = False
     needs_coordinator: bool = False
+    # 该工具的重活可交给隔离计算 worker（docs 03.15）。注入的是会话绑定的
+    # ``SessionCompute``；未配置远程 worker（本地、CLI、Railway 单服务）时为
+    # None，工具回退进程内执行——声明的是"可以外包"，不是"必须外包"。
+    needs_compute: bool = False
     data_tool: bool = False
     # 该工具的调用会把用户数据发往第三方、或从第三方拉入不可信内容，因此首次调用
     # 须经用户确认（docs 03.7.1）。它是**声明**而非闸门里的名称表：此前判定写在
@@ -230,6 +234,7 @@ def tool(
     review_eligible: bool = True,
     needs_interactive: bool = False,
     needs_coordinator: bool = False,
+    needs_compute: bool = False,
     data_tool: bool = False,
     egress: bool = False,
     model_validator: Callable[[Any], Any] | None = None,
@@ -275,6 +280,7 @@ def tool(
             review_eligible=review_eligible,
             needs_interactive=needs_interactive,
             needs_coordinator=needs_coordinator,
+            needs_compute=needs_compute,
             data_tool=data_tool,
             egress=egress,
             input_model=model,
@@ -297,6 +303,7 @@ def tool(
         cls.review_eligible = spec.review_eligible
         cls.needs_interactive = spec.needs_interactive
         cls.needs_coordinator = spec.needs_coordinator
+        cls.needs_compute = spec.needs_compute
         cls.data_tool = spec.data_tool
         cls.egress = spec.egress
         cls.input_model = spec.input_model
