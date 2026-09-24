@@ -8,6 +8,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import hmac
 import json
 import os
 import sqlite3
@@ -21,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from finharness.auth.dependency import create_require_user
+from finharness.auth.dependency import _bearer_token, create_require_user
 from finharness.auth.ratelimit import RateLimiter
 from finharness.auth.store import CurrentUser, UserStore
 from finharness.config.crypto import SecretCipher
@@ -552,6 +553,8 @@ def create_app(
             memory_store=memory_store,
             usage_store=usage_store,
             require_user=require_user,
+            settings=settings,
+            semantic_index=semantic_index,
         )
     )
 
@@ -925,8 +928,21 @@ def create_app(
     if metrics_recorder is not None:
 
         @application.get("/metrics")
-        async def metrics_endpoint() -> Response:
-            """Prometheus 抓取端点；仅在 metrics 启用时注册。"""
+        async def metrics_endpoint(request: Request) -> Response:
+            """Prometheus 抓取端点；仅在 metrics 启用时注册。
+
+            配了 ``server.metrics_token`` 时按常量时间比对 Bearer 令牌——远程
+            部署强制要求该令牌（见 Settings.validate），避免公网无鉴权读取运营
+            指标。本地回环开发可不设，此时保持开放。
+            """
+            expected = settings.server.metrics_token
+            if expected:
+                if not hmac.compare_digest(_bearer_token(request), expected):
+                    raise HTTPException(
+                        status_code=401,
+                        detail="metrics 令牌无效",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
             return Response(
                 content=metrics_recorder.render(),
                 media_type="text/plain; version=0.0.4; charset=utf-8",
@@ -1379,6 +1395,26 @@ def create_app(
                 registry.sessions.pop(session_id, None)
         return {"ok": True, "conversation_id": conversation_id}
 
+    @application.get("/v1/account/export")
+    async def export_account(user: CurrentUser = Depends(require_user)) -> Response:
+        """导出自有账号的全部数据（可携带权，隔离方案 Phase 2）。
+
+        与管理员抹除相对：用户可自助取回自己的数据，但删除需管理员。归档含
+        ``userdata.json``（记忆库结构）与该用户的产物、缓存文件。
+        """
+        from finharness.server.tenant_data import export_tenant_archive
+
+        archive = export_tenant_archive(
+            store=memory_store, user_id=user.id, settings=settings
+        )
+        return Response(
+            content=archive,
+            media_type="application/zip",
+            headers={
+                "content-disposition": 'attachment; filename="finharness-export.zip"'
+            },
+        )
+
     @application.get("/")
     async def root() -> HTMLResponse:
         index = frontend_dist / "index.html"
@@ -1440,6 +1476,7 @@ def create_app(
         # 请求交错而双双通过。检查本身只读注册表现状，失败不会留下 busy 残留。
         cap = settings.quota.max_concurrent_streams
         if cap and registry.busy_count(user.id) >= cap:
+            observer.record_governance_event(kind="quota_concurrent_streams")
             raise HTTPException(
                 status_code=429,
                 detail=f"同时进行的对话过多（上限 {cap}），请等待其中一轮结束",
@@ -1447,6 +1484,7 @@ def create_app(
             )
         turn_decision = turn_limiter.check(f"turns:{user.id}")
         if not turn_decision.allowed:
+            observer.record_governance_event(kind="quota_turn_budget")
             raise HTTPException(
                 status_code=429,
                 detail=f"本时段对话轮次已达上限，请 {turn_decision.retry_after_s} 秒后重试",

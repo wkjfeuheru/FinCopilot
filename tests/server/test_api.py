@@ -686,6 +686,40 @@ def test_production_factory_starts_without_an_api_key(monkeypatch, tmp_path) -> 
     assert app.title == "FinHarness"
 
 
+def test_metrics_endpoint_requires_the_token_when_configured(tmp_path) -> None:
+    """配了令牌时 /metrics 必须带 Bearer；否则公网可读运营指标（隔离方案 G14）。"""
+    settings = Settings(
+        model={"provider": "fake"},
+        data={"cache_dir": tmp_path / "cache"},
+        paths={
+            "output_dir": tmp_path / "out",
+            "memory_db": tmp_path / "state" / "memory.db",
+        },
+        server={"metrics_token": "s3cret"},
+        observability={"metrics": {"enabled": True}},
+    )
+    client = TestClient(create_app(FakeProvider(["hi"]), settings=settings))
+
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/metrics", headers={"authorization": "Bearer wrong"}).status_code == 401
+    ok = client.get("/metrics", headers={"authorization": "Bearer s3cret"})
+    assert ok.status_code == 200
+    assert "text/plain" in ok.headers["content-type"]
+
+
+def test_remote_mode_requires_a_metrics_token_when_metrics_enabled(tmp_path) -> None:
+    """远程暴露 + 启用 metrics 却没配令牌 → 启动即失败，而不是静默公开。"""
+    settings = Settings(
+        server={"allow_remote": True, "host": "0.0.0.0"},
+        auth={"secure_cookie": True},
+        compute={"remote_worker_url": "http://worker.internal:8080"},
+        observability={"metrics": {"enabled": True}},
+    )
+
+    with pytest.raises(SettingsError, match="metrics_token"):
+        settings.validate()
+
+
 def test_metrics_endpoint_is_absent_when_disabled(tmp_path) -> None:
     """默认关闭 metrics 时不注册 /metrics，避免暴露一个空端点。"""
     settings = Settings(

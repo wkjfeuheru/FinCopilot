@@ -95,6 +95,20 @@ class MetricsRecorder:
             buckets=_ROUNDS_BUCKETS,
             registry=self.registry,
         )
+        # 治理事件计数（隔离方案 Phase 2：告警与演练）——拒绝率、配额超限、
+        # 审计写失败、确认超时都需要可告警，而不只是写进日志。指标名刻意统一
+        # 为 ``governance_events_total``，按 ``kind`` 区分，使一条 PromQL 就能
+        # 覆盖所有"被治理拦下"的信号。
+        self.governance_events = Counter(
+            "governance_events_total",
+            "按类型统计的治理事件（拒绝、配额、审计失败、确认超时等）",
+            labelnames=("kind",),
+            registry=self.registry,
+        )
+
+    def governance_event(self, *, kind: str) -> None:
+        """记录一次治理事件；``kind`` 是稳定的小写标识，供告警规则匹配。"""
+        self.governance_events.labels(kind=kind or "unknown").inc()
 
     # -- Observer 接口 ----------------------------------------------------------
 

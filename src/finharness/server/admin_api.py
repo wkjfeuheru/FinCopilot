@@ -7,7 +7,9 @@
 * ``MemoryStore``：每用户对话数与最后活跃（conversations 表聚合）；
 * ``UsageStore``：每用户轮数与 token（usage_turns 聚合，窗口可过滤）。
 
-纯查看：本期不提供任何管理动作（禁用/改配额），后续需要时在此路由上扩。
+另有一个管理动作——**抹除某租户的数据**（遗忘权，隔离方案 Phase 2）。它是本
+路由上唯一的写操作，因为它不可逆，故留在管理员面而非用户自助面：用户能自助
+导出（``/v1/account/export``），但抹除需要管理员，以免误触毁掉整份历史。
 """
 
 from __future__ import annotations
@@ -48,8 +50,14 @@ def create_admin_router(
     memory_store,
     usage_store,
     require_user: Callable,
+    settings=None,
+    semantic_index=None,
 ) -> APIRouter:
-    """构建 /v1/admin 路由；依赖 ``require_user`` 叠加管理员判定。"""
+    """构建 /v1/admin 路由；依赖 ``require_user`` 叠加管理员判定。
+
+    ``settings`` 与 ``semantic_index`` 供租户抹除使用（覆盖产物/缓存/向量/审计），
+    未注入时该端点返回 503 而非静默少删——遗忘权不能"部分完成还报成功"。
+    """
 
     router = APIRouter(prefix="/v1/admin", tags=["admin"])
     require_admin = Depends(_make_admin_dependency(require_user))
@@ -107,6 +115,27 @@ def create_admin_router(
             "total_users": user_store.count_users(),
             **usage_store.summary(since=since),
         }
+
+    @router.delete("/users/{user_id}/data")
+    def purge_user_data(user_id: str, user: CurrentUser = require_admin) -> dict[str, Any]:
+        """抹除某租户的全部数据（遗忘权）：记忆库 + 向量 + 产物 + 缓存 + 审计。
+
+        不可逆，故有两条硬约束：目标账号必须存在（避免对拼写错误的 id 静默
+        "成功"），且能力未接线时 503（不静默少删）。返回实际删除计数供核对。
+        """
+        if settings is None or semantic_index is None:
+            raise HTTPException(status_code=503, detail="租户抹除能力未接线")
+        if user_store.get_user(user_id) is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        from finharness.server.tenant_data import purge_tenant_data
+
+        return purge_tenant_data(
+            store=memory_store,
+            user_id=user_id,
+            settings=settings,
+            audit_path=settings.audit.log_path,
+            semantic_index=semantic_index,
+        )
 
     return router
 

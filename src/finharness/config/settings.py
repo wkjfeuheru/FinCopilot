@@ -411,6 +411,9 @@ class ServerSettings(FrozenModel):
     user_cache_size: PositiveInt = 64
     static_dir: Path = Path("src/finharness/server/static")
     allow_remote: bool = False
+    # /metrics 的抓取令牌。远程模式下启用 metrics 时必须设置（见 validate）；
+    # 本地回环下可留空，此时 /metrics 保持开放以便开发。比较按常量时间进行。
+    metrics_token: str | None = None
 
 
 class ComputeSettings(FrozenModel):
@@ -680,6 +683,14 @@ class Settings(BaseSettings):
             if parsed_worker.scheme not in {"http", "https"} or not parsed_worker.netloc:
                 raise SettingsError(
                     "server.allow_remote=true 时 compute.remote_worker_url 必须是远程 worker 地址"
+                )
+            # /metrics 在启用时是公开端点（编排器要探测 health，但指标是运营数据）。
+            # 远程暴露下必须带令牌，否则一个公网可读的 Prometheus 端点会泄露
+            # 工具失败率、请求量与模型名等运营信息（隔离方案 G14）。
+            if self.observability.metrics.enabled and not self.server.metrics_token:
+                raise SettingsError(
+                    "server.allow_remote=true 且启用 metrics 时必须设置 "
+                    "server.metrics_token（/metrics 不得公网无鉴权可读）"
                 )
         if require_api_key and provider.kind != "fake":
             env_key = provider.env_key
@@ -1053,6 +1064,7 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_SERVER_CONFIRM_TTL_S": (("server", "confirm_ttl_s"), int),
     "FINH_SERVER_STATIC_DIR": (("server", "static_dir"), Path),
     "FINH_SERVER_ALLOW_REMOTE": (("server", "allow_remote"), bool),
+    "FINH_SERVER_METRICS_TOKEN": (("server", "metrics_token"), str),
     "FINH_COMPUTE_REMOTE_WORKER_URL": (("compute", "remote_worker_url"), str),
     "FINH_COMPUTE_HMAC_SECRET_ENV": (("compute", "hmac_secret_env"), str),
     "FINH_COMPUTE_LEASE_SECONDS": (("compute", "lease_seconds"), int),

@@ -1957,3 +1957,88 @@ class MemoryStore:
                 "DELETE FROM conversations WHERE conversation_id = ?",
             ):
                 connection.execute(statement, (conversation_id,))
+
+    # -- 租户级数据生命周期（隔离方案 Phase 2：可携带权与遗忘权）------------
+    def export_user_data(self, *, user_id: str) -> dict[str, object]:
+        """导出一个用户的**全部**记忆数据，供数据可携带。
+
+        覆盖对话、消息、引用、结论、标的池、摘要片段、情节与语义记忆。
+        只读，不做任何归属转换；空串 ``user_id`` 是合法输入（CLI/单租户）。
+        """
+        with self._connect() as connection:
+
+            def rows(sql: str, *params: object) -> list[dict[str, object]]:
+                return [dict(row) for row in connection.execute(sql, params).fetchall()]
+
+            return {
+                "user_id": user_id,
+                "conversations": rows(
+                    "SELECT conversation_id, title, created_at, updated_at, last_active_at"
+                    " FROM conversations WHERE user_id = ? ORDER BY created_at",
+                    user_id,
+                ),
+                "messages": rows(
+                    "SELECT conversation_id, seq, role, content, payload_json, ts"
+                    " FROM messages WHERE user_id = ? ORDER BY conversation_id, seq",
+                    user_id,
+                ),
+                "citations": rows(
+                    "SELECT conversation_id, cid, tool, endpoint, symbol, params_json,"
+                    " rows, cols, fingerprint, parquet_path, from_cache, ts"
+                    " FROM citations WHERE user_id = ? ORDER BY conversation_id, cid",
+                    user_id,
+                ),
+                "conclusions": rows(
+                    "SELECT conversation_id, subject, text, cids_json, ts"
+                    " FROM conclusions WHERE user_id = ? ORDER BY conversation_id, id",
+                    user_id,
+                ),
+                "summary_segments": rows(
+                    "SELECT conversation_id, seq_from, seq_to, tier, text, ledger_json, created_at"
+                    " FROM summary_segments WHERE user_id = ? ORDER BY conversation_id, seq_from",
+                    user_id,
+                ),
+                "symbols": rows(
+                    "SELECT conversation_id, symbol, name, first_seen, last_seen"
+                    " FROM conversation_symbols WHERE user_id = ? ORDER BY conversation_id, symbol",
+                    user_id,
+                ),
+                "episodes": rows(
+                    "SELECT ep_uid, kind, subject, summary, source_conversation_id,"
+                    " source_title, source_ts, cids_json, created_at"
+                    " FROM ltm_episodes WHERE user_id = ? ORDER BY created_at",
+                    user_id,
+                ),
+                "facts": rows(
+                    "SELECT fa_uid, key, statement, kind, subject, source_conversation_id,"
+                    " source_ts, confidence, updated_at"
+                    " FROM ltm_facts WHERE user_id = ? ORDER BY updated_at",
+                    user_id,
+                ),
+            }
+
+    def purge_user_data(self, *, user_id: str) -> dict[str, int]:
+        """删除一个用户的全部记忆数据，返回各表删除行数（遗忘权）。
+
+        与 ``delete_conversation`` 不同，这里连跨对话情节与语义记忆一并抹除：
+        "删除我的数据"必须覆盖该用户的一切，否则残留的情节仍指向已删对话。
+        向量由调用方经 ``SemanticIndex`` 同步清理（记录本体在此，向量在彼）。
+        """
+        tables = (
+            ("messages", "DELETE FROM messages WHERE user_id = ?"),
+            ("summary_segments", "DELETE FROM summary_segments WHERE user_id = ?"),
+            ("citations", "DELETE FROM citations WHERE user_id = ?"),
+            ("conclusions", "DELETE FROM conclusions WHERE user_id = ?"),
+            ("conversation_symbols", "DELETE FROM conversation_symbols WHERE user_id = ?"),
+            ("turn_checkpoints", "DELETE FROM turn_checkpoints WHERE user_id = ?"),
+            ("ltm_processed", "DELETE FROM ltm_processed WHERE user_id = ?"),
+            ("ltm_episodes", "DELETE FROM ltm_episodes WHERE user_id = ?"),
+            ("ltm_facts", "DELETE FROM ltm_facts WHERE user_id = ?"),
+            ("conversations", "DELETE FROM conversations WHERE user_id = ?"),
+        )
+        deleted: dict[str, int] = {}
+        with self._connect() as connection:
+            # 子表先于父表删除；外键为 DEFERRABLE，顺序在此是显式意图而非依赖。
+            for name, statement in tables:
+                deleted[name] = connection.execute(statement, (user_id,)).rowcount
+        return deleted

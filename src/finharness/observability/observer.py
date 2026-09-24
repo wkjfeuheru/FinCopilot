@@ -216,6 +216,9 @@ class NullObserver:
     def record_error(self, *, error_type: str, detail: str = "") -> None:
         return None
 
+    def record_governance_event(self, *, kind: str) -> None:
+        return None
+
 
 class Observer:
     """真实实现：组合可选的指标与追踪后端，并发射结构化日志。"""
@@ -368,6 +371,19 @@ class Observer:
                 self.metrics.error(error_type=error_type)
             except Exception:  # noqa: BLE001 - 观测尽力而为
                 _guard("metrics.error")
+
+    def record_governance_event(self, *, kind: str) -> None:
+        """记录一次治理事件（拒绝、配额、审计失败、确认超时），进日志与指标。
+
+        这些事件此前只写日志，无法聚合告警——而"拒绝率突然上升"本身就是需要
+        被看见的信号（可能是攻击，也可能是配置错误）。
+        """
+        self._log("warning", "governance_event", kind=kind)
+        if self.metrics is not None:
+            try:
+                self.metrics.governance_event(kind=kind)
+            except Exception:  # noqa: BLE001 - 观测尽力而为
+                _guard("metrics.governance_event")
 
     def log_tool_call(self, *, tool: str, args: Any, turn: int = 0) -> None:
         """工具调用的入参摘要（脱敏后）——排查时最需要的一段。"""

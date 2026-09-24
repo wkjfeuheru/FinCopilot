@@ -161,7 +161,8 @@
     "busy_timeout_s": 3600,
     "user_cache_size": 64,
     "static_dir": "src/finharness/server/static",
-    "allow_remote": false
+    "allow_remote": false,
+    "metrics_token": null
   },
   "auth": {
     "token_ttl_s": 3600,

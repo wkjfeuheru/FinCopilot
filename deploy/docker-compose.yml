@@ -31,6 +31,8 @@ services:
       HITHINK_FINANCE_API_KEY: ${HITHINK_FINANCE_API_KEY:-}
       # 是否开放注册：初始化管理员账号后改回 false 并 docker compose up -d
       FINH_AUTH_ALLOW_REGISTER: ${FINH_AUTH_ALLOW_REGISTER:-false}
+      # /metrics 抓取令牌：仅在启用 metrics 时需要（远程模式强制）。
+      FINH_SERVER_METRICS_TOKEN: ${FINH_SERVER_METRICS_TOKEN:-}
       # 语义记忆向量库（docs 03.6.4）：指向下方 qdrant 服务；向量只存 Qdrant，
       # SQLite 只留记录本体。服务未起时应用照常运行，仅少一层语义召回。
       FINH_LTM_VECTOR_DB_URL: ${FINH_LTM_VECTOR_DB_URL:-http://qdrant:6333}

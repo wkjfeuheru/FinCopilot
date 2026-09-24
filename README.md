@@ -365,3 +365,5 @@ python -m finharness.eval run --set smoke                # 真实 Provider（需
 | 服务层 | [03.12-server.md](docs/modules/03.12-server.md) |
 | 评估体系 | [03.13-eval.md](docs/modules/03.13-eval.md) |
 | 可观测性 | [03.14-observability.md](docs/modules/03.14-observability.md) |
+| 可达面契约 | [03.15-workspace.md](docs/modules/03.15-workspace.md) |
+| 威胁模型 | [03.16-threat-model.md](docs/modules/03.16-threat-model.md) |

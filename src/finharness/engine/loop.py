@@ -647,6 +647,11 @@ class AgentLoop:
         log.warning(
             "审计写入失败：tool=%s action=%s", tool_name, action, exc_info=True
         )
+        # 同时计数：审计失败率是需要告警的治理信号（隔离方案 Phase 2）。
+        try:
+            self.observer.record_governance_event(kind="audit_write_failure")
+        except Exception:  # noqa: BLE001 - 观测绝不能再抛
+            pass
 
     async def _audit_detection(self, detected: LoopDetected) -> None:
         """在审计轨迹中记录该中止（尽力而为，绝不致命）。"""
