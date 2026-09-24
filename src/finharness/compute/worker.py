@@ -13,7 +13,6 @@ import json
 import os
 import re
 import socket
-import tempfile
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -21,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from finharness.compute.protocol import TaskPackageError, TaskSigner, extract_task_package
+from finharness.compute.protocol import TaskPackageError, TaskSigner
 from finharness.compute.executor import ComputeTask, LocalProcessComputeExecutor
 
 
