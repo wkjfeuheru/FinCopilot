@@ -27,10 +27,12 @@ def child_descendant(_job, input_dir):
     import time
     from pathlib import Path
     marker = (input_dir / "marker.txt").read_text()
-    code = "import time; from pathlib import Path; time.sleep(6); Path(" + repr(marker) + ").write_text('alive')"
+    # 后代进程睡眠时间远长于任务超时，因此它只可能"被终止"而不可能自然完成——
+    # 这让"marker 未出现"成为"整棵树被杀死"的确证，而不是时序巧合。
+    code = "import time; from pathlib import Path; time.sleep(120); Path(" + repr(marker) + ").write_text('alive')"
     subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     Path(marker + ".ready").write_text("ready")
-    time.sleep(20)
+    time.sleep(200)
     return {}
 
 
@@ -47,10 +49,13 @@ async def test_local_stdout_has_bounded_size(tmp_path):
 @pytest.mark.asyncio
 async def test_local_timeout_or_cancel_kills_descendants(tmp_path, cancel):
     marker = tmp_path / "descendant.txt"
+    # 超时给足余量：全量并发跑时子进程的 Python 启动+解包可能慢到数秒，若超时
+    # 贴着启动时间，任务会在 handler 尚未拉起后代前就超时，测的就不再是"杀树"。
+    # 后代进程睡眠 120s，从而"marker 未出现"只可能是被终止，而非自然完成。
     executor = LocalProcessComputeExecutor(handlers={"tree": child_descendant}, work_dir=tmp_path / "work")
-    task = ComputeTask("u", "c", "tree", {"marker.txt": str(marker).encode()}, timeout_s=4)
+    task = ComputeTask("u", "c", "tree", {"marker.txt": str(marker).encode()}, timeout_s=20)
     pending = asyncio.create_task(executor.execute(task))
-    for _ in range(500):
+    for _ in range(2000):
         if marker.with_suffix(".txt.ready").exists():
             break
         await asyncio.sleep(0.01)
@@ -61,7 +66,7 @@ async def test_local_timeout_or_cancel_kills_descendants(tmp_path, cancel):
             await pending
     else:
         assert (await pending).error == "timeout"
-    await asyncio.sleep(6.2)
+    await asyncio.sleep(3.0)
     assert not marker.exists(), "后代进程在任务终止后仍在运行"
 
 

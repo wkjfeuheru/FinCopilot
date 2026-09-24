@@ -204,7 +204,9 @@ class WriteReportTool(BaseTool):
         return str(target), None
 
 
-_IMAGE_REF_RE = re.compile(r"!\[(.*?)\]\((.+?)\)")
+# 与 docx_export 的图片语法一致：只处理独占一行的引用（导出器也只嵌入这种）。
+# 行尾空白用 [ \t] 而非 \s，否则会连同行末换行一起吃掉。
+_IMAGE_REF_RE = re.compile(r"^!\[(.*?)\]\((.+?)\)[ \t]*$", re.MULTILINE)
 
 
 def _package_chart_images(markdown: str) -> tuple[str, dict[str, bytes]]:
