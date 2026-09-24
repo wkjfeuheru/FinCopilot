@@ -67,3 +67,26 @@ def test_worker_finish_materializes_validated_blobs_in_the_job_workspace(tmp_pat
     finish_body = json.dumps(finish, separators=(",", ":")).encode()
     assert client.post("/v1/internal/compute/finish", content=finish_body, headers=_headers(finish_body)).status_code == 204
     assert (tmp_path / "output" / "u_1" / "c_1" / job.job_id / "report.docx").read_bytes() == b"docx"
+    assert not package.exists()
+
+
+def test_invalid_worker_result_fails_job_and_cleans_input_package(tmp_path, monkeypatch):
+    app = _app(tmp_path, monkeypatch)
+    package = tmp_path / "state" / "compute_packages" / "job.zip"
+    package.parent.mkdir(parents=True)
+    package.write_bytes(b"task package")
+    job = app.state.compute_jobs.enqueue(
+        user_id="u_1", conversation_id="c_1", kind="chart", payload_path=str(package)
+    )
+    client = TestClient(app)
+    lease_body = b'{"worker_id":"worker_1"}'
+    client.post("/v1/internal/compute/lease", content=lease_body, headers=_headers(lease_body))
+    running_body = json.dumps({"worker_id": "worker_1", "job_id": job.job_id}, separators=(",", ":")).encode()
+    client.post("/v1/internal/compute/running", content=running_body, headers=_headers(running_body))
+    finish_body = json.dumps({"worker_id": "worker_1", "job_id": job.job_id,
+                              "result_json": '{"blobs":{"../escape":"eA=="}}'},
+                             separators=(",", ":")).encode()
+    response = client.post("/v1/internal/compute/finish", content=finish_body, headers=_headers(finish_body))
+    assert response.status_code == 422
+    assert app.state.compute_jobs.get(job.job_id, user_id="u_1").status == "failed"
+    assert not package.exists()

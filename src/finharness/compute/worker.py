@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import base64
+import asyncio
+import contextlib
 import json
 import os
 import socket
@@ -19,9 +21,14 @@ from typing import Any
 import httpx
 
 from finharness.compute.protocol import TaskPackageError, TaskSigner, extract_task_package
+from finharness.compute.executor import ComputeTask, LocalProcessComputeExecutor
 
 
 TaskHandler = Callable[[Mapping[str, Any], Path], dict[str, Any]]
+
+
+class _LeaseLost(RuntimeError):
+    """续租失败：主服务已取消或回收任务，worker 不得再提交结果。"""
 
 
 def _docx_export_handler(_job: Mapping[str, Any], input_dir: Path) -> dict[str, Any]:
@@ -44,11 +51,14 @@ def _docx_export_handler(_job: Mapping[str, Any], input_dir: Path) -> dict[str, 
 class WorkerClient:
     """唯一的 worker 出站能力：经签名向主服务领取/完成任务。"""
 
-    def __init__(self, *, base_url: str, secret: str, worker_id: str | None = None) -> None:
+    def __init__(self, *, base_url: str, secret: str, worker_id: str | None = None,
+                 renew_interval_s: float = 15.0, work_dir: str | Path | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{socket.gethostname()}-{os.getpid()}"
         self.signer = TaskSigner(secret)
         self.http = httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0))
+        self.renew_interval_s = max(renew_interval_s, 0.01)
+        self.work_dir = work_dir
 
     def request(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -69,20 +79,54 @@ class WorkerClient:
         self.request("/v1/internal/compute/running", base)
         try:
             package = base64.b64decode(str(leased["package_b64"]), validate=True)
-            handler = handlers.get(str(job["kind"]))
-            if handler is None:
+            if str(job["kind"]) not in handlers:
                 raise TaskPackageError(f"worker 不支持任务类型：{job['kind']}")
-            with tempfile.TemporaryDirectory(prefix="finh-worker-") as temporary:
-                task_dir = Path(temporary)
-                archive = task_dir / "input.zip"
-                archive.write_bytes(package)
-                input_dir = task_dir / "input"
-                extract_task_package(archive, input_dir)
-                result = handler(job, input_dir)
-            self.request("/v1/internal/compute/finish", {**base, "result_json": json.dumps(result)})
+            result = asyncio.run(self._run_child(job, package, handlers, base))
+            if result is None:  # 租约被取消或过期，不能再提交迟到的结果。
+                return True
+            if result.status == "succeeded":
+                self.request("/v1/internal/compute/finish", {
+                    **base, "result_json": json.dumps({"metadata": result.metadata, "blobs": result.blob_data})
+                })
+            else:
+                self.request("/v1/internal/compute/finish", {**base, "error": result.error or "child_failed"})
+        except _LeaseLost:
+            return True
         except Exception as exc:  # noqa: BLE001 - failure is reported to main service, then loop continues.
             self.request("/v1/internal/compute/finish", {**base, "error": f"worker_error:{type(exc).__name__}"})
         return True
+
+    async def _run_child(self, job: Mapping[str, Any], package: bytes,
+                         handlers: Mapping[str, TaskHandler], base: dict[str, str]):
+        executor = LocalProcessComputeExecutor(handlers=handlers, work_dir=self.work_dir)
+        task = ComputeTask(user_id=str(job["user_id"]), conversation_id=str(job["conversation_id"]),
+                           kind=str(job["kind"]), files={}, package_bytes=package)
+        running = asyncio.create_task(executor.execute(task))
+
+        async def renew():
+            while True:
+                await asyncio.sleep(self.renew_interval_s)
+                await asyncio.to_thread(self.request, "/v1/internal/compute/renew", base)
+
+        heartbeat = asyncio.create_task(renew())
+        try:
+            done, _ = await asyncio.wait({running, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
+            if heartbeat in done:
+                running.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await running
+                try:
+                    heartbeat.result()
+                except Exception as exc:  # noqa: BLE001 - 任何续租拒绝均意味着失去租约。
+                    raise _LeaseLost() from exc
+                raise _LeaseLost()
+            return running.result()
+        finally:
+            heartbeat.cancel()
+            # 续租任务的原始拒绝已转换为 _LeaseLost；finally 不得以同一个
+            # ValueError 覆盖它，否则外层会误把取消当成普通失败并提交 finish。
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await heartbeat
 
     def close(self) -> None:
         self.http.close()

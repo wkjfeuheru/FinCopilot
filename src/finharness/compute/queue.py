@@ -81,7 +81,8 @@ class ComputeJobStore:
             lease_expires_at=row["lease_expires_at"], result_json=row["result_json"], error=row["error"],
         )
 
-    def enqueue(self, *, user_id: str, conversation_id: str, kind: str, payload_path: str) -> ComputeJob:
+    def enqueue(self, *, user_id: str, conversation_id: str, kind: str, payload_path: str,
+                job_id: str | None = None) -> ComputeJob:
         now = time.time()
         with self._connect() as connection:
             waiting = connection.execute(
@@ -89,7 +90,7 @@ class ComputeJobStore:
             ).fetchone()["n"]
             if int(waiting) >= self.max_waiting_per_user:
                 raise QueueFullError("该用户的计算任务等待队列已满")
-            job_id = f"job_{uuid.uuid4().hex}"
+            job_id = job_id or f"job_{uuid.uuid4().hex}"
             connection.execute(
                 "INSERT INTO compute_jobs (job_id, user_id, conversation_id, kind, payload_path, status, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)",

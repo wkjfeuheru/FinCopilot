@@ -6,6 +6,7 @@
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import json
 import os
@@ -323,6 +324,8 @@ def create_app(
             raise HTTPException(status_code=422, detail="worker 返回的 result_json 非法") from exc
         if not isinstance(result, dict):
             raise HTTPException(status_code=422, detail="worker 结果必须是 object")
+        if not isinstance(result.get("metadata", {}), dict):
+            raise HTTPException(status_code=422, detail="worker 元数据必须是 object")
         blobs = result.pop("blobs", {})
         if not blobs:
             return json.dumps(result, ensure_ascii=False)
@@ -343,7 +346,7 @@ def create_app(
                     raise HTTPException(status_code=422, detail="worker blob 内容非法")
                 try:
                     content = base64.b64decode(encoded, validate=True)
-                except ValueError as exc:
+                except (ValueError, binascii.Error) as exc:
                     raise HTTPException(status_code=422, detail="worker blob 不是 base64") from exc
                 if len(content) > 32 * 1024 * 1024:
                     raise HTTPException(status_code=422, detail="worker blob 超过大小限制")
@@ -357,6 +360,12 @@ def create_app(
             raise
         result["artifacts"] = artifacts
         return json.dumps(result, ensure_ascii=False)
+
+    def _cleanup_compute_package(job) -> None:
+        package_root = Path(settings.paths.compute_packages_dir).resolve()
+        package_path = Path(job.payload_path).resolve()
+        if package_path.is_relative_to(package_root):
+            package_path.unlink(missing_ok=True)
 
     @application.post("/v1/internal/compute/lease", include_in_schema=False)
     async def lease_compute_job(payload: WorkerLeaseRequest, request: Request) -> dict:
@@ -391,20 +400,28 @@ def create_app(
     @application.post("/v1/internal/compute/finish", include_in_schema=False)
     async def finish_compute_job(payload: WorkerFinishRequest, request: Request) -> Response:
         await _verify_worker_request(request)
+        job = application.state.compute_jobs.get_leased(payload.job_id, worker_id=payload.worker_id)
+        if job is None:
+            raise HTTPException(status_code=409, detail="任务未被当前 worker 运行")
         try:
             if payload.error:
                 application.state.compute_jobs.fail(payload.job_id, worker_id=payload.worker_id, error=payload.error)
             else:
-                job = application.state.compute_jobs.get_leased(payload.job_id, worker_id=payload.worker_id)
-                if job is None:
-                    raise HTTPException(status_code=409, detail="任务未被当前 worker 运行")
                 application.state.compute_jobs.succeed(
                     payload.job_id,
                     worker_id=payload.worker_id,
                     result_json=_materialize_worker_blobs(job, payload.result_json or "{}"),
                 )
+        except HTTPException as exc:
+            if exc.status_code == 422:
+                application.state.compute_jobs.fail(
+                    payload.job_id, worker_id=payload.worker_id, error="invalid_result"
+                )
+                _cleanup_compute_package(job)
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _cleanup_compute_package(job)
         return Response(status_code=204)
 
     # 语义记忆的检索层（docs 03.6.4 LTM）：记录本体在 SQLite，向量只用于
