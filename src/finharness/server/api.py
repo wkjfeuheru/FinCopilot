@@ -219,9 +219,13 @@ def create_app(
                 semantic_index.index_pending(user_id=user_id)
         except Exception:  # noqa: BLE001 - 回填绝不该阻止服务启动
             pass
+        compute_cleanup_task = asyncio.create_task(_compute_cleanup_worker())
         try:
             yield
         finally:
+            compute_cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await compute_cleanup_task
             if trace_cleanup_task is not None:
                 trace_cleanup_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -276,12 +280,23 @@ def create_app(
     # 队列数据库仅由主服务持有；worker 只能经签名内部接口领取任务，绝不能
     # 直接挂载 state 或打开这个 SQLite 文件。
     from finharness.compute.queue import ComputeJobStore
+    from finharness.compute.executor import RemoteComputeExecutor
+    from finharness.compute.protocol import MAX_PACKAGE_BYTES
 
     application.state.compute_jobs = ComputeJobStore(
         settings.paths.compute_jobs_db,
         max_waiting_per_user=int(settings.compute.max_waiting_per_user),
         max_attempts=int(settings.compute.max_attempts),
     )
+    application.state.compute_executor = RemoteComputeExecutor(
+        store=application.state.compute_jobs, packages_dir=settings.paths.compute_packages_dir,
+    )
+
+    async def _compute_cleanup_worker() -> None:
+        while True:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(application.state.compute_executor.cleanup_terminal_packages)
+            await asyncio.sleep(30)
     compute_secret = os.getenv(settings.compute.hmac_secret_env)
     application.state.compute_signer = (
         TaskSigner(compute_secret) if compute_secret and len(compute_secret.encode("utf-8")) >= 16 else None
@@ -303,7 +318,7 @@ def create_app(
             package_path.relative_to(package_root)
         except ValueError as exc:
             raise HTTPException(status_code=500, detail="计算任务包不在受控 state 目录") from exc
-        if not package_path.is_file() or package_path.stat().st_size > 16 * 1024 * 1024:
+        if not package_path.is_file() or package_path.stat().st_size > MAX_PACKAGE_BYTES:
             raise HTTPException(status_code=500, detail="计算任务包不可用或超过大小限制")
         return {
             "job": {
@@ -316,7 +331,7 @@ def create_app(
             "package_b64": base64.b64encode(package_path.read_bytes()).decode("ascii"),
         }
 
-    def _materialize_worker_blobs(job, result_json: str) -> str:
+    def _materialize_worker_blobs(job, result_json: str, created: list[Path]) -> str:
         """验证 worker 回传物后才写入所属任务目录，绝不相信其目标路径。"""
         try:
             result = json.loads(result_json)
@@ -337,6 +352,7 @@ def create_app(
             conversation_id=job.conversation_id,
             job_id=job.job_id,
         )
+        created.append(destination)
         artifacts: list[str] = []
         try:
             for name, encoded in blobs.items():
@@ -373,6 +389,7 @@ def create_app(
         job = application.state.compute_jobs.lease_next(
             worker_id=payload.worker_id, lease_seconds=float(settings.compute.lease_seconds)
         )
+        application.state.compute_executor.cleanup_terminal_packages()
         return {"job": None} if job is None else _worker_job_payload(job)
 
     @application.post("/v1/internal/compute/running", include_in_schema=False)
@@ -403,6 +420,8 @@ def create_app(
         job = application.state.compute_jobs.get_leased(payload.job_id, worker_id=payload.worker_id)
         if job is None:
             raise HTTPException(status_code=409, detail="任务未被当前 worker 运行")
+        created: list[Path] = []
+        committed = False
         try:
             if payload.error:
                 application.state.compute_jobs.fail(payload.job_id, worker_id=payload.worker_id, error=payload.error)
@@ -410,18 +429,28 @@ def create_app(
                 application.state.compute_jobs.succeed(
                     payload.job_id,
                     worker_id=payload.worker_id,
-                    result_json=_materialize_worker_blobs(job, payload.result_json or "{}"),
+                    result_json=lambda: _materialize_worker_blobs(job, payload.result_json or "{}", created),
                 )
+            committed = True
         except HTTPException as exc:
             if exc.status_code == 422:
-                application.state.compute_jobs.fail(
-                    payload.job_id, worker_id=payload.worker_id, error="invalid_result"
-                )
-                _cleanup_compute_package(job)
+                try:
+                    application.state.compute_jobs.fail(
+                        payload.job_id, worker_id=payload.worker_id, error="invalid_result"
+                    )
+                except ValueError as conflict:
+                    raise HTTPException(status_code=409, detail=str(conflict)) from conflict
             raise
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        _cleanup_compute_package(job)
+        finally:
+            if not committed:
+                import shutil
+                for destination in created:
+                    shutil.rmtree(destination, ignore_errors=True)
+            current = application.state.compute_jobs.get(job.job_id, user_id=job.user_id)
+            if current is not None and current.status in {"succeeded", "failed", "cancelled"}:
+                _cleanup_compute_package(job)
         return Response(status_code=204)
 
     # 语义记忆的检索层（docs 03.6.4 LTM）：记录本体在 SQLite，向量只用于
@@ -795,6 +824,7 @@ def create_app(
         loop_factory,
         ttl_s=settings.server.session_ttl_s,
         busy_timeout_s=settings.server.busy_timeout_s,
+        compute_executor=application.state.compute_executor,
     )
     application.state.session_registry = registry
     # LTM 懒蒸馏的前一翼（docs 03.6.4）：周期扫描闲置对话并补蒸馏。

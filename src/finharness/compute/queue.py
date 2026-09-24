@@ -9,6 +9,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -170,22 +171,43 @@ class ComputeJobStore:
             if connection.execute(sql, assignments).rowcount != 1:
                 raise ValueError("任务未被当前 worker 租用或租约已过期")
 
-    def succeed(self, job_id: str, *, worker_id: str, result_json: str) -> None:
+    def succeed(self, job_id: str, *, worker_id: str, result_json: str | Callable[[], str]) -> None:
         self._finish(job_id, worker_id=worker_id, status="succeeded", result_json=result_json, error=None)
 
     def fail(self, job_id: str, *, worker_id: str, error: str) -> None:
         self._finish(job_id, worker_id=worker_id, status="failed", result_json=None, error=error)
 
-    def _finish(self, job_id: str, *, worker_id: str, status: str, result_json: str | None, error: str | None) -> None:
-        now = time.time()
+    def _finish(self, job_id: str, *, worker_id: str, status: str,
+                result_json: str | Callable[[], str] | None, error: str | None) -> None:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM compute_jobs WHERE job_id=? AND lease_owner=? "
+                "AND status='running' AND lease_expires_at > ?", (job_id, worker_id, time.time())
+            ).fetchone() is None:
+                raise ValueError("只能完成由当前 worker 持有效租约运行的任务")
+            # 持有写事务再调用结果落盘，取消/回收不能穿插在校验和完成之间。
+            if callable(result_json):
+                result_json = result_json()
+            now = time.time()
             cursor = connection.execute(
                 "UPDATE compute_jobs SET status = ?, result_json = ?, error = ?, lease_owner = NULL, "
-                "lease_expires_at = NULL, updated_at = ? WHERE job_id = ? AND lease_owner = ? AND status = 'running'",
-                (status, result_json, error, now, job_id, worker_id),
+                "lease_expires_at = NULL, updated_at = ? WHERE job_id = ? AND lease_owner = ? "
+                "AND status = 'running' AND lease_expires_at > ?",
+                (status, result_json, error, now, job_id, worker_id, now),
             )
             if cursor.rowcount != 1:
                 raise ValueError("只能完成由当前 worker 运行的任务")
+
+    def recover_and_list_terminal(self) -> list[ComputeJob]:
+        """回收租约并返回可幂等清理输入的终态任务，支持服务重启。"""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._recover_expired(connection, time.time())
+            rows = connection.execute(
+                "SELECT * FROM compute_jobs WHERE status IN ('succeeded', 'failed', 'cancelled')"
+            ).fetchall()
+        return [self._row(row) for row in rows]
 
     def cancel(self, job_id: str, *, user_id: str) -> bool:
         with self._connect() as connection:

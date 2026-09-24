@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from finharness.compute.queue import ComputeJobStore
+from finharness.compute.protocol import MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES
+from finharness.compute.process_tree import ProcessTree
 
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -50,9 +52,9 @@ class ComputeExecutor(Protocol):
 
 
 def _package(files: Mapping[str, bytes]) -> bytes:
-    if not files or len(files) > 64:
+    if not files or len(files) > MAX_PACKAGE_FILES:
         raise ValueError("任务包文件数量非法")
-    if sum(len(content) for content in files.values()) > 16 * 1024 * 1024:
+    if sum(len(content) for content in files.values()) > MAX_PACKAGE_BYTES:
         raise ValueError("任务包超过大小限制")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
@@ -60,7 +62,10 @@ def _package(files: Mapping[str, bytes]) -> bytes:
             if not isinstance(name, str) or not _NAME.fullmatch(name) or not isinstance(content, bytes):
                 raise ValueError("任务包文件名或内容非法")
             bundle.writestr(name, content)
-    return output.getvalue()
+    package = output.getvalue()
+    if len(package) > MAX_PACKAGE_BYTES:
+        raise ValueError("任务压缩包超过大小限制")
+    return package
 
 
 def _result(payload: object, *, job_id: str | None = None) -> ComputeResult:
@@ -90,6 +95,12 @@ class RemoteComputeExecutor:
         self.store = store
         self.packages_dir = Path(packages_dir).resolve()
         self.poll_interval_s = max(poll_interval_s, 0.001)
+
+    def cleanup_terminal_packages(self) -> None:
+        for job in self.store.recover_and_list_terminal():
+            path = Path(job.payload_path).resolve()
+            if path.is_relative_to(self.packages_dir) and path.is_file():
+                path.unlink(missing_ok=True)
 
     async def execute(self, job: ComputeTask) -> ComputeResult:
         if job.timeout_s <= 0:
@@ -139,11 +150,15 @@ class LocalProcessComputeExecutor:
     """仅供本地单租户使用，显式注册的 handler 在新进程中执行。"""
 
     def __init__(self, *, handlers: Mapping[str, Callable], work_dir: str | Path | None = None,
-                 cpu_seconds: int = 30, memory_bytes: int = 512 * 1024 * 1024) -> None:
+                 cpu_seconds: int = 30, memory_bytes: int = 512 * 1024 * 1024,
+                 max_stdout_bytes: int = 48 * 1024 * 1024) -> None:
         self.handlers = dict(handlers)
         self.work_dir = Path(work_dir).resolve() if work_dir is not None else None
         self.cpu_seconds = cpu_seconds
         self.memory_bytes = memory_bytes
+        if max_stdout_bytes <= 0:
+            raise ValueError("输出大小限制必须为正数")
+        self.max_stdout_bytes = max_stdout_bytes
 
     async def execute(self, job: ComputeTask) -> ComputeResult:
         if job.timeout_s <= 0:
@@ -152,10 +167,13 @@ class LocalProcessComputeExecutor:
         if handler is None or "<locals>" in handler.__qualname__:
             return ComputeResult("failed", error="unsupported_kind")
         package = job.package_bytes if job.package_bytes is not None else _package(job.files)
+        if len(package) > MAX_PACKAGE_BYTES:
+            raise ValueError("任务压缩包超过大小限制")
         if self.work_dir is not None:
             self.work_dir.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix="finh-compute-", dir=self.work_dir))
         child = None
+        tree = None
         try:
             archive = temporary / "input.zip"
             archive.write_bytes(package)
@@ -163,28 +181,49 @@ class LocalProcessComputeExecutor:
             env = _minimal_env(handler)
             child = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "finharness.compute.child", str(archive),
-                f"{handler.__module__}:{handler.__qualname__}", job.kind,
+                f"{handler.__module__}:{handler.__qualname__}", job.kind, str(temporary),
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 env=env, preexec_fn=preexec,
+                start_new_session=os.name != "nt",
             )
-            try:
-                stdout, _ = await asyncio.wait_for(child.communicate(), timeout=job.timeout_s)
-            except TimeoutError:
-                child.kill()
+            tree = ProcessTree(child.pid)
+            child.stdin.write(b"1")
+            await child.stdin.drain()
+            child.stdin.close()
+
+            async def read_result() -> bytes:
+                output = bytearray()
+                while chunk := await child.stdout.read(min(65536, self.max_stdout_bytes + 1 - len(output))):
+                    output.extend(chunk)
+                    if len(output) > self.max_stdout_bytes:
+                        raise OverflowError("output_limit")
                 await child.wait()
+                return bytes(output)
+
+            try:
+                stdout = await asyncio.wait_for(read_result(), timeout=job.timeout_s)
+            except TimeoutError:
                 return ComputeResult("failed", error="timeout")
+            except OverflowError:
+                return ComputeResult("failed", error="output_limit")
             if child.returncode != 0:
                 return ComputeResult("failed", error="child_failed")
             try:
                 return _result(json.loads(stdout), job_id=None)
             except (ValueError, json.JSONDecodeError):
                 return ComputeResult("failed", error="invalid_result")
-        except asyncio.CancelledError:
-            if child is not None and child.returncode is None:
-                child.kill()
-                await child.wait()
-            raise
         finally:
+            if tree is not None:
+                tree.terminate()
+            elif child is not None and child.returncode is None:
+                child.kill()
+            if child is not None:
+                # 输出超限可能暂停 StreamReader；终止后只排空有界管道缓冲，
+                # 否则 asyncio 的进程退出通知会一直等待管道关闭。
+                while await child.stdout.read(65536):
+                    pass
+                await child.wait()
             shutil.rmtree(temporary, ignore_errors=True)
 
 

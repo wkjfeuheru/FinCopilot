@@ -1,4 +1,20 @@
 from finharness.compute.queue import ComputeJobStore, QueueFullError
+import pytest
+
+
+@pytest.mark.parametrize("finish", ["succeed", "fail"])
+def test_expired_running_lease_rejects_late_finish(tmp_path, monkeypatch, finish):
+    clock = [100.0]
+    monkeypatch.setattr("finharness.compute.queue.time.time", lambda: clock[0])
+    store = ComputeJobStore(tmp_path / "jobs.db")
+    job = store.enqueue(user_id="u", conversation_id="c", kind="x", payload_path="x.zip")
+    store.lease_next(worker_id="w", lease_seconds=10)
+    store.mark_running(job.job_id, worker_id="w", lease_seconds=10)
+    clock[0] = 110.0
+    kwargs = {"result_json": "{}"} if finish == "succeed" else {"error": "late"}
+    with pytest.raises(ValueError):
+        getattr(store, finish)(job.job_id, worker_id="w", **kwargs)
+    assert store.get(job.job_id, user_id="u").status == "running"
 
 
 def test_queue_leases_jobs_round_robin_across_users(tmp_path):

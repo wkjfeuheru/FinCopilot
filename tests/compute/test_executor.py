@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import zipfile
+import io
+from pathlib import Path
 
 import pytest
 
@@ -13,8 +15,89 @@ from finharness.compute.executor import (
 from finharness.compute.queue import ComputeJobStore
 
 
+def child_noisy(_job, _input_dir):
+    import sys
+    sys.stdout.write("x" * (2 * 1024 * 1024))
+    return {"metadata": {}}
+
+
+def child_descendant(_job, input_dir):
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+    marker = (input_dir / "marker.txt").read_text()
+    code = "import time; from pathlib import Path; time.sleep(6); Path(" + repr(marker) + ").write_text('alive')"
+    subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    Path(marker + ".ready").write_text("ready")
+    time.sleep(20)
+    return {}
+
+
+@pytest.mark.asyncio
+async def test_local_stdout_has_bounded_size(tmp_path):
+    executor = LocalProcessComputeExecutor(handlers={"noisy": child_noisy}, work_dir=tmp_path)
+    executor.max_stdout_bytes = 1024
+    result = await executor.execute(_task("noisy"))
+    assert result.error == "output_limit"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.asyncio
+async def test_local_timeout_or_cancel_kills_descendants(tmp_path, cancel):
+    marker = tmp_path / "descendant.txt"
+    executor = LocalProcessComputeExecutor(handlers={"tree": child_descendant}, work_dir=tmp_path / "work")
+    task = ComputeTask("u", "c", "tree", {"marker.txt": str(marker).encode()}, timeout_s=4)
+    pending = asyncio.create_task(executor.execute(task))
+    for _ in range(500):
+        if marker.with_suffix(".txt.ready").exists():
+            break
+        await asyncio.sleep(0.01)
+    assert marker.with_suffix(".txt.ready").exists(), (pending.result() if pending.done() else "handler must start")
+    if cancel:
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    else:
+        assert (await pending).error == "timeout"
+    await asyncio.sleep(6.2)
+    assert not marker.exists(), "后代进程在任务终止后仍在运行"
+
+
+@pytest.mark.asyncio
+async def test_local_rejects_oversized_compressed_package_before_spawning(tmp_path):
+    executor = LocalProcessComputeExecutor(handlers={"pid": child_pid}, work_dir=tmp_path)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("request.json", b"{}")
+    package = archive.getvalue() + b"x" * (16 * 1024 * 1024)
+    with pytest.raises(ValueError, match="大小|体积"):
+        await executor.execute(ComputeTask("u", "c", "pid", {}, package_bytes=package))
+
+
+def test_package_builder_rejects_compressed_size_over_limit():
+    from finharness.compute.executor import _package
+    with pytest.raises(ValueError, match="大小|体积"):
+        _package({"input.bin": os.urandom(16 * 1024 * 1024)})
+
+
 def child_pid(_job, _input_dir):
     return {"metadata": {"pid": os.getpid()}, "blobs": {}}
+
+
+def child_input_path(_job, input_dir):
+    return {"metadata": {"input_path": str(input_dir)}, "blobs": {}}
+
+
+@pytest.mark.asyncio
+async def test_extracted_inputs_stay_in_parent_owned_cleanup_directory(tmp_path):
+    executor = LocalProcessComputeExecutor(handlers={"path": child_input_path}, work_dir=tmp_path)
+    result = await executor.execute(_task("path", timeout_s=5))
+    assert result.status == "succeeded"
+    path = Path(result.metadata["input_path"])
+    assert path.is_relative_to(tmp_path)
+    assert not path.exists()
 
 
 def child_sleep(_job, _input_dir):

@@ -34,6 +34,8 @@ class TaskPackageError(ValueError):
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SAFE_JOB_ID = re.compile(r"^(?:job_)?[a-f0-9]{32}$")
+MAX_PACKAGE_BYTES = 16 * 1024 * 1024
+MAX_PACKAGE_FILES = 64
 
 
 class TaskSigner:
@@ -113,12 +115,14 @@ def extract_task_package(
     archive: str | Path,
     target_dir: str | Path,
     *,
-    max_files: int = 64,
-    max_uncompressed_bytes: int = 16 * 1024 * 1024,
+    max_files: int = MAX_PACKAGE_FILES,
+    max_uncompressed_bytes: int = MAX_PACKAGE_BYTES,
 ) -> list[Path]:
     """安全解包受限 ZIP；拒绝链接、路径逃逸及压缩炸弹。"""
     if max_files <= 0 or max_uncompressed_bytes <= 0:
         raise ValueError("任务包限制必须为正数")
+    if Path(archive).stat().st_size > MAX_PACKAGE_BYTES:
+        raise TaskPackageError("任务压缩包体积超过限制")
     destination = Path(target_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     _chmod_private(destination)
