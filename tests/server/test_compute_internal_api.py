@@ -110,6 +110,34 @@ async def test_session_dispatch_uses_settings_package_path_and_session_identity(
     assert (await pending).metadata == {"ok": True}
 
 
+@pytest.mark.asyncio
+async def test_loop_receives_a_session_bound_compute_channel(tmp_path, monkeypatch):
+    """隔离通道必须在建会话时注入 loop，且身份是会话的 user/conversation。"""
+    app = _app(tmp_path, monkeypatch)
+    loop = app.state.session_registry.loop_factory("s_1", "c_1", "u_1")
+
+    assert loop.compute is not None
+    assert loop.compute.user_id == "u_1"
+    assert loop.compute.conversation_id == "c_1"
+
+
+@pytest.mark.asyncio
+async def test_no_compute_channel_without_a_configured_worker(tmp_path, monkeypatch):
+    """未配 worker 的本地模式不得启用隔离通道——否则 docx 会被拖到超时。"""
+    settings = Settings(
+        paths={
+            "output_dir": tmp_path / "output",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
+        },
+    )
+    app = create_app(settings=settings)
+
+    assert app.state.compute_executor is None
+    loop = app.state.session_registry.loop_factory("s_1", "c_1", "u_1")
+    assert loop.compute is None
+
+
 def _app(tmp_path, monkeypatch):
     monkeypatch.setenv("FINH_COMPUTE_HMAC_SECRET", "test-secret-at-least-16-bytes")
     settings = Settings(
@@ -120,6 +148,8 @@ def _app(tmp_path, monkeypatch):
             "compute_jobs_db": tmp_path / "state" / "compute_jobs.db",
             "compute_packages_dir": tmp_path / "state" / "compute_packages",
         },
+        # 配了远程 worker 地址，隔离计算通道才启用（未配置则工具进程内执行）。
+        compute={"remote_worker_url": "http://worker.internal:8080"},
     )
     return create_app(settings=settings)
 

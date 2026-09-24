@@ -157,7 +157,7 @@ async def test_local_executor_cancellation_kills_child_and_cleans_package(tmp_pa
 async def test_remote_executor_writes_only_to_package_root_and_waits_without_blocking(tmp_path):
     root = tmp_path / "state" / "packages"
     store = ComputeJobStore(tmp_path / "state" / "jobs.db")
-    executor = RemoteComputeExecutor(store=store, packages_dir=root, poll_interval_s=0.01)
+    executor = RemoteComputeExecutor(store=store, packages_dir=root, output_dir=tmp_path / "output", poll_interval_s=0.01)
     pending = asyncio.create_task(executor.execute(_task()))
     await asyncio.sleep(0.05)
     assert not pending.done()
@@ -176,6 +176,10 @@ async def test_remote_executor_writes_only_to_package_root_and_waits_without_blo
     assert result.status == "succeeded"
     assert result.metadata == {"ok": True}
     assert result.blobs == ("a.txt",)
+    # 产物由主服务按 (user, conversation, job) 落盘；executor 只负责还原路径，
+    # 不信任 worker 自报的任何路径。
+    expected = tmp_path / "output" / "u_1" / "c_1" / leased.job_id / "a.txt"
+    assert result.artifact_paths == (str(expected),)
     assert not packages[0].exists()
 
 
@@ -183,7 +187,7 @@ async def test_remote_executor_writes_only_to_package_root_and_waits_without_blo
 async def test_remote_executor_cancellation_updates_queue_and_cleans_package(tmp_path):
     root = tmp_path / "packages"
     store = ComputeJobStore(tmp_path / "jobs.db")
-    executor = RemoteComputeExecutor(store=store, packages_dir=root, poll_interval_s=0.01)
+    executor = RemoteComputeExecutor(store=store, packages_dir=root, output_dir=tmp_path / "output", poll_interval_s=0.01)
     pending = asyncio.create_task(executor.execute(_task()))
     await asyncio.sleep(0.05)
     pending.cancel()

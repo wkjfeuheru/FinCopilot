@@ -45,6 +45,10 @@ class ComputeResult:
     error: str | None = None
     job_id: str | None = None
     blob_data: Mapping[str, str] = field(default_factory=dict)
+    # 远程任务的产物已由主服务落盘，这里给的是它们的**完整路径**（本地产物
+    # 经 blob_data 回传，调用方自行决定写到哪里）。两者互斥：远程有路径、
+    # 本地有内容，消费方按哪个非空就取哪个，不必判断部署形态。
+    artifact_paths: tuple[str, ...] = ()
 
 
 class ComputeExecutor(Protocol):
@@ -91,10 +95,23 @@ class RemoteComputeExecutor:
     """主服务适配器：生成任务包、排队、异步轮询并清理输入。"""
 
     def __init__(self, *, store: ComputeJobStore, packages_dir: str | Path,
-                 poll_interval_s: float = 0.1) -> None:
+                 output_dir: str | Path, poll_interval_s: float = 0.1) -> None:
         self.store = store
         self.packages_dir = Path(packages_dir).resolve()
+        # 产物落点由主服务在 finish 时按 (user, conversation, job) 派生
+        # （见 server/api.py 的 allocate_artifact_dir）。这里保留输出根，才能在
+        # 任务成功后把 blob 名还原成调用方可直接使用的路径。
+        self.output_dir = Path(output_dir).resolve()
         self.poll_interval_s = max(poll_interval_s, 0.001)
+
+    def _artifact_paths(self, job: ComputeTask, job_id: str, names: tuple[str, ...]) -> tuple[str, ...]:
+        """把 finish 回传的 blob 名还原为产物路径，不信任任何来自 worker 的路径。
+
+        目录布局与主服务 finish 处的 ``allocate_artifact_dir`` 一致；此处只做
+        拼接（那份目录已由主服务创建），不重复创建、也不做校验以外的动作。
+        """
+        root = self.output_dir / job.user_id / job.conversation_id / job_id
+        return tuple(str(root / name) for name in names)
 
     def cleanup_terminal_packages(self) -> None:
         for job in self.store.recover_and_list_terminal():
@@ -131,7 +148,10 @@ class RemoteComputeExecutor:
                             raise ValueError("远程结果非法")
                     except (json.JSONDecodeError, AttributeError, ValueError):
                         return ComputeResult("failed", error="invalid_result", job_id=queued.job_id)
-                    return ComputeResult("succeeded", metadata, tuple(artifacts), job_id=queued.job_id)
+                    return ComputeResult(
+                        "succeeded", metadata, tuple(artifacts), job_id=queued.job_id,
+                        artifact_paths=self._artifact_paths(job, queued.job_id, tuple(artifacts)),
+                    )
                 if current.status in {"failed", "cancelled"}:
                     return ComputeResult(current.status, error=current.error, job_id=queued.job_id)
                 if asyncio.get_running_loop().time() >= deadline:

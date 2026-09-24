@@ -17,6 +17,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
+import re
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
@@ -30,6 +35,11 @@ from finharness.tools.fin.report_pipeline import (
     ReportSection,
     ReportValidationError,
 )
+
+# docx 导出经隔离 worker 执行时的预算。报告渲染含图片嵌入，取与工具
+# 声明一致的量级；worker 侧还会被队列租约与进程时限二次约束。
+DOCX_COMPUTE_TIMEOUT_S = 300.0
+
 
 
 class SectionInput(BaseModel):
@@ -60,6 +70,9 @@ class SectionInput(BaseModel):
     timeout=300,
     output_schema_note="产出 output/<topic>_<YYYYMMDD>.md 与 .docx，并附风险终审意见。",
     needs_coordinator=True,
+    # docx 导出可交给隔离计算 worker（见 03.15）：渲染报告要嵌入图表、写二进制
+    # 文档，是当前唯一值得离开主进程的重活。无 worker（本地/CLI）时回退进程内。
+    needs_compute=True,
 )
 class WriteReportTool(BaseTool):
     @param("topic", desc="报告主题，用于文件命名")
@@ -102,9 +115,20 @@ class WriteReportTool(BaseTool):
         try:
             # 落盘 markdown 与 docx 导出（可能起 pandoc 子进程）都是阻塞调用，
             # 放进线程后 300s 的工具超时才真正生效，且渲染期间不占住事件循环。
-            artifact = await asyncio.to_thread(
-                pipeline.export, outline, formats=tuple(formats or ("md", "docx"))
-            )
+            requested = tuple(formats or ("md", "docx"))
+            if self.compute is not None and "docx" in requested:
+                # 隔离路径：markdown 仍写在本用户的 output 目录（纯文本、无外部
+                # 输入），只有 docx 渲染进 worker——它要嵌入图表、写二进制文档。
+                artifact = await asyncio.to_thread(pipeline.export, outline, formats=("md",))
+                docx_path, docx_error = await self._export_docx_isolated(
+                    outline=outline, markdown_path=artifact.markdown_path
+                )
+                artifact.docx_path = docx_path
+                if docx_error:
+                    artifact.docx_error = docx_error
+                    artifact.warnings.append(f"docx 导出失败，已保留 markdown：{docx_error}")
+            else:
+                artifact = await asyncio.to_thread(pipeline.export, outline, formats=requested)
         except ReportValidationError as exc:
             # 精确、可操作的反馈，便于模型修正大纲。
             raise ValueError("报告校验未通过：" + "；".join(exc.problems)) from exc
@@ -144,3 +168,63 @@ class WriteReportTool(BaseTool):
     def render(self, raw: RawData) -> tuple[str, list[RawData]]:
         """报告结果会携带文件附件，供传输层使用。"""
         return (raw.text or "（报告生成失败）"), [raw]
+
+    async def _export_docx_isolated(
+        self, *, outline: ReportOutline, markdown_path: str
+    ) -> tuple[str | None, str | None]:
+        """把 docx 渲染交给隔离 worker，返回 (产物路径, 错误信息)。
+
+        图表是**本地文件**，worker 容器不挂载 output 目录，因此必须把它们的字节
+        随任务包一起送过去，并把 markdown 里的图片引用改写成包内文件名——否则
+        隔离导出会把图表静默降级成"图片缺失"，而进程内导出不会。
+        """
+        path = Path(markdown_path)
+        markdown, images = _package_chart_images(path.read_text(encoding="utf-8"))
+        files: dict[str, bytes] = {
+            "request.json": json.dumps(
+                {"markdown": markdown, "topic": outline.topic}, ensure_ascii=False
+            ).encode("utf-8")
+        }
+        files.update(images)
+        result = await self.compute.execute(
+            kind="docx_export", files=files, timeout_s=DOCX_COMPUTE_TIMEOUT_S
+        )
+        if result.status != "succeeded":
+            return None, result.error or "计算任务失败"
+        # 远程 worker：产物已由主服务落盘到本任务的 output 目录，直接用其路径。
+        for produced in result.artifact_paths:
+            if produced.endswith(".docx") and Path(produced).is_file():
+                return produced, None
+        # 本地 executor：产物经 blob_data 回传，写到 markdown 旁边。
+        encoded = (result.blob_data or {}).get("report.docx")
+        if not encoded:
+            return None, "worker 未返回 report.docx"
+        target = path.with_suffix(".docx")
+        target.write_bytes(base64.b64decode(encoded))
+        return str(target), None
+
+
+_IMAGE_REF_RE = re.compile(r"!\[(.*?)\]\((.+?)\)")
+
+
+def _package_chart_images(markdown: str) -> tuple[str, dict[str, bytes]]:
+    """把 markdown 引用的本地图片收进任务包，并把引用改写为包内文件名。
+
+    文件名取内容哈希，使同一张图在多次调用间稳定、且不同图不撞名；找不到的
+    图片保持原样，交由导出器按既有规则降级为"图片缺失"提示。
+    """
+    packaged: dict[str, bytes] = {}
+
+    def replace(match: "re.Match[str]") -> str:
+        alt, raw_target = match.group(1), match.group(2).strip()
+        wrapped = raw_target.startswith("<") and raw_target.endswith(">")
+        inner = raw_target[1:-1].replace("\\>", ">") if wrapped else raw_target
+        candidate = Path(inner)
+        if not candidate.is_file():
+            return match.group(0)
+        data = candidate.read_bytes()
+        name = f"img_{hashlib.sha256(data).hexdigest()[:16]}{candidate.suffix}"
+        packaged[name] = data
+        return f"![{alt}](<{name}>)"
+
+    return _IMAGE_REF_RE.sub(replace, markdown), packaged

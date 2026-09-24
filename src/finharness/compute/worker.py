@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import socket
 import tempfile
 import time
@@ -25,6 +26,9 @@ from finharness.compute.executor import ComputeTask, LocalProcessComputeExecutor
 
 
 TaskHandler = Callable[[Mapping[str, Any], Path], dict[str, Any]]
+
+# 与 docx_export 同源的图片语法；这里只负责把包内文件名解析成绝对路径。
+_IMAGE_REF = re.compile(r"(!\[.*?\]\()(<[^>]+>|[^)\s]+)(\))")
 
 
 class _LeaseLost(RuntimeError):
@@ -43,9 +47,26 @@ def _docx_export_handler(_job: Mapping[str, Any], input_dir: Path) -> dict[str, 
         raise TaskPackageError("docx 任务输入非法或超过大小限制")
     from finharness.tools.fin.docx_export import export_markdown_to_docx
 
+    # 图表随任务包一起送达（worker 不挂载 output 目录），此处把它们解析到
+    # 解包目录内的绝对路径——导出器按相对路径会以 CWD 为基准而找不到文件。
     output = input_dir.parent / "report.docx"
-    export_markdown_to_docx(markdown, out_path=output, topic=topic)
+    export_markdown_to_docx(_absolutize_images(markdown, input_dir), out_path=output, topic=topic)
     return {"blobs": {"report.docx": base64.b64encode(output.read_bytes()).decode("ascii")}}
+
+
+def _absolutize_images(markdown: str, input_dir: Path) -> str:
+    """把引用包内文件的图片目标改写为绝对路径；其余引用原样保留。"""
+
+    def replace(match: "re.Match[str]") -> str:
+        prefix, target, suffix = match.group(1), match.group(2), match.group(3)
+        wrapped = target.startswith("<") and target.endswith(">")
+        inner = target[1:-1].replace("\\>", ">") if wrapped else target
+        candidate = input_dir / inner
+        if candidate.is_file():
+            return f"{prefix}{candidate}{suffix}"
+        return match.group(0)
+
+    return _IMAGE_REF.sub(replace, markdown)
 
 
 class WorkerClient:

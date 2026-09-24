@@ -56,7 +56,7 @@ from finharness.server.distill_sweeper import (
     start_distill_sweeper,
     stop_distill_sweeper,
 )
-from finharness.server.sessions import SessionBusyError, SessionRegistry
+from finharness.server.sessions import SessionBusyError, SessionCompute, SessionRegistry
 from finharness.server.sse import HEARTBEAT_S, encode_comment, encode_event
 from finharness.tools.registry import ALL_TOOL_CLASSES, ToolRegistry
 from finharness.types import StopSignal
@@ -288,14 +288,25 @@ def create_app(
         max_waiting_per_user=int(settings.compute.max_waiting_per_user),
         max_attempts=int(settings.compute.max_attempts),
     )
-    application.state.compute_executor = RemoteComputeExecutor(
-        store=application.state.compute_jobs, packages_dir=settings.paths.compute_packages_dir,
+    # 只有配了远程 worker 地址才启用隔离计算通道（远程模式强制要求该地址，
+    # 见 settings.validate）。否则把工具的重活外包给一个不存在的 worker，只会
+    # 在本地单机/开发时把每次 docx 导出拖到超时——未配置即回退进程内执行。
+    application.state.compute_executor = (
+        RemoteComputeExecutor(
+            store=application.state.compute_jobs, packages_dir=settings.paths.compute_packages_dir,
+            output_dir=settings.paths.output_dir,
+        )
+        if settings.compute.remote_worker_url
+        else None
     )
 
     async def _compute_cleanup_worker() -> None:
+        executor = application.state.compute_executor
+        if executor is None:
+            return
         while True:
             with contextlib.suppress(Exception):
-                await asyncio.to_thread(application.state.compute_executor.cleanup_terminal_packages)
+                await asyncio.to_thread(executor.cleanup_terminal_packages)
             await asyncio.sleep(30)
     compute_secret = os.getenv(settings.compute.hmac_secret_env)
     application.state.compute_signer = (
@@ -389,7 +400,9 @@ def create_app(
         job = application.state.compute_jobs.lease_next(
             worker_id=payload.worker_id, lease_seconds=float(settings.compute.lease_seconds)
         )
-        application.state.compute_executor.cleanup_terminal_packages()
+        executor = application.state.compute_executor
+        if executor is not None:
+            executor.cleanup_terminal_packages()
         return {"job": None} if job is None else _worker_job_payload(job)
 
     @application.post("/v1/internal/compute/running", include_in_schema=False)
@@ -762,6 +775,16 @@ def create_app(
             user_id=user_id,
             observer=observer,
             semantic_index=semantic_index,
+            # 会话绑定的隔离计算通道（docs 03.15）：user/conversation 到此才
+            # 可知，工具不该自己拼；声明 needs_compute 的工具由循环注入。
+            # 未配远程 worker 时传 None（而非空壳通道），工具据此回退进程内。
+            compute=(
+                SessionCompute(
+                    application.state.compute_executor, user_id, conversation_id or "local"
+                )
+                if application.state.compute_executor is not None
+                else None
+            ),
         )
 
         async def _ask(

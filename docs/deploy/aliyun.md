@@ -1,7 +1,8 @@
 # 阿里云轻量应用服务器部署手册（香港节点，免备案）
 
-> 适用架构：Docker Compose 跑应用容器 + Caddy 自动 TLS。单服务、单副本、
-> 单 worker（与 Railway 方案同一约束：状态是进程内 SQLite，不可横向扩容）。
+> 适用架构：Docker Compose 跑应用容器（uvicorn 单 worker）+ 隔离计算 worker + Caddy 自动 TLS。
+> 应用仍是单副本（与 Railway 方案同一约束：状态是进程内 SQLite，不可横向扩容）；
+> 计算 worker 是**无状态**的，可在 `compute` 内网横向扩容，且不挂载 `/data`、不持 Provider 密钥。
 > 相关交付物：`Dockerfile`、`ops/docker-entrypoint.sh`、`deploy/docker-compose.yml`、
 > `deploy/Caddyfile`、`deploy/.env.example`。
 
@@ -60,7 +61,7 @@ docker compose -f deploy/docker-compose.yml up -d --build
 首次构建约 5–10 分钟（93 个 Python 依赖 + 前端构建）。完成后验证：
 
 ```bash
-docker compose -f deploy/docker-compose.yml ps        # 两个容器 Up (healthy)
+docker compose -f deploy/docker-compose.yml ps        # 三个容器 Up（app 状态 healthy）
 curl -s http://127.0.0.1:8000/v1/ready                # {"status":"ready"}（经 docker exec 测试）
 curl -s https://$DOMAIN/v1/ready                      # 公网 HTTPS 验证；Caddy 首次签证书需 ~1 分钟
 ```
