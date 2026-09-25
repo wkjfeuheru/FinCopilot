@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readEventStream, stopChat } from "./client";
+import { readEventStream, stopChat, streamChat } from "./client";
 import type { ChatEvent } from "./client";
 
 /** 把若干字节片段拼成一个可读的 SSE 响应体。 */
@@ -167,3 +167,55 @@ describe("stopChat", () => {
     await expect(stopChat("c_1", null)).rejects.toThrow("boom");
   });
 });
+
+describe("streamChat", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubStreamFetch(): ReturnType<typeof vi.fn> {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: done\ndata: {"succeeded": true}\n\n'));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body,
+      text: async () => "",
+    })) as unknown as ReturnType<typeof vi.fn>;
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  it("serializes resume=true in the request body", async () => {
+    const fetchMock = stubStreamFetch();
+
+    await streamChat("", "c_1", () => undefined, new AbortController().signal, true);
+
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/v1/chat/stream");
+    expect(JSON.parse(String(init.body))).toEqual({
+      message: "",
+      conversation_id: "c_1",
+      resume: true,
+    });
+  });
+
+  it("always includes resume=false for a normal send", async () => {
+    const fetchMock = stubStreamFetch();
+
+    await streamChat("hello", "c_1", () => undefined, new AbortController().signal);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({
+      message: "hello",
+      conversation_id: "c_1",
+      resume: false,
+    });
+  });
+});
+

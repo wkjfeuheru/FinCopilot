@@ -75,4 +75,44 @@ describe("traceFromStoredTurn", () => {
 
     expect(trace.status).toBe("error");
   });
+
+  it("derives high-level phase from the last state event while keeping done metrics", () => {
+    // done 仍提供指标；高阶 phase 以最后一条 state 为准（此处覆盖 done 的 stopped）。
+    const trace = traceFromStoredTurn(
+      turn([
+        {
+          event: "tool_status",
+          data: { call_id: "call_1", name: "get_quotes", status: "started" },
+        },
+        {
+          event: "done",
+          data: {
+            succeeded: false,
+            reason: "user_stopped",
+            usage: { input_tokens: 10, output_tokens: 5 },
+            tool_calls: 1,
+            tool_duration_ms: 100,
+          },
+        },
+        {
+          event: "state",
+          data: {
+            run_id: "r1",
+            revision: 2,
+            phase: "error",
+            turn: 1,
+            calls: [],
+            error: { kind: "provider", message: "模型调用失败" },
+          },
+        },
+      ]),
+    );
+
+    expect(trace.status).toBe("error");
+    expect(trace.metrics?.totalTokens).toBe(15);
+    expect(trace.metrics?.toolDurationMs).toBe(100);
+    const pending = trace.steps.find((step) => step.key === "call_1");
+    expect(pending?.status).toBe("stopped");
+  });
 });
+

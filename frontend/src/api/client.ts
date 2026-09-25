@@ -31,7 +31,10 @@ export type HistoryMessage = {
 export type ResumableTurn = {
   reason: string;
   rounds: number;
-  plan: Record<string, unknown> | null;
+  /** Legacy checkpoint plan; FSM history may omit this. */
+  plan?: Record<string, unknown> | null;
+  /** FSM public_state_view when a snapshot is resumable. */
+  state?: Record<string, unknown> | null;
   updated_at: string;
 };
 
@@ -114,13 +117,16 @@ export async function streamChat(
   conversationId: string | null,
   onEvent: (event: ChatEvent) => void,
   signal: AbortSignal,
+  resume = false,
 ): Promise<void> {
   const response = await authedFetch("/v1/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     // conversation_id 是持久化的凭据：发送它即可恢复一个
     // 执行会话已过期的对话。
-    body: JSON.stringify({ message, conversation_id: conversationId }),
+    // resume=true 仅由"继续研究"发出：显式恢复可续做的 FSM/断点，
+    // 普通新消息必须带 resume=false，避免隐式 recovery。
+    body: JSON.stringify({ message, conversation_id: conversationId, resume }),
     signal,
   });
   if (!response.ok) {

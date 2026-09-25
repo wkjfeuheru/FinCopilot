@@ -1,5 +1,11 @@
 import { useState } from "react";
 import type { StoredTurn } from "../api/client";
+import {
+  asPublicAgentState,
+  presentAgentPhase,
+  reduceAgentState,
+  type PublicAgentState,
+} from "../lib/agentState";
 import { planFromEvent, presentToolAction, presentToolProgress } from "../lib/researchPresentation";
 import type { ResearchPlan } from "../lib/researchPresentation";
 import { ResearchPlanLedger } from "./ResearchPlanLedger";
@@ -70,6 +76,7 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
   ];
   let plan: ResearchPlan | undefined;
   let metrics: TurnMetrics | undefined;
+  let publicState: PublicAgentState | null = null;
 
   const upsert = (next: AgentStep) => {
     steps = steps.some((step) => step.key === next.key)
@@ -79,6 +86,10 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
 
   for (const event of turn.events ?? []) {
     const data = event.data ?? {};
+    if (event.event === "state") {
+      const incoming = asPublicAgentState(data);
+      if (incoming) publicState = reduceAgentState(publicState, incoming);
+    }
     if (event.event === "tool_status") {
       const name = String(data.name ?? "tool");
       const callId = String(data.call_id ?? name);
@@ -215,6 +226,11 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
       };
       plan = planFromEvent((data.plan as Record<string, unknown> | undefined) ?? {}) ?? plan;
     }
+  }
+
+  // 高阶 phase 以最后一条有效 state 为准；done 仍负责指标与步骤细节。
+  if (publicState !== null) {
+    status = presentAgentPhase(publicState).status;
   }
 
   return { planned: planned || Boolean(plan), status, steps, plan, metrics };
