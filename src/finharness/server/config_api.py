@@ -201,7 +201,8 @@ def create_config_router(
         if payload.kind != "fake" and not _effective_secret(store(), payload, config_id=None):
             raise HTTPException(status_code=422, detail={"errors": [_missing_secret_error()]})
         try:
-            record = store().create(
+            record = await asyncio.to_thread(
+                store().create,
                 name=payload.name.strip(),
                 kind=payload.kind,
                 base_url=payload.base_url,
@@ -235,7 +236,8 @@ def create_config_router(
         ):
             raise HTTPException(status_code=422, detail={"errors": [_missing_secret_error()]})
         try:
-            record = store().update(
+            record = await asyncio.to_thread(
+                store().update,
                 config_id,
                 name=payload.name.strip(),
                 kind=payload.kind,
@@ -269,7 +271,7 @@ def create_config_router(
                 detail={"errors": [{"field": "base_url", "message": url_error}]},
             )
         try:
-            record = store().activate(config_id, user_id=user_id)
+            record = await asyncio.to_thread(store().activate, config_id, user_id=user_id)
         except ConfigNotFound as exc:
             raise HTTPException(status_code=404, detail="配置不存在") from exc
         if resolver is not None:
@@ -283,7 +285,7 @@ def create_config_router(
         """删除指定配置；拒绝删除当前激活项。"""
         user_id = user.id if user is not None else ""
         try:
-            store().delete(config_id, user_id=user_id)
+            await asyncio.to_thread(store().delete, config_id, user_id=user_id)
         except ConfigNotFound as exc:
             raise HTTPException(status_code=404, detail="配置不存在") from exc
         except ActiveConfigDeleteError as exc:

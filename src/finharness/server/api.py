@@ -47,7 +47,7 @@ from finharness.hooks.audit import AuditHook, AuditLogWriter, summarize_args
 from finharness.hooks.base import HookChain
 from finharness.observability import build_observer, get_logger, setup_logging
 from finharness.observability.usage_store import UsageStore
-from finharness.permissions.gate import EGRESS_CATEGORY, PermissionGate
+from finharness.permissions.gate import EGRESS_CATEGORY, WRITE_CATEGORY, PermissionGate
 from finharness.provider.resolver import NotConfigured, ProviderResolver
 from finharness.server.admin_api import create_admin_router
 from finharness.server.auth_api import create_auth_router
@@ -233,7 +233,7 @@ def create_app(
         while True:
             await asyncio.sleep(3600.0)
             with contextlib.suppress(Exception):
-                trace_store.cleanup(trace_cfg.retention_days)  # type: ignore[union-attr]
+                await asyncio.to_thread(trace_store.cleanup, trace_cfg.retention_days)  # type: ignore[union-attr]
     settings = settings or Settings.from_file()
 
     # 日志在任何组件之前配置，使启动期的日志本身就带上下文字段。
@@ -578,12 +578,23 @@ def create_app(
             confirmed = set()
             confirmed_categories[conversation_id or "local"] = confirmed
 
+        # 会话级"始终允许此类操作"：loop_factory 每个执行会话只被调用一次，
+        # 因此这份集合天然随会话生灭——新建会话、或会话被 TTL 淘汰后重建，
+        # 都会拿到一份空集，"始终允许"不会越过会话边界（与对话级的
+        # confirmed_categories 不同，后者在会话重建后仍有效）。
+        session_approved: set[str] = set()
+
         async def _confirm_write(name: str, args: dict) -> bool:
             answer = await _ask(
                 "confirm",
                 f"工具 {name} 将执行，入参：{summarize_args(args)}",
-                ["y", "n"],
+                # 第三个选项是会话级"始终允许"：反复重试同一写操作时，用户
+                # 不必每次确认。它只在本次执行会话内有效（见 session_approved）。
+                ["y", "y_session", "n"],
             )
+            if answer == "y_session":
+                session_approved.add(WRITE_CATEGORY)
+                return True
             return answer == "y"
 
         async def _confirm_egress(name: str, args: dict) -> bool:
@@ -607,6 +618,7 @@ def create_app(
             conversation_id=conversation_id or "local",
             confirmed_categories=confirmed,
             confirm_egress=_confirm_egress,
+            session_approved=session_approved,
         )
         loop = AgentLoop(
             provider=selected,
@@ -986,7 +998,8 @@ def create_app(
     ) -> dict:
         """编辑一条跨对话情节（治理：用户发现记忆有误或表述不当）。"""
         try:
-            updated = memory_store.update_ltm_episode(
+            updated = await asyncio.to_thread(
+                memory_store.update_ltm_episode,
                 ep_uid,
                 user_id=user.id,
                 kind=body.kind,
@@ -1016,7 +1029,8 @@ def create_app(
         ep_uid: str, user: CurrentUser = Depends(require_user)
     ) -> dict:
         """删除一条跨对话情节（治理：遗忘权）。"""
-        if not memory_store.delete_ltm_episode(ep_uid, user_id=user.id):
+        deleted = await asyncio.to_thread(memory_store.delete_ltm_episode, ep_uid, user_id=user.id)
+        if not deleted:
             raise HTTPException(status_code=404, detail="记忆条目不存在")
         return {"ok": True, "ep_uid": ep_uid}
 
@@ -1035,7 +1049,8 @@ def create_app(
         ``(user_id, key)`` 的 UPSERT 语义保证只有一个版本的真相。
         """
         try:
-            updated = memory_store.update_ltm_fact(
+            updated = await asyncio.to_thread(
+                memory_store.update_ltm_fact,
                 fa_uid,
                 user_id=user.id,
                 statement=body.statement,
@@ -1069,7 +1084,7 @@ def create_app(
     ) -> dict:
         """删除一条语义记忆（治理：遗忘权）。"""
         fact = memory_store.get_ltm_fact(fa_uid, user_id=user.id)
-        if fact is None or not memory_store.delete_ltm_fact(fa_uid, user_id=user.id):
+        if fact is None or not await asyncio.to_thread(memory_store.delete_ltm_fact, fa_uid, user_id=user.id):
             raise HTTPException(status_code=404, detail="记忆条目不存在")
         # 同步清理向量库中的点，否则后续召回会命中一个已删除的 id。
         semantic_index.unindex_fact(fact, user_id=user.id)
@@ -1227,7 +1242,7 @@ def create_app(
             raise HTTPException(
                 status_code=409, detail="该对话正在处理中，请稍后再删除"
             )
-        memory_store.delete_conversation(conversation_id)
+        await asyncio.to_thread(memory_store.delete_conversation, conversation_id)
         conversation_citations.pop(conversation_id, None)
         # 会话级状态无需在这里清理：它挂在 session/loop 上，随注册表淘汰回收。
         for session_id, session in list(registry.sessions.items()):
@@ -1365,7 +1380,8 @@ def create_app(
         # 非文本事件、轮次轨迹与终态都落库。失败只降级（TraceStore 吞错）。
         trace_run_started = trace_store is not None
         if trace_store is not None:
-            trace_store.start_run(
+            await asyncio.to_thread(
+                trace_store.start_run,
                 run_id=run_id,
                 source="server",
                 user_id=user.id,
@@ -1446,7 +1462,7 @@ def create_app(
                         return None
                 return None
 
-            def finish_trace(status: str, reason: str | None = None) -> None:
+            async def finish_trace(status: str, reason: str | None = None) -> None:
                 """把本次运行的终态与轮次轨迹落库（未启用时为 no-op）。
 
                 覆盖四条收尾路径：done 事件、引擎异常、用户停止/断连、以及
@@ -1456,7 +1472,8 @@ def create_app(
 
                 用量账本在 trace **之前**落一行：它是计费口径，与 trace 开关
                 解耦——监控关闭时 token/轮次照记不误。落账失败由 UsageStore
-                吞掉（旁路纪律），绝不影响收尾。
+                吞掉（旁路纪律），绝不影响收尾。写入在工作线程执行，避免占用
+                事件循环做磁盘 I/O。
                 """
                 outcome = None
                 if task.done() and not task.cancelled():
@@ -1482,7 +1499,8 @@ def create_app(
                         "cache_hit_tokens": getattr(u, "cache_hit_tokens", 0) or 0,
                     }
                 elapsed_ms = round((time.monotonic() - started) * 1000)
-                usage_store.record_turn(
+                await asyncio.to_thread(
+                    usage_store.record_turn,
                     user_id=user.id,
                     input_tokens=usage["input_tokens"],
                     output_tokens=usage["output_tokens"],
@@ -1493,7 +1511,8 @@ def create_app(
                 )
                 if trace_store is None or not trace_run_started:
                     return
-                trace_store.finish_run(
+                await asyncio.to_thread(
+                    trace_store.finish_run,
                     run_id,
                     status=status,
                     answer=str(getattr(outcome, "answer", "") or ""),
@@ -1507,12 +1526,12 @@ def create_app(
                     trace_rounds=list(getattr(outcome, "trace", []) or []) if outcome else None,
                 )
 
-            def terminal_frames() -> list[str]:
+            async def terminal_frames() -> list[str]:
                 """引擎未下发终止事件时的兜底帧，保证客户端一定收敛。"""
                 nonlocal terminal_sent
                 terminal_sent = True
                 failure = engine_failure()
-                finish_trace(
+                await finish_trace(
                     "error" if failure is not None else "done",
                     "engine_error" if failure is not None else "missing_terminal_event",
                 )
@@ -1586,7 +1605,7 @@ def create_app(
                         if task.done() and sink.queue.empty():
                             await settle_engine()
                             if not terminal_sent:
-                                for frame in terminal_frames():
+                                for frame in await terminal_frames():
                                     yield frame
                             break
                         # 记录心跳，使"引擎静默了多久"在日志里可见——旧实现下
@@ -1613,14 +1632,15 @@ def create_app(
                         # 先完成该刷写并附上重放记录；但这一步失败不得
                         # 累终止帧，否则答案已落库、界面却停在运行中。
                         await settle_engine()
-                        finish_trace(
+                        await finish_trace(
                             "stopped" if stop_signal.requested else "done",
                             str(data.get("reason") or "done"),
                         )
                         turn_metadata = sink.turn_metadata()
                         if turn_metadata is not None:
                             try:
-                                memory_store.attach_latest_answer_metadata(
+                                await asyncio.to_thread(
+                                    memory_store.attach_latest_answer_metadata,
                                     session.conversation_id,
                                     metadata={"turn": turn_metadata},
                                     after_seq=persisted_before,
@@ -1672,8 +1692,9 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
                 # 终态落库：用户停止（stop_signal 已置位）与传输掐断分开记账，
-                # 与下方日志的口径一致。
-                finish_trace(
+                # 与下方日志的口径一致。await 在此收尾路径上不会丢失写入：
+                # 上游取消只投递一次，to_thread 的任务会照常提交。
+                await finish_trace(
                     "stopped" if stop_signal.requested else "aborted",
                     "user_stop" if stop_signal.requested else "disconnected",
                 )
@@ -1694,9 +1715,9 @@ def create_app(
                 # 传输层自身的意外失败：至少给客户端一个终止事件，
                 # 而不是静默断流。落盘由引擎负责，这里只负责收尾。
                 log.exception("chat_stream_transport_failed")
-                finish_trace("error", "transport_failed")
+                await finish_trace("error", "transport_failed")
                 if not terminal_sent:
-                    for frame in terminal_frames():
+                    for frame in await terminal_frames():
                         yield frame
             finally:
                 # 停止信号属于本次请求：清掉它，避免下一次请求一开始就处于

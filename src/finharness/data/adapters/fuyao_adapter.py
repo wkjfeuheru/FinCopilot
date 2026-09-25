@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -39,6 +40,7 @@ from finharness.data.mapping import (
     FUYAO_DEFAULT_ADJUST,
     FUYAO_ENDPOINTS,
     FUYAO_FINANCIAL_LABELS,
+    FUYAO_INDEX_THSCODES,
     FUYAO_INDICATOR_LABELS,
     FUYAO_KLINE_PERIODS,
     FUYAO_MAX_WINDOW_YEARS,
@@ -46,6 +48,7 @@ from finharness.data.mapping import (
     FUYAO_SERVICE_PATHS,
     FUYAO_SERVICES,
     fuyao_thscode,
+    is_index_symbol,
     select_indicator_columns,
 )
 
@@ -58,6 +61,7 @@ _METHOD_SERVICE: dict[str, str] = {
     "financials": "a-share",
     "indicators": "a-share",
     "index_constituents": "a-share-index",
+    "index_kline": "a-share-index",
 }
 
 # ``fetch_financials`` 的 statement 参数 -> ``FUYAO_ENDPOINTS`` 的键。
@@ -89,6 +93,14 @@ _NO_DATA_CODES: frozenset[int] = frozenset({3001, 3004})
 _READINESS_CODE = 3002
 _READINESS_RETRY_ATTEMPTS = 2
 _READINESS_RETRY_DELAY_S = 1.5
+
+# ``fetch_indicators`` 的整体墙钟预算。指标端点一次只给一个报告期，因此凑出
+# ``years`` 年的序列要串行发多次请求（期数另有上限）；每次请求又各自带超时与
+# 节流。若不加整体上限，上游一慢就会超过外层工具的 30s 预算，被 engine 把**整条**
+# 调用判成 timeout——即便前几期已经取到。用整体预算约束 fan-out，到点即停并返回
+# 已取到的部分序列，使"慢"退化为"少几期"而非"全无数据"；全部失败时才抛错，让回退
+# 链交给 akshare（它自己的指标请求也有独立时限）。12s + akshare 的 15s 仍在 30s 内。
+FUYAO_INDICATOR_FANOUT_BUDGET_S: float = 12.0
 
 
 class FuyaoDataNotReady(AdapterError):
@@ -361,11 +373,20 @@ class FuyaoMcpAdapter(DataAdapter):
     def fetch_kline(
         self, symbol: str, period: str, adjust: str | None, years: int
     ) -> FetchResult:
-        """日线序列（前/后复权）。
+        """日线序列（前/后复权）；指数代码走 a-share-index 服务的指数 K 线。
 
         同花顺的 K 线只提供日线：周/月线请求抛 ``NotImplementedError``，编排器会
         读作"该源不支持"并转到下一个数据源。这不是缺陷而是回退——把它硬凑成日线
         聚合出来的周线，会让数据来源与调用方的请求不再对应。
+
+        指数与股票是**两个数据集**（股票的 ``prices/historical`` 在 a-share 服务，
+        指数的在 a-share-index 服务），参数同构但 thscode 语义不同：股票号段表对
+        ``000300`` 会拼出 ``000300.SZ``，而沪深300 实际是 ``000300.SH``。因此
+        指数代码一律按 ``is_index_symbol`` 分流（**在查 ``FUYAO_INDEX_THSCODES``
+        之前**——表里没有的指数如中证全指 000985 若漏进股票分支，会被号段表拼成
+        ``000985.SZ``，取回一只 17 元的深市股票并被缓存成"中证全指"）；查不到
+        thscode 的抛 ``NotImplementedError`` 让位 akshare——发一个注定 code=1002
+        的请求只是浪费一次限流配额。
         """
         if period not in FUYAO_KLINE_PERIODS:
             raise NotImplementedError(f"同花顺 K 线不支持周期 {period}")
@@ -376,6 +397,10 @@ class FuyaoMcpAdapter(DataAdapter):
             raise AdapterError(
                 f"同花顺 K 线窗口上限为 {FUYAO_MAX_WINDOW_YEARS} 年，请求了 {span} 年"
             )
+        if is_index_symbol(symbol):
+            if symbol not in FUYAO_INDEX_THSCODES:
+                raise NotImplementedError(f"同花顺不收录指数 {symbol}，交由 akshare")
+            return self._fetch_index_kline(symbol, years=span)
         dataset = FUYAO_ENDPOINTS["kline"]
         end = date.today()
         start = end - timedelta(days=365 * span + 30)
@@ -395,6 +420,29 @@ class FuyaoMcpAdapter(DataAdapter):
             raise AdapterError(f"{dataset}: 未返回 {symbol} 的 K 线")
         if "date" in frame.columns:
             # 内部契约是最新在前，使摘要与均线窗口读到的总是最新一期。
+            frame = frame.sort_values("date", ascending=False)
+        return FetchResult(df=frame.reset_index(drop=True), interface=dataset)
+
+    def _fetch_index_kline(self, symbol: str, *, years: int) -> FetchResult:
+        """指数日线（a-share-index 服务）。列已与股票 K 线同构（MARKET_COLUMNS），
+        无复权概念——``adjust`` 参数对指数无意义，上游响应 ``adjust`` 恒为 null。"""
+        dataset = FUYAO_ENDPOINTS["index_kline"]
+        end = date.today()
+        start = end - timedelta(days=365 * years + 30)
+        payload = self._call(
+            _METHOD_SERVICE["index_kline"],
+            dataset,
+            {
+                "thscode": FUYAO_INDEX_THSCODES[symbol],
+                "interval": "1d",
+                "start": _next_day_ms(start),
+                "end": _next_day_ms(end + timedelta(days=1)),
+            },
+        )
+        frame = _payload_frame(payload)
+        if not len(frame):
+            raise AdapterError(f"{dataset}: 未返回 {symbol} 的指数 K 线")
+        if "date" in frame.columns:
             frame = frame.sort_values("date", ascending=False)
         return FetchResult(df=frame.reset_index(drop=True), interface=dataset)
 
@@ -432,13 +480,21 @@ class FuyaoMcpAdapter(DataAdapter):
         该端点一次只返回**一个**报告期，因此要凑出 ``years`` 年的序列就得发多次
         请求；期数由 ``mapping.fuyao_report_periods`` 决定并有上限，使最坏情况下的
         请求数可推理。某一期没有数据（次新股、尚未披露）只是少一行，不丢整条序列。
+
+        整个 fan-out 由一个墙钟预算约束（``FUYAO_INDICATOR_FANOUT_BUDGET_S``）：到点
+        即停止再发请求，并返回**已取到的部分序列**。没有它，一个慢上游会让逐期请求
+        串起来超过外层工具的 30s 预算，把一条本可部分作答的序列变成整条 timeout。
         """
         from finharness.data.mapping import fuyao_report_periods
 
         dataset = FUYAO_ENDPOINTS["indicators"]
         rows: list[dict[str, Any]] = []
         errors: list[str] = []
+        started = time.monotonic()
         for period in fuyao_report_periods(years):
+            # 预算耗尽就带着已取到的期数收手：部分序列远好过整条超时。
+            if rows and time.monotonic() - started >= FUYAO_INDICATOR_FANOUT_BUDGET_S:
+                break
             try:
                 payload = self._call(
                     _METHOD_SERVICE["indicators"],

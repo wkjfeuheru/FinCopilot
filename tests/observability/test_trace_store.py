@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -164,3 +166,25 @@ def test_cleanup_removes_old_runs(store):
         conn.execute("UPDATE trace_runs SET started_at = '2000-01-01T00:00:00.000+00:00' WHERE run_id='old'")
     assert store.cleanup(30) == 1
     assert store.run_detail("old") is None
+
+
+def test_concurrent_record_event_assigns_unique_monotonic_seq(store):
+    """同 run 的并发 record_event 必须各得唯一且连续的 seq。
+
+    ``_seq`` 是每 run 的无锁内存序号；服务端可能从工作线程写 trace，
+    因此 get/set 由锁保护、序号不可重复。
+    """
+    store.start_run(run_id="r", input="a")
+    workers = 40
+    barrier = threading.Barrier(workers)
+
+    def record(n: int) -> None:
+        barrier.wait()
+        store.record_event("r", "tool_status", {"n": n})
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(record, range(workers)))
+
+    detail = store.run_detail("r")
+    seqs = sorted(event["seq"] for event in detail["events"])
+    assert seqs == list(range(1, workers + 1))

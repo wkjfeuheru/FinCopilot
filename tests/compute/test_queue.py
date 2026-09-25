@@ -1,3 +1,7 @@
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from finharness.compute.queue import ComputeJobStore, QueueFullError
@@ -64,3 +68,46 @@ def test_expired_lease_is_requeued_then_can_be_completed(tmp_path):
     assert final is not None
     assert final.status == "succeeded"
     assert final.result_json == '{"ok": true}'
+
+
+def test_queue_uses_wal_journal_mode(tmp_path):
+    db_path = tmp_path / "compute_jobs.db"
+    ComputeJobStore(db_path)
+    with sqlite3.connect(db_path) as connection:
+        mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode == "wal"
+
+
+def test_enqueue_sets_busy_timeout(tmp_path):
+    store = ComputeJobStore(tmp_path / "compute_jobs.db")
+    with store._connect() as connection:
+        timeout_ms = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert timeout_ms == int(store._timeout * 1000) > 0
+
+
+def test_concurrent_enqueue_respects_waiting_quota_atomically(tmp_path):
+    store = ComputeJobStore(tmp_path / "compute_jobs.db", max_waiting_per_user=2)
+    attempts = 8
+    barrier = threading.Barrier(attempts)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def attempt(n: int) -> None:
+        barrier.wait()
+        try:
+            store.enqueue(user_id="u_a", conversation_id="c", kind="chart", payload_path=f"{n}.zip")
+            outcome: object = "ok"
+        except QueueFullError:
+            outcome = "full"
+        except sqlite3.OperationalError as exc:  # 锁升级失败不应再出现
+            outcome = exc
+        with lock:
+            results.append(outcome)
+
+    with ThreadPoolExecutor(max_workers=attempts) as pool:
+        list(pool.map(attempt, range(attempts)))
+
+    assert "ok" in results
+    assert not [r for r in results if isinstance(r, sqlite3.OperationalError)]
+    assert results.count("ok") == 2
+    assert results.count("full") == attempts - 2

@@ -39,6 +39,8 @@ class SqliteStore:
             check_same_thread=self._check_same_thread,
         )
         connection.row_factory = sqlite3.Row
+        # 与 connect(timeout=) 同源，但显式落到连接上：busy 等待不依赖驱动的隐式映射。
+        connection.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
         if self._foreign_keys:
             connection.execute("PRAGMA foreign_keys = ON")
         return connection

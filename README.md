@@ -31,7 +31,7 @@ cp settings.example.json settings.json
 export DEEPSEEK_API_KEY=sk-...        # 密钥只从环境变量读，永不写入文件
 
 # 2. 起服务（FastAPI + SSE）
-uv run uvicorn finharness.server.api:create_production_app --factory --port 8000
+uv run uvicorn finharness.server.api:create_production_app --factory --port 8001
 
 # 3. 起前端（另开一个终端）
 cd frontend && npm install && npm run dev
@@ -45,30 +45,6 @@ cd frontend && npm install && npm run dev
 「注册新账号」，用户名 2–32 个字符，密码至少 8 位。所有对话、偏好与
 模型供应商配置都按账号隔离（见 [docs/modules/03.17-auth.md](docs/modules/03.17-auth.md)）。
 若这是从单用户版本升级而来，第一个注册的账号会自动继承原有的对话与配置。
-
-### 生产部署（单端口）
-
-不依赖 Node 开发服务器，前端构建产物由 FastAPI 直接托管：
-
-```bash
-cd frontend && npm install && npm run build   # 产出 frontend/dist（已按 vendor 分包）
-uv run uvicorn finharness.server.api:create_production_app --factory --port 8001
-```
-
-服务检测到 `frontend/dist` 后，`/` 返回页面、`/assets/*` 返回静态资源；页面与
-`/v1` 接口同源，浏览器直接携带会话 Cookie，无需 CORS 与代理。若未执行前端构建，
-`/` 会返回占位页，其余接口不受影响。
-
-也可用 HTTP 驱动的演示脚本跑通两个端到端场景（脚本会先注册/登录一个
-`demo` 账号，因为所有 `/v1` 接口都要求认证）：
-
-```bash
-python scripts/demo.py                    # 自己拉起服务，跑 Demo A + B
-python scripts/demo.py --base-url http://127.0.0.1:8000   # 跑在已有服务上
-python scripts/demo.py --demo b --json    # 只跑 Demo B，输出机器可读指标
-```
-
-`demo.py` 走的是与浏览器完全相同的 HTTP/SSE 接口，包括写工具的确认往返，因此它同时是一次接口验收。
 
 ### Railway 部署（远程模式）
 
@@ -337,11 +313,13 @@ python -m finharness.eval run --set smoke                # 真实 Provider（需
   它需要独立核数）。决策记录见 [03.10-coordinator.md](docs/modules/03.10-coordinator.md)。
 - **记忆作用域**：对话内容按 conversation 隔离；**跨对话长期记忆（LTM）** 与用户偏好是该用户
   所有对话共享的，但绝不跨用户。LTM 分两层：
-  - **情节记忆**（`ltm_episodes`：做过什么）——任务结果每轮由结论自动写入，关键决策与对话片段
-    在对话闲置后由 LLM 懒蒸馏产出；
+  - **情节记忆**（`ltm_episodes`：做过什么）——关键决策与对话片段在对话闲置后由 LLM 懒蒸馏产出；
+    "任务结果"（每轮结论自动升格为跨对话情节）是一条**无约定**的写入路径，默认关闭
+    （`ltm.auto_task_episodes=false`），需要时显式开启；
   - **语义记忆**（`ltm_facts`：知道什么）——事实、概念与偏好，与情节**共用同一次**蒸馏调用，
     `(user, key)` 覆盖式更新，因此用户后来的口径会取代旧口径。配了 embedding 端点与 Qdrant 时
     按语义相似度召回（也可只用本地向量，或退化为键匹配——见 03.6 §3.6.4「4.2」）。
+  删除一个对话会连带清理**它来源的情节记忆**与蒸馏台账；语义记忆与偏好按用户共享，予以保留。
   用户可经 `/v1/memory` 查看/编辑/删除任一记忆条目，或让 agent 用 `search_memory` /
   `update_memory` / `forget_memory` 操作。详见
   [03.6-context.md](docs/modules/03.6-context.md) §3.6.4「4.1」「4.2」。

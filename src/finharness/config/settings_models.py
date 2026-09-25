@@ -262,6 +262,14 @@ class LtmSettings(FrozenModel):
     retention_days: PositiveInt = 365
     # 语义记忆（事实/概念/偏好）是否随蒸馏产出。与情节共用一次 LLM 调用。
     distill_semantics: bool = True
+    # 是否把每轮的结论自动升格为跨对话情节（kind=task_result，无 LLM、每轮随结论落库）。
+    #
+    # 默认**关闭**：这是唯一"未经约定"的全局记忆写入路径——用户只是正常问一句，其结论
+    # 就会在每轮结束时悄悄外溢成全局记忆，并在之后**任何**新对话的首轮被注入。默认只保留
+    # 两条经过约定的来源：显式写入（如 remember_preference）与懒蒸馏产出的 decision/excerpt
+    # （受 distill_semantics 管辖）。需要旧行为（每轮结论即全局情节）时显式开启。
+    # 关闭不影响对话内的结论/摘要/引用——它们仍按对话隔离地保存。
+    auto_task_episodes: bool = False
     # 语义保留预算与情节分开：偏好这类条目少而长期，比情节更耐久。
     retention_facts: PositiveInt = 300
     retention_facts_days: PositiveInt = 730
@@ -493,7 +501,11 @@ class FuyaoSettings(FrozenModel):
     kind: Literal["mcp"] = "mcp"
     base_url: str = "https://fuyao.aicubes.cn"
     env_key: str = "HITHINK_FINANCE_API_KEY"
-    timeout_s: Annotated[float, Field(gt=0)] = 30.0
+    # 单次上游请求的超时。默认刻意压到 3s（而非通用 HTTP 客户端的 30s）：指标端点
+    # 一次只给一个报告期，``fetch_indicators`` 要逐期发多次请求，若每次允许 30s，
+    # 一个慢上游就能吃光整个工具预算（30s）而让整条调用被 engine 判 timeout。
+    # 短超时使慢请求快速失败，从而落到回退链的 akshare；正常响应远快于 3s。
+    timeout_s: Annotated[float, Field(gt=0)] = 3.0
     api_key: str | None = None
     # 与 ``search.proxy`` 同理：``httpx`` 只读环境变量，而 A 股数据源（``requests``）
     # 还遵循操作系统代理，在不显式设置时两者会走不同的出口。留空则回退到系统代理。

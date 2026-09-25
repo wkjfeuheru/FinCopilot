@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from finharness.config.settings import Settings
 from finharness.data.access import DataAccess
+from finharness.provider.fake import FakeProvider
 from finharness.server.api import create_app
 from finharness.server.confirm import ConfirmBus
 from finharness.tools.meta.ask import AskUserTool
@@ -435,3 +436,101 @@ def test_concurrent_egress_checks_share_one_confirmation(tmp_path):
     assert len(announced) == 1
     assert all(decision.verdict.value == "allow" for decision in decisions)
     assert "egress" in confirmed
+
+
+# -- 会话级"始终允许此类操作"（docs 03.7.1）--------------------------------------
+
+
+class _CollectingSink:
+    """收集引擎事件的替身 sink，供直接驱动 gate 的测试读取其宣告。"""
+
+    def __init__(self) -> None:
+        self.events: list = []
+
+    async def emit(self, event) -> None:
+        self.events.append(event)
+
+    def of_kind(self, kind: str) -> list:
+        return [event for event in self.events if event.kind == kind]
+
+
+async def _answer_pending(bus: ConfirmBus, value: str) -> None:
+    """轮询到有挂起请求就应答；给 gate 一个 tick 去登记与宣告。"""
+    for _ in range(50):
+        await asyncio.sleep(0)
+        pending = bus.pending_ids()
+        if pending:
+            bus.respond(request_id=pending[-1], value=value)
+            return
+    raise AssertionError("no pending request appeared to answer")
+
+
+def test_write_confirm_offers_session_option_and_remembers_within_session(tmp_path):
+    """写类确认提供会话级选项；应答后本会话内第二次写调用不再宣告提示。"""
+    from finharness.permissions.gate import WRITE_CATEGORY
+    from finharness.tools.base import PermissionLevel
+    from tests.permissions.test_gate import FakeTool
+
+    app = create_app(provider=FakeProvider([]), settings=_settings(tmp_path))
+    registry = app.state.session_registry
+    bus = app.state.confirm_bus
+    write_tool = FakeTool(name="write_file", permission=PermissionLevel.WRITE)
+
+    async def scenario():
+        session = await registry.ensure(conversation_id="conv-1", user_id="u1")
+        loop = session.loop
+        sink = _CollectingSink()
+        loop.output = sink
+
+        answerer = asyncio.ensure_future(_answer_pending(bus, "y_session"))
+        first = await loop.gate.check(write_tool, {})
+        await answerer
+        # 会话级授权已记录；同会话内第二次写调用免问。
+        second = await loop.gate.check(write_tool, {})
+        return first, second, sink
+
+    first, second, sink = asyncio.run(scenario())
+
+    requests = sink.of_kind("interactive_request")
+    assert requests, "the first write call must announce a confirmation"
+    assert requests[0].data["options"] == ["y", "y_session", "n"]
+    assert first.verdict.value == "allow"
+    assert second.verdict.value == "allow"
+    assert "本会话" in second.reason
+    # 第二次没有再宣告确认：只存在一条提示。
+    assert len(requests) == 1
+
+
+def test_session_approval_does_not_survive_into_a_new_session(tmp_path):
+    """会话边界：授权只活在当前执行会话，新建会话后重新询问。"""
+    from finharness.tools.base import PermissionLevel
+    from tests.permissions.test_gate import FakeTool
+
+    app = create_app(provider=FakeProvider([]), settings=_settings(tmp_path))
+    registry = app.state.session_registry
+    bus = app.state.confirm_bus
+    write_tool = FakeTool(name="write_file", permission=PermissionLevel.WRITE)
+
+    async def scenario():
+        # 会话 A：给出"始终允许"。
+        first_session = await registry.ensure(conversation_id="conv-a", user_id="u1")
+        first_session.loop.output = _CollectingSink()
+        answerer = asyncio.ensure_future(_answer_pending(bus, "y_session"))
+        await first_session.loop.gate.check(write_tool, {})
+        await answerer
+
+        # 会话 B（新执行会话）：同一对话也拿不到 A 的授权——会话已换。
+        new_session = await registry.ensure(conversation_id="conv-b", user_id="u1")
+        sink = _CollectingSink()
+        new_session.loop.output = sink
+        answerer = asyncio.ensure_future(_answer_pending(bus, "y_session"))
+        decision = await new_session.loop.gate.check(write_tool, {})
+        await answerer
+        return decision, sink
+
+    decision, sink = asyncio.run(scenario())
+
+    # 新会话必须重新弹框，且其 gate 上不存在上一会话的授权。
+    assert sink.of_kind("interactive_request"), "a new session must ask again"
+    assert decision.verdict.value == "allow"  # 这次用户又选了 y_session
+

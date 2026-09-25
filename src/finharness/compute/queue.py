@@ -67,6 +67,7 @@ class ComputeJobStore(SqliteStore):
         self.max_waiting_per_user = max_waiting_per_user
         self.max_attempts = max_attempts
         with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
 
     @staticmethod
@@ -82,6 +83,9 @@ class ComputeJobStore(SqliteStore):
                 job_id: str | None = None) -> ComputeJob:
         now = time.time()
         with self._connect() as connection:
+            # 先取得写锁，配额检查与插入才是原子的：否则 deferred 事务的读锁升级
+            # 会在并发 enqueue 下抛 database is locked，且可能越过等待上限。
+            connection.execute("BEGIN IMMEDIATE")
             waiting = connection.execute(
                 "SELECT COUNT(*) AS n FROM compute_jobs WHERE user_id = ? AND status = 'queued'", (user_id,)
             ).fetchone()["n"]
@@ -94,6 +98,7 @@ class ComputeJobStore(SqliteStore):
                 (job_id, user_id, conversation_id, kind, payload_path, now, now),
             )
             row = connection.execute("SELECT * FROM compute_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            connection.commit()
         assert row is not None
         return self._row(row)
 

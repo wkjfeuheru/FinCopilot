@@ -8,6 +8,7 @@ EM 对比 endpoint 会把公司行与两行汇总行混在一起，并且在使�
 import time
 
 import pandas as pd
+import pytest
 
 from finharness.data.adapters import akshare_adapter
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
@@ -252,6 +253,30 @@ def test_kline_moves_on_when_a_candidate_exceeds_its_deadline(monkeypatch):
     assert time.perf_counter() - started < 1.0
 
 
+def test_indicators_abandon_a_hung_source_at_the_deadline(monkeypatch):
+    """指标接口不接受请求超时：挂死的上游必须在时限内被弃，不得吃光工具预算。
+
+    没有这道保护，一个卡住的 akshare 指标调用会一直阻塞，直到外层工具 30s 预算
+    耗尽，把一次可回退的失败变成整条 timeout（docs 03.5）。
+    """
+    class Ak:
+        def stock_financial_analysis_indicator(self, **kwargs):
+            time.sleep(3.0)  # 远长于截止时间
+            return pd.DataFrame({"日期": ["2026-06-30"], "净资产收益率(%)": [32.53]})
+
+    monkeypatch.setattr(akshare_adapter, "_INDICATORS_CANDIDATE_DEADLINE_S", 0.2)
+    adapter = AkShareAdapter(throttle_seconds=0)
+    monkeypatch.setattr(akshare_adapter, "_import_akshare", lambda: Ak())
+    started = time.perf_counter()
+
+    with pytest.raises(AdapterError) as exc:
+        adapter.fetch_indicators("600519", 1, None)
+
+    # 在慢源返回之前就放弃，并把"超时"标成可重试，让编排器继续回退链。
+    assert time.perf_counter() - started < 1.0
+    assert exc.value.retryable is True
+
+
 def test_tencent_quote_receives_a_request_timeout_and_prefixed_symbol(monkeypatch):
     class Ak:
         def __init__(self):
@@ -329,3 +354,135 @@ def test_all_unhealthy_candidates_are_retried_rather_than_giving_up(monkeypatch)
 
     # 所有候选源都处于冷却期，于是整条链路被重试，EM 胜出。
     assert adapter.fetch_quote("600519").interface == "stock_zh_a_spot_em"
+
+
+# --- 指数 K 线 --------------------------------------------------------
+
+
+def _index_em_frame() -> pd.DataFrame:
+    """EM 指数日线的中文列形态（与股票 kline 同形）。"""
+    return pd.DataFrame(
+        {
+            "日期": ["2026-09-23", "2026-09-24"],
+            "开盘": [4400.0, 4430.0],
+            "收盘": [4420.0, 4439.14],
+            "最高": [4440.0, 4450.0],
+            "最低": [4390.0, 4410.0],
+            "成交量": [1.0e8, 1.1e8],
+            "成交额": [3.0e11, 3.1e11],
+        }
+    )
+
+
+def _index_tx_frame() -> pd.DataFrame:
+    return pd.DataFrame({"date": ["2026-09-23", "2026-09-24"], "close": [4401.0, 4439.14]})
+
+
+def _index_sina_frame() -> pd.DataFrame:
+    """新浪指数序列是英文列，已是内部契约。"""
+    return pd.DataFrame(
+        {
+            "date": ["2026-09-23", "2026-09-24"],
+            "open": [4400.0, 4430.0],
+            "high": [4440.0, 4450.0],
+            "low": [4390.0, 4410.0],
+            "close": [4420.0, 4439.14],
+            "volume": [1.0e8, 1.1e8],
+        }
+    )
+
+
+def test_index_codes_take_the_index_candidate_chain(monkeypatch):
+    """指数代码不得进股票端点：EM 股票接口按号段把 000300 当深市股票，返回空表。"""
+
+    class Ak:
+        def index_zh_a_hist(self, **kwargs):
+            return _index_em_frame()
+
+        def stock_zh_a_hist(self, **kwargs):  # pragma: no cover - 不得运行
+            raise AssertionError("指数不得走股票端点")
+
+    result = make_quote_adapter(monkeypatch, Ak()).fetch_kline("000300", "day", None, 1)
+
+    assert result.interface == "index_zh_a_hist"
+    assert result.df.iloc[0]["close"] == 4439.14
+    assert result.df.iloc[0]["date"].strftime("%Y-%m-%d") == "2026-09-24"
+
+
+def test_index_candidates_are_tried_in_order_when_the_first_fails(monkeypatch):
+    """EM 不可达时落到腾讯；腾讯再失败才到新浪。"""
+
+    class Ak:
+        def index_zh_a_hist(self, **kwargs):
+            raise RuntimeError("em unreachable")
+
+        def stock_zh_index_daily_tx(self, **kwargs):
+            return _index_tx_frame()
+
+    result = make_quote_adapter(monkeypatch, Ak()).fetch_kline("000985", "day", None, 1)
+
+    assert result.interface == "stock_zh_index_daily_tx"
+    assert result.df.iloc[0]["close"] == 4439.14
+
+
+def test_a_stale_index_series_is_refused_rather_than_rendered(monkeypatch):
+    """新浪对个别指数只给一段早已停更的序列（实测 sh000985 止于 2016）。
+
+    这份数据若被原样交出，会被渲染成"近一年走势"——比取不到更危险。适配器要求
+    最新一行落在请求窗口内，否则按"该源无可用数据"继续下一候选。
+    """
+
+    class Ak:
+        def index_zh_a_hist(self, **kwargs):
+            raise RuntimeError("em unreachable")
+
+        def stock_zh_index_daily_tx(self, **kwargs):
+            raise RuntimeError("tx unreachable")
+
+        def stock_zh_index_daily(self, symbol):
+            return pd.DataFrame(
+                {"date": ["2011-08-02", "2016-06-13"], "close": [3000.0, 3200.0]}
+            )
+
+    with pytest.raises(AdapterError) as exc:
+        make_quote_adapter(monkeypatch, Ak()).fetch_kline("000985", "day", None, 1)
+
+    assert "陈旧" in str(exc.value)
+
+
+def test_index_kline_accepts_a_fresh_sina_series(monkeypatch):
+    """新浪对多数指数（如 000300）是完整的：陈旧防护不得误伤。"""
+
+    class Ak:
+        def index_zh_a_hist(self, **kwargs):
+            raise RuntimeError("em unreachable")
+
+        def stock_zh_index_daily_tx(self, **kwargs):
+            raise RuntimeError("tx unreachable")
+
+        def stock_zh_index_daily(self, symbol):
+            assert symbol == "sh000300"
+            return _index_sina_frame()
+
+    result = make_quote_adapter(monkeypatch, Ak()).fetch_kline("000300", "day", None, 1)
+
+    assert result.interface == "stock_zh_index_daily"
+    assert result.df.iloc[0]["close"] == 4439.14
+
+
+def test_a_stock_symbol_still_takes_the_stock_chain(monkeypatch):
+    """分流不得改变股票路径：600519 仍走 stock_zh_a_hist。"""
+
+    class Ak:
+        def stock_zh_a_hist(self, **kwargs):
+            return pd.DataFrame(
+                {"日期": ["2026-09-24"], "收盘": [1237.0], "成交量": [1.0]}
+            )
+
+        def index_zh_a_hist(self, **kwargs):  # pragma: no cover - 不得运行
+            raise AssertionError("股票不得走指数端点")
+
+    result = make_quote_adapter(monkeypatch, Ak()).fetch_kline("600519", "day", None, 1)
+
+    assert result.interface == "stock_zh_a_hist"
+    assert result.df.iloc[0]["close"] == 1237.0

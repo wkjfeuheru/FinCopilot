@@ -532,6 +532,16 @@ def test_fuyao_environment_overrides(monkeypatch, tmp_path):
     assert settings.fuyao.enabled is False
 
 
+def test_auto_task_episodes_defaults_off_and_env_can_enable(monkeypatch, tmp_path):
+    """每轮结论自动升格为跨对话情节的路径默认关闭，除非显式开启。"""
+    assert Settings().ltm.auto_task_episodes is False
+
+    monkeypatch.setenv("FINH_LTM_AUTO_TASK_EPISODES", "true")
+    path = write_settings(tmp_path, {"model": {"provider": "fake"}})
+
+    assert Settings.from_file(path).ltm.auto_task_episodes is True
+
+
 def test_fuyao_rejects_an_unknown_transport(tmp_path):
     """extra=forbid 与 Literal 在 fuyao 段同样生效；首期只实现 MCP 传输。"""
     path = write_settings(

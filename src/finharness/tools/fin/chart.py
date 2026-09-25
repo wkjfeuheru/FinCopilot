@@ -49,7 +49,7 @@ _Y_CANDIDATES = ("close", "value", "nav", "收盘", "最新价", "净值")
 class MakeChartTool(BaseTool):
     @param("type", desc="图表类型：line/bar/candlestick")
     @param("title", desc="图表标题")
-    @param("symbol", desc="6位A股代码；与 cids 二选一")
+    @param("symbol", desc="6位A股代码或指数代码（如 000300 沪深300）；与 cids 二选一")
     @param(
         "cids",
         desc="复用的数据引用 id；传多个时按 X 轴对齐叠加为多条序列（零重复取数）",

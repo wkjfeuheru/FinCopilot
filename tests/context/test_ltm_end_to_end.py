@@ -26,12 +26,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 from test_loop import ScriptedProvider, text_round  # noqa: E402
 
 
-def make_settings(tmp_path) -> Settings:
-    return settings_with_cache(tmp_path)
+def make_settings(tmp_path, **overrides) -> Settings:
+    return settings_with_cache(tmp_path, **overrides)
 
 
-def build_loop(tmp_path, provider, *, conversation_id, store, user_id="u1", semantic_index=None):
-    settings = make_settings(tmp_path)
+def build_loop(
+    tmp_path, provider, *, conversation_id, store, user_id="u1", semantic_index=None,
+    auto_task_episodes=False,
+):
+    settings = make_settings(tmp_path, ltm={"auto_task_episodes": auto_task_episodes})
     cite = CitationRegistry()
     ctx = ResearchContext(cite=cite, settings=settings)
     return AgentLoop(
@@ -58,6 +61,7 @@ def test_conclusion_persists_as_cross_conversation_episode(tmp_path):
             ScriptedProvider([text_round("茅台结论：毛利率 91%")]),
             conversation_id="c_a",
             store=store,
+            auto_task_episodes=True,
         )
         await first.run("分析茅台")
         # 模拟真实的"轮次内形成结论"：pending 非空时 _persist_turn 才落库。
@@ -75,6 +79,33 @@ def test_conclusion_persists_as_cross_conversation_episode(tmp_path):
     assert episodes[0].source_title  # 对话标题随情节冗余保存
 
 
+def test_task_episodes_are_not_written_by_default(tmp_path):
+    """默认门控关闭：正常对话的结论不外溢成跨对话情节。
+
+    ``auto_task_episodes`` 是唯一"无约定"的全局写入路径，默认关闭后，
+    结论仍按对话隔离落库（``conclusions``），但不会成为任何新对话都能看到的记忆。
+    """
+    store = MemoryStore(tmp_path / "memory.db")
+
+    async def run():
+        loop = build_loop(
+            tmp_path,
+            ScriptedProvider([text_round("答案")]),
+            conversation_id="c_a",
+            store=store,
+        )
+        await loop.run("分析茅台")
+        loop.memory.append_user("补充一轮")
+        loop.ctx.add_conclusion("茅台结论：毛利率 91%", [])
+        loop._persist_turn()
+
+    asyncio.run(run())
+
+    # 对话内结论照常保存，但没有任何跨对话情节。
+    assert [c.text for c in store.load_conclusions("c_a")] == ["茅台结论：毛利率 91%"]
+    assert store.list_ltm_episodes(user_id="u1", kind="task_result") == []
+
+
 def test_second_conversation_receives_the_episode_in_its_request(tmp_path):
     store = MemoryStore(tmp_path / "memory.db")
     provider = ScriptedProvider([text_round("第二个答案")])
@@ -85,6 +116,7 @@ def test_second_conversation_receives_the_episode_in_its_request(tmp_path):
             ScriptedProvider([text_round("第一个答案")]),
             conversation_id="c_a",
             store=store,
+            auto_task_episodes=True,
         )
         await first.run("分析茅台")
         first.memory.append_user("补充一轮")
@@ -111,14 +143,15 @@ def test_conversations_of_other_users_see_nothing(tmp_path):
     async def run():
         first = build_loop(
             tmp_path, ScriptedProvider([text_round("答案")]), conversation_id="c_a",
-            store=store, user_id="u1",
+            store=store, user_id="u1", auto_task_episodes=True,
         )
         await first.run("分析茅台")
         first.memory.append_user("补充一轮")
         first.ctx.add_conclusion("u1 的秘密结论", [])
         first._persist_turn()
         other = build_loop(
-            tmp_path, provider, conversation_id="c_b", store=store, user_id="u2"
+            tmp_path, provider, conversation_id="c_b", store=store, user_id="u2",
+            auto_task_episodes=True,
         )
         await other.run("我的问题")
         return provider
@@ -438,3 +471,34 @@ class _StubEmbedder:
 
     def embed_one(self, text):
         return self.embed([text])[0]
+
+
+def test_distiller_marks_ledger_off_the_event_loop(tmp_path):
+    """蒸馏的台账写入（mark_ltm_distilled）在工作线程执行，不占事件循环。
+
+    空对话走最简路径：只调 mark_ltm_distilled 后返回，正好用来证明该写
+    经 ``asyncio.to_thread`` 落到非主线程。
+    """
+    import threading
+
+    store = MemoryStore(tmp_path / "memory.db")
+    settings = make_settings(tmp_path)
+    store.ensure_conversation("c_empty", user_id="u1")
+
+    seen: dict[str, int] = {}
+    original = store.mark_ltm_distilled
+
+    def spy(*args, **kwargs):
+        seen["worker"] = threading.get_ident()
+        return original(*args, **kwargs)
+
+    store.mark_ltm_distilled = spy  # type: ignore[method-assign]
+
+    async def run():
+        distiller = EpisodeDistiller(provider=JsonProvider("[]"), store=store, settings=settings)
+        return await distiller.distill_conversation("c_empty", user_id="u1")
+
+    outcome = asyncio.run(run())
+
+    assert outcome.skipped is True
+    assert seen["worker"] != threading.main_thread().ident, "台账写入必须发生在工作线程"

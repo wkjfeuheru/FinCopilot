@@ -14,6 +14,7 @@ worker 是独立进程：它只能经这几个**签名**端点领取任务、上
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -134,20 +135,26 @@ def create_compute_router(*, settings: Any, state: Any) -> APIRouter:
     @router.post("/v1/internal/compute/lease", include_in_schema=False)
     async def lease_compute_job(payload: WorkerLeaseRequest, request: Request) -> dict:
         await _verify_worker_request(request)
-        job = state.compute_jobs.lease_next(
-            worker_id=payload.worker_id, lease_seconds=float(settings.compute.lease_seconds)
+        # 队列写入（BEGIN IMMEDIATE）与产物回收都在工作线程执行，避免占住事件循环。
+        job = await asyncio.to_thread(
+            state.compute_jobs.lease_next,
+            worker_id=payload.worker_id,
+            lease_seconds=float(settings.compute.lease_seconds),
         )
         executor = state.compute_executor
         if executor is not None:
-            executor.cleanup_terminal_packages()
+            await asyncio.to_thread(executor.cleanup_terminal_packages)
         return {"job": None} if job is None else _worker_job_payload(job)
 
     @router.post("/v1/internal/compute/running", include_in_schema=False)
     async def mark_compute_running(payload: WorkerJobRequest, request: Request) -> Response:
         await _verify_worker_request(request)
         try:
-            state.compute_jobs.mark_running(
-                payload.job_id, worker_id=payload.worker_id, lease_seconds=float(settings.compute.lease_seconds)
+            await asyncio.to_thread(
+                state.compute_jobs.mark_running,
+                payload.job_id,
+                worker_id=payload.worker_id,
+                lease_seconds=float(settings.compute.lease_seconds),
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -157,8 +164,11 @@ def create_compute_router(*, settings: Any, state: Any) -> APIRouter:
     async def renew_compute_lease(payload: WorkerJobRequest, request: Request) -> Response:
         await _verify_worker_request(request)
         try:
-            state.compute_jobs.renew(
-                payload.job_id, worker_id=payload.worker_id, lease_seconds=float(settings.compute.lease_seconds)
+            await asyncio.to_thread(
+                state.compute_jobs.renew,
+                payload.job_id,
+                worker_id=payload.worker_id,
+                lease_seconds=float(settings.compute.lease_seconds),
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -174,9 +184,15 @@ def create_compute_router(*, settings: Any, state: Any) -> APIRouter:
         committed = False
         try:
             if payload.error:
-                state.compute_jobs.fail(payload.job_id, worker_id=payload.worker_id, error=payload.error)
+                await asyncio.to_thread(
+                    state.compute_jobs.fail,
+                    payload.job_id,
+                    worker_id=payload.worker_id,
+                    error=payload.error,
+                )
             else:
-                state.compute_jobs.succeed(
+                await asyncio.to_thread(
+                    state.compute_jobs.succeed,
                     payload.job_id,
                     worker_id=payload.worker_id,
                     result_json=lambda: _materialize_worker_blobs(job, payload.result_json or "{}", created),
@@ -185,8 +201,11 @@ def create_compute_router(*, settings: Any, state: Any) -> APIRouter:
         except HTTPException as exc:
             if exc.status_code == 422:
                 try:
-                    state.compute_jobs.fail(
-                        payload.job_id, worker_id=payload.worker_id, error="invalid_result"
+                    await asyncio.to_thread(
+                        state.compute_jobs.fail,
+                        payload.job_id,
+                        worker_id=payload.worker_id,
+                        error="invalid_result",
                     )
                 except ValueError as conflict:
                     raise HTTPException(status_code=409, detail=str(conflict)) from conflict

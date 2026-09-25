@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -110,7 +111,8 @@ def create_auth_router(
             if not decision.allowed:
                 _reject_limited(decision, "注册")
         try:
-            session = store.register(
+            session = await asyncio.to_thread(
+                store.register,
                 payload.username.strip(),
                 payload.password,
                 ttl_s=ttl_s,
@@ -139,7 +141,7 @@ def create_auth_router(
             if not decision.allowed:
                 _reject_limited(decision, "登录尝试")
         try:
-            session = store.login(username, payload.password, ttl_s=ttl_s)
+            session = await asyncio.to_thread(store.login, username, payload.password, ttl_s=ttl_s)
         except InvalidCredentials as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         except UserStoreError as exc:
@@ -156,7 +158,7 @@ def create_auth_router(
             from finharness.auth.dependency import _bearer_token
 
             token = _bearer_token(request)
-        revoked = store.revoke(token) if token else False
+        revoked = await asyncio.to_thread(store.revoke, token) if token else False
         response.delete_cookie(SESSION_COOKIE, path="/")
         return {"ok": revoked}
 

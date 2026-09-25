@@ -148,6 +148,24 @@ def test_thscode_rejects_an_unknown_board():
         thscode("777777")
 
 
+def test_index_codes_are_derived_from_the_alias_table():
+    """``INDEX_CODES`` 是 ``INDEX_ALIASES`` 的取值集，不得各自维护。
+
+    ``is_index_symbol`` 的分流决策就建立在这张表上——它若与别名表漂移，
+    一个已收录指数会被当股票取数（或反之），正是这台机器要防的危险。
+    """
+    from finharness.data.mapping import INDEX_ALIASES, INDEX_CODES
+
+    assert INDEX_CODES == frozenset(INDEX_ALIASES.values())
+
+
+def test_fuyao_index_thscodes_are_a_subset_of_the_known_indices():
+    """同花顺能服务的指数必是已收录指数；反过来不成立（如中证全指 000985）。"""
+    from finharness.data.mapping import FUYAO_INDEX_THSCODES, INDEX_CODES
+
+    assert set(FUYAO_INDEX_THSCODES).issubset(INDEX_CODES)
+
+
 def test_every_fuyao_service_has_a_path_and_a_description():
     from finharness.data.mapping import FUYAO_SERVICE_PATHS, FUYAO_SERVICES
 
@@ -159,12 +177,17 @@ def test_every_fuyao_service_has_a_path_and_a_description():
 
 def test_fuyao_endpoints_only_name_typed_methods():
     """只有存在 typed 适配器方法的数据集才登记在此；长尾端点经通用派发器触达，
-    其名字来自服务端 ``tools/list``，不应在此重复维护。"""
+    其名字来自服务端 ``tools/list``，不应在此重复维护。
+
+    ``index_kline`` 是 typed ``fetch_kline`` 的指数分支所用的数据集——同一方法按
+    ``is_index_symbol`` 分流到股票/指数两个数据集，故两者都属于"有 typed 方法"。
+    """
     from finharness.data.mapping import FUYAO_ENDPOINTS
 
     assert set(FUYAO_ENDPOINTS) == {
         "quote",
         "kline",
+        "index_kline",
         "financials:利润",
         "financials:资产",
         "financials:现金流",

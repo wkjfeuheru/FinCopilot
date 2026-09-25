@@ -105,6 +105,7 @@
     "retention_episodes": 500,
     "retention_days": 365,
     "distill_semantics": true,
+    "auto_task_episodes": false,
     "retention_facts": 300,
     "retention_facts_days": 730,
     "semantic_top_k": 5,
@@ -205,7 +206,7 @@
     "kind": "mcp",
     "base_url": "https://fuyao.aicubes.cn",
     "env_key": "HITHINK_FINANCE_API_KEY",
-    "timeout_s": 30.0,
+    "timeout_s": 3.0,
     "api_key": null,
     "proxy": null,
     "catalog_ttl_s": 300.0

@@ -10,6 +10,7 @@ decision / excerpt 两类需要 LLM 判断"哪些值得长期记住"的情节。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -114,7 +115,7 @@ class EpisodeDistiller:
         messages = self.store.load_messages(conversation_id)
         if not messages:
             # 空对话没有可蒸馏的内容：直接记账，避免反复被扫描器选中。
-            self.store.mark_ltm_distilled(conversation_id, user_id=user_id)
+            await asyncio.to_thread(self.store.mark_ltm_distilled, conversation_id, user_id=user_id)
             return DistillOutcome(
                 conversation_id=conversation_id,
                 skipped=True,
@@ -133,8 +134,11 @@ class EpisodeDistiller:
                 facts, conversation_id=conversation_id, user_id=user_id,
                 source_ts=record.created_at,
             )
-            self.store.mark_ltm_distilled(
-                conversation_id, user_id=user_id, episodes_written=written
+            await asyncio.to_thread(
+                self.store.mark_ltm_distilled,
+                conversation_id,
+                user_id=user_id,
+                episodes_written=written,
             )
             self._prune(user_id)
             return DistillOutcome(
@@ -146,8 +150,11 @@ class EpisodeDistiller:
         except Exception as exc:  # noqa: BLE001 - 蒸馏失败绝不致命
             state = self.store.get_ltm_distill_state(conversation_id)
             attempts = (state[0] if state else 0) + 1
-            self.store.mark_ltm_distilled(
-                conversation_id, user_id=user_id, attempts=attempts
+            await asyncio.to_thread(
+                self.store.mark_ltm_distilled,
+                conversation_id,
+                user_id=user_id,
+                attempts=attempts,
             )
             return DistillOutcome(
                 conversation_id=conversation_id,

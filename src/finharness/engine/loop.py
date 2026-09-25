@@ -511,8 +511,9 @@ class AgentLoop(PlanProgressMixin):
         self.store.save_citations(self.conversation_id, self.cite.all(), user_id=self.user_id)
         for symbol in self.ctx.symbols:
             self.store.upsert_symbol(self.conversation_id, symbol)
-        # 跨对话情节记忆（docs 03.6.4 LTM）：本轮结论同时以 task_result 情节
-        # 落库（无 LLM、与消息同批），使下一个对话首轮即可被动召回。
+        # 跨对话情节记忆（docs 03.6.4 LTM）：这是**唯一**无约定环节的全局写入
+        # 路径，因此默认关闭（ltm.auto_task_episodes）。关闭后跨对话记忆只来自
+        # 显式写入与懒蒸馏（decision/excerpt）。对话内结论照常按对话隔离落库。
         # add_ltm_episode 按 (kind, subject, summary) 幂等，与 save_conclusion
         # 的对话内去重互不干扰。标题只查一次（每条情节都要冗余它）。
         title = self._conversation_title()
@@ -524,6 +525,8 @@ class AgentLoop(PlanProgressMixin):
                 text=conclusion.text,
                 cids=conclusion.cids,
             )
+            if not self.settings.ltm.auto_task_episodes:
+                continue
             try:
                 self.store.add_ltm_episode(
                     kind="task_result",

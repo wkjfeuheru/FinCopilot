@@ -143,8 +143,10 @@ class EvalCase(_Model):
     # 多对话用例（跨对话记忆）：各对话依次运行，共享 store 与 user_id。
     chats: list[ChatCase] = Field(default_factory=list)
     # 多对话用例中，每个对话结束后是否同步跑一次蒸馏，使后续对话能召回
-    # decision/excerpt 情节。task_result 情节每轮已由引擎写入，不依赖它；
-    # 因此即使蒸馏失败（如离线自检 provider 不产出 JSON），跨对话召回仍成立。
+    # decision/excerpt 情节。默认写入的 task_result 情节已随门控关闭
+    # （ltm.auto_task_episodes=false），故跨对话用例依赖本蒸馏或显式写入
+    # （remember_preference 等）；蒸馏失败（如离线自检 provider 不产出 JSON）
+    # 时若用例本身走的是显式写入，仍成立。
     distill_between_chats: bool = True
     budget: Budget = Field(default_factory=Budget)
 

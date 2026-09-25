@@ -90,6 +90,32 @@ def test_index_aliases_resolve():
     assert normalize_index("000905") == "000905"
 
 
+def test_csi_all_share_resolves_and_is_recognised_as_an_index():
+    """中证全指（000985）此前不在别名表：任何路径都不识别它。"""
+    from finharness.data.mapping import INDEX_CODES, is_index_symbol
+
+    assert normalize_index("中证全指") == "000985"
+    assert normalize_index("000985") == "000985"
+    assert "000985" in INDEX_CODES
+    assert is_index_symbol("000985") is True
+    assert is_index_symbol("000300") is True
+
+
+def test_index_recognition_does_not_swallow_ordinary_stocks():
+    from finharness.data.mapping import is_index_symbol
+
+    assert is_index_symbol("600519") is False
+    assert is_index_symbol("000858") is False  # 深市五粮液，同 000 号段但不是指数
+
+
+def test_fuyao_only_claims_the_indices_it_actually_serves():
+    """000985 上游不收录（code=1002）：收录进表只会换来一次注定失败的请求。"""
+    from finharness.data.mapping import FUYAO_INDEX_THSCODES
+
+    assert FUYAO_INDEX_THSCODES["000300"] == "000300.SH"
+    assert "000985" not in FUYAO_INDEX_THSCODES
+
+
 # --- 宏观工具 --------------------------------------------------------------
 
 def test_macro_tool_renders_latest_values_and_a_series(tmp_path):

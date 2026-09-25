@@ -403,9 +403,9 @@ class EvalRunner:
                         f"{outcome.usage.input_tokens + outcome.usage.output_tokens}"
                     )
                 # 跨对话记忆用例：对话结束后蒸馏一次，使 decision/excerpt
-                # 情节对后续对话可见。task_result 情节每轮已写入，不依赖这里；
-                # 蒸馏失败（离线自检 provider 不产出 JSON 即属此列）也不影响
-                # 用例成立，因此吞掉异常。
+                # 情节对后续对话可见（默认写入的 task_result 情节已随门控关闭）。
+                # 蒸馏失败（离线自检 provider 不产出 JSON 即属此列）时，走显式
+                # 写入（remember_preference 等）的用例仍成立，因此吞掉异常。
                 if case.distill_between_chats and case.chats:
                     try:
                         from finharness.context.memory.distill import EpisodeDistiller

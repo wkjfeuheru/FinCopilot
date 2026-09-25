@@ -19,9 +19,15 @@ type Props = {
  * 通道，因此共用同一个对话框。
  */
 
-/** 确认按钮的展示文案：y_remember 是网络访问确认的"本对话不再询问"应答。 */
-function confirmLabel(option: string): string {
+/** 确认按钮的展示文案。
+ *
+ * ``y_remember`` 是网络访问确认的"本对话不再询问"应答（对话级）；
+ * ``y_session`` 是写工具确认的"始终允许此类操作"应答（**会话级**：新会话即失效，
+ * 因此文案必须点明"本会话内"，不能写成"不再询问"而让人误以为永久生效）。
+ */
+export function confirmLabel(option: string): string {
   if (option === "y") return "允许";
+  if (option === "y_session") return "始终允许此类操作（本会话内）";
   if (option === "y_remember") return "允许并本对话不再询问";
   return "拒绝";
 }

@@ -31,6 +31,7 @@ from finharness.data.mapping import (
     PEER_STAT,
     PEER_STAT_LABELS,
     VALUATION_INDICATOR_UNITS,
+    is_index_symbol,
     normalize_index,
     prefixed_symbol,
     select_indicator_columns,
@@ -50,6 +51,9 @@ _QUOTE_REQUEST_TIMEOUT_S = 8.0  # 传给接受 timeout 参数的接口
 # 请求超时，一个挂死的接口会吃光整个工具体预算（横截面回测一次要取数百只），
 # 因此候选链上的每次尝试都必须有时限，超时即弃并落到下一个候选。
 _KLINE_CANDIDATE_DEADLINE_S = 15.0
+# 财务指标接口同样是一个没有请求超时的阻塞调用，因此也需要墙钟时限；否则一个挂死的
+# 上游会吃光工具预算。15s 与 K 线同档：指标接口本身返回就慢一些，但必须给上限。
+_INDICATORS_CANDIDATE_DEADLINE_S = 15.0
 _UNHEALTHY_AFTER_FAILURES = 2
 _UNHEALTHY_COOLDOWN_S = 300.0
 
@@ -301,7 +305,16 @@ class AkShareAdapter(DataAdapter):
         raise AdapterError("; ".join(errors) or "quote 无可用接口")
 
     def fetch_kline(self, symbol: str, period: str, adjust: str | None, years: int) -> pd.DataFrame:
-        """按候选链抓取 K 线，统一列名并按最新在前排序。"""
+        """按候选链抓取 K 线，统一列名并按最新在前排序。
+
+        指数代码（``INDEX_ALIASES`` 收录的中证/上证指数）走 ``index_kline`` 候选链：
+        股票端点会按号段拼市场（``000300`` 被当成深市股票查成空表），且新浪股票
+        端点对 ``sz000985`` 实测返回的是**深市股票**的数据——同一串数字在两个体系
+        里是不同的证券，不分流就会把错的数据缓存下来。指数无复权概念，
+        ``adjust`` 被忽略。
+        """
+        if is_index_symbol(symbol):
+            return self._fetch_index_kline(symbol, period, years)
         em_period = _PERIOD_MAP.get(period, "daily")
         errors: list[str] = []
         for interface in AKSHARE_ENDPOINTS["kline"]:
@@ -348,6 +361,74 @@ class AkShareAdapter(DataAdapter):
                 errors.append(exc.message)
         raise AdapterError("; ".join(errors) or "kline 无可用接口")
 
+    def _fetch_index_kline(self, symbol: str, period: str, years: int) -> FetchResult:
+        """指数 K 线候选链（``index_kline``）。
+
+        - 东财 ``index_zh_a_hist``：裸代码 + 周期/起止日期；列名中文，与股票 kline
+          的映射表同形，复用 ``_normalize``。
+        - 腾讯 ``stock_zh_index_daily_tx``：``sh`` 前缀 + 起止日期。
+        - 新浪 ``stock_zh_index_daily``：``sh`` 前缀，无日期参数。
+
+        当前收录的指数全部在上交所发布，统一拼 ``sh``。
+
+        指数没有复权概念，各接口都没有 ``adjust`` 参数——调用方传入的复权意图对
+        指数不适用，忽略而非报错，让"取沪深300近期走势"这类请求不必先知道这条
+        冷知识。
+
+        **陈旧防护。** 新浪对个别指数只提供一段早已停止更新的序列：实测
+        ``sh000985`` 返回的是 2011–2016 年的数据（中证全指），而 ``sh000300``
+        是完整的。若不加判定，这份陈旧序列会被 ``_slice_years`` 的兜底（区间内
+        无行时返回原表）原样交出，被渲染成"近一年走势"——比"取不到"危险得多。
+        因此这里要求序列的**最新一行落在请求窗口内**，否则按"该源无可用数据"
+        继续下一候选；全部候选都陈旧则整体失败（宁可报错也不给错数据）。
+        """
+        em_period = _PERIOD_MAP.get(period, "daily")
+        start = lookback_stamp(years, extra_days=30)
+        end = date.today().strftime("%Y%m%d")
+        cutoff = pd.Timestamp(lookback_start(years))
+        errors: list[str] = []
+        for interface in AKSHARE_ENDPOINTS["index_kline"]:
+            try:
+                if interface == "index_zh_a_hist":
+                    df = self._call(
+                        interface,
+                        lambda ak: ak.index_zh_a_hist(
+                            symbol=symbol, period=em_period,
+                            start_date=start, end_date=end,
+                        ),
+                        deadline_s=_KLINE_CANDIDATE_DEADLINE_S,
+                    )
+                elif interface == "stock_zh_index_daily_tx":
+                    df = self._call(
+                        interface,
+                        lambda ak: ak.stock_zh_index_daily_tx(
+                            symbol=f"sh{symbol}", start_date=start, end_date=end
+                        ),
+                        deadline_s=_KLINE_CANDIDATE_DEADLINE_S,
+                    )
+                else:  # 新浪：无日期参数，返回全量历史
+                    df = self._call(
+                        interface,
+                        lambda ak: ak.stock_zh_index_daily(symbol=f"sh{symbol}"),
+                        deadline_s=_KLINE_CANDIDATE_DEADLINE_S,
+                    )
+                df = _normalize(df, "kline")
+                if not len(df):
+                    raise AdapterError(f"{interface}: 返回空表")
+                if "date" in df.columns:
+                    latest = pd.to_datetime(df["date"], errors="coerce").max()
+                    if pd.notna(latest) and latest < cutoff:
+                        raise AdapterError(
+                            f"{interface}: 数据陈旧（最新 {latest.date()}，早于请求窗口）"
+                        )
+                df = _slice_years(df, years)
+                if "date" in df.columns:
+                    df = df.sort_values("date", ascending=False)
+                return FetchResult(df=df.reset_index(drop=True), interface=interface)
+            except AdapterError as exc:
+                errors.append(exc.message)
+        raise AdapterError("; ".join(errors) or "指数 K 线无可用接口")
+
     def fetch_indicators(self, symbol: str, years: int, fields: list[str] | None) -> FetchResult:
         """抓取财务分析指标，统一日期列名并将日期降序排列。"""
         interface = AKSHARE_ENDPOINTS["indicators"][0]
@@ -355,6 +436,7 @@ class AkShareAdapter(DataAdapter):
         df = self._call(
             interface,
             lambda ak: ak.stock_financial_analysis_indicator(symbol=symbol, start_year=start_year),
+            deadline_s=_INDICATORS_CANDIDATE_DEADLINE_S,
         )
         if "日期" in df.columns:
             df = df.rename(columns={"日期": "date"})

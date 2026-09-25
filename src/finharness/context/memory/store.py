@@ -11,6 +11,10 @@
 * ``notes`` 以 ``(user_id, key)`` 为键：用户偏好由该用户的所有对话共享，
   因为“这位用户喜欢什么样的报告”并非某个对话独有，但绝不跨用户共享。
 
+跨对话情节（``ltm_episodes``）虽按 ``user_id`` 共享，却以 ``source_conversation_id``
+指向来源对话：删除该对话会**连带删除**它产生的情节（见 ``delete_conversation``）。
+语义记忆（``ltm_facts``，含偏好）按 ``(user_id, key)`` 跨对话共享，删除单个对话予以保留。
+
 所有语句都使用绑定参数；没有任何一条是由变量拼接而成的。
 """
 
@@ -400,6 +404,10 @@ class MemoryStore(SqliteStore):
             return (0, 0)
         now = utc_now_iso()
         with self._connect() as connection:
+            # 分配 seq 与插入同处写事务：deferred 事务下 MAX(seq) 与 INSERT
+            # 之间可能被并发写入插入同序号（messages 有 UNIQUE(user_id,
+            # conversation_id, seq)），先取写锁则二者原子。
+            connection.execute("BEGIN IMMEDIATE")
             user_id = self._conversation_user(connection, conversation_id)
             row = connection.execute(
                 "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM messages WHERE conversation_id = ?",
@@ -422,6 +430,7 @@ class MemoryStore(SqliteStore):
                 "INSERT INTO messages (user_id, conversation_id, seq, role, content, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+            connection.commit()
         return (base + 1, base + len(messages))
 
     def message_seq_range(self, conversation_id: str) -> tuple[int, int]:
@@ -1572,11 +1581,13 @@ class MemoryStore(SqliteStore):
         return sorted(doomed)
 
     def delete_conversation(self, conversation_id: str) -> None:
-        """删除一个对话及其作用域内的全部内容（不含 notebook）。
+        """删除一个对话及其作用域内的全部内容，**连带清理它产生的情节记忆**。
 
-        刻意**不**删除 ``ltm_episodes``：跨对话情节是自包含的（冗余了来源
-        标题与时间，并用 cid 指向引用），因此源对话被删不该抹掉已经沉淀的
-        长期记忆——它由 ``prune_ltm_episodes`` 按自己的预算管理。
+        情节虽按用户跨对话共享，但它以 ``source_conversation_id`` 指向来源对话；
+        当用户删除这个对话时，其来源情节应随之一同消失——否则"删了对话记忆还在"
+        违背直觉（它会在下一个新对话的首轮被重新注入）。语义记忆（``ltm_facts``，
+        含偏好）**保留**：它按 ``(user_id, key)`` 跨对话共享，可能由多个对话共同
+        贡献，删除单个对话不该抹掉它。整用户的彻底抹除见 ``purge_user_data``。
         """
         with self._connect() as connection:
             for statement in (
@@ -1586,6 +1597,9 @@ class MemoryStore(SqliteStore):
                 "DELETE FROM conclusions WHERE conversation_id = ?",
                 "DELETE FROM conversation_symbols WHERE conversation_id = ?",
                 "DELETE FROM turn_checkpoints WHERE conversation_id = ?",
+                # 该对话来源的情节与其蒸馏台账：记忆自包含，但来源被用户删除时随之清理。
+                "DELETE FROM ltm_episodes WHERE source_conversation_id = ?",
+                "DELETE FROM ltm_processed WHERE conversation_id = ?",
                 "DELETE FROM conversations WHERE conversation_id = ?",
             ):
                 connection.execute(statement, (conversation_id,))

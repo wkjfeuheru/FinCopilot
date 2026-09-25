@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -114,6 +115,8 @@ class TraceStore(SqliteStore):
         super().__init__(db_path, check_same_thread=False)
         self.capture_payloads = capture_payloads
         self._seq: dict[str, int] = {}
+        # 每个 run 的内存序号；调用方可能在工作线程写 trace，故 get/set/pop 需互斥。
+        self._seq_lock = threading.Lock()
         self._init_db()
 
     # ── 基础设施 ──────────────────────────────────────────────
@@ -175,8 +178,9 @@ class TraceStore(SqliteStore):
 
     def record_event(self, run_id: str, kind: str, payload: dict[str, Any], *, turn: int | None = None) -> None:
         try:
-            seq = self._seq.get(run_id, 0) + 1
-            self._seq[run_id] = seq
+            with self._seq_lock:
+                seq = self._seq.get(run_id, 0) + 1
+                self._seq[run_id] = seq
             with self._connect() as connection:
                 connection.execute(
                     "INSERT INTO trace_events (run_id, seq, turn, kind, payload_json)"
@@ -241,7 +245,8 @@ class TraceStore(SqliteStore):
             if trace_rounds:
                 self._write_rounds(run_id, trace_rounds)
             # 终态后清理内存序号。
-            self._seq.pop(run_id, None)
+            with self._seq_lock:
+                self._seq.pop(run_id, None)
         except sqlite3.Error:
             log.exception("trace_finish_run_failed run_id=%s", run_id)
 

@@ -8,6 +8,7 @@ memory 中。
 import asyncio
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from finharness.data.cache import LocalCache
 from finharness.data.citation import Citation, CitationRegistry
 from finharness.engine.loop import AgentLoop
 from finharness.permissions.gate import PermissionGate
-from finharness.types import ToolUse
+from finharness.types import Msg, ToolUse
 from tests.conftest import settings_with_cache
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
@@ -395,3 +396,31 @@ def test_memory_is_capped_by_short_mem_cap(tmp_path):
     loop = asyncio.run(run())
 
     assert len(loop.short_term.episodes()) == 3
+
+
+def test_concurrent_append_messages_assigns_disjoint_seq(tmp_path):
+    """并发 append_messages 不得因 seq 分配竞争而抛 IntegrityError。
+
+    seq 由 ``SELECT MAX(seq)`` 计算；messages 有 UNIQUE(user_id,
+    conversation_id, seq)，因此分配与插入必须在同一写事务内
+    （BEGIN IMMEDIATE）才原子。
+    """
+    store = MemoryStore(tmp_path / "memory.db")
+    store.ensure_conversation("c_a", user_id="u1")
+    writers = 8
+
+    def append(n: int) -> None:
+        store.append_messages("c_a", [Msg(role="user", content=f"m{n}")])
+
+    with ThreadPoolExecutor(max_workers=writers) as pool:
+        list(pool.map(append, range(writers)))
+
+    assert store.count_messages("c_a") == writers
+    with store._connect() as connection:
+        seqs = [
+            row["seq"]
+            for row in connection.execute(
+                "SELECT seq FROM messages WHERE conversation_id = ? ORDER BY seq", ("c_a",)
+            )
+        ]
+    assert seqs == list(range(1, writers + 1))

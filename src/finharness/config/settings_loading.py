@@ -235,6 +235,7 @@ _ENV_FIELDS: dict[str, tuple[tuple[str, ...], Any]] = {
     "FINH_LTM_RETENTION_EPISODES": (("ltm", "retention_episodes"), int),
     "FINH_LTM_RETENTION_DAYS": (("ltm", "retention_days"), int),
     "FINH_LTM_DISTILL_SEMANTICS": (("ltm", "distill_semantics"), bool),
+    "FINH_LTM_AUTO_TASK_EPISODES": (("ltm", "auto_task_episodes"), bool),
     "FINH_LTM_RETENTION_FACTS": (("ltm", "retention_facts"), int),
     "FINH_LTM_RETENTION_FACTS_DAYS": (("ltm", "retention_facts_days"), int),
     "FINH_LTM_SEMANTIC_TOP_K": (("ltm", "semantic_top_k"), int),

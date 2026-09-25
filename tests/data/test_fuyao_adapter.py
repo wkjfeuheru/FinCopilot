@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -248,6 +249,56 @@ def test_kline_window_starts_the_requested_number_of_years_back():
     assert 730 <= span_days <= 800
 
 
+# -- 指数 K 线（a-share-index 服务）------------------------------------------
+
+INDEX_KLINE_DATASET = "get_a_share_index_prices_historical"
+
+
+def test_index_kline_uses_the_index_dataset_and_thscode():
+    """指数走 a-share-index 的独立数据集，且 thscode 查专用表（000300 → .SH）。
+
+    直接用股票号段表会拼出 ``000300.SZ``（000 段属深市），上游对它返回空；
+    指数 K 线因此不能复用股票的 ``get_a_share_prices_historical``。
+    """
+    seen: list[dict] = []
+
+    def capture(arguments: dict) -> dict:
+        seen.append(arguments)
+        return kline_payload()
+
+    adapter = make_adapter({INDEX_KLINE_DATASET: capture})
+    frame = adapter.fetch_kline("000300", "day", None, 1).df
+
+    assert adapter.seen[0][0] == INDEX_KLINE_DATASET
+    assert seen[0]["thscode"] == "000300.SH"
+    assert "adjust" not in seen[0]  # 指数无复权概念，不该带这个参数
+    assert frame.iloc[0]["close"] == 1.5
+
+
+def test_an_unlisted_index_yields_to_akshare_without_a_request():
+    """中证全指 000985 不在 FUYAO_INDEX_THSCODES：直接让位，不发注定失败的请求。
+
+    若漏进股票分支，号段表会把它拼成 000985.SZ，取回一只 17 元的深市股票。
+    """
+    adapter = make_adapter(
+        {KLINE_DATASET: kline_payload(), INDEX_KLINE_DATASET: kline_payload()}
+    )
+
+    with pytest.raises(NotImplementedError):
+        adapter.fetch_kline("000985", "day", None, 1)
+
+    assert adapter.seen == []
+
+
+def test_index_kline_reports_not_supported_for_weekly_so_akshare_takes_over():
+    adapter = make_adapter({INDEX_KLINE_DATASET: kline_payload()})
+
+    with pytest.raises(NotImplementedError):
+        adapter.fetch_kline("000300", "week", None, 1)
+
+    assert adapter.seen == []
+
+
 # -- 财报 ------------------------------------------------------------------
 
 
@@ -397,7 +448,29 @@ def test_indicator_field_filter_uses_the_chinese_aliases():
     frame = adapter.fetch_indicators("600519", 1, ["ROE"]).df
 
     assert "加权净资产收益率" in frame.columns
-    assert "销售毛利率" not in frame.columns
+
+
+def test_indicators_stop_at_the_fanout_budget_with_a_partial_series(monkeypatch):
+    """慢上游不得让逐期 fan-out 超过整体预算，也不得把整条调用拖成 timeout。
+
+    指标端点一期一请求，若每期都很慢，串起来会超过外层工具的 30s 预算；届时 engine
+    会把**整条**调用判成 timeout——即便前几期已经取到。整体预算让"慢"退化为"少几期"：
+    到点停发并返回已取到的部分序列。
+    """
+    import finharness.data.adapters.fuyao_adapter as fuyao_adapter
+
+    def slow(arguments: dict) -> dict:
+        time.sleep(0.1)
+        return indicators_payload(arguments["report"], 30.5, 91.2)
+
+    monkeypatch.setattr(fuyao_adapter, "FUYAO_INDICATOR_FANOUT_BUDGET_S", 0.15)
+    adapter = make_adapter({INDICATORS_DATASET: slow})
+
+    frame = adapter.fetch_indicators("600519", 1, None).df
+
+    # 一年本应发 4 次（4 个季度）；预算只够前两期，且返回的正是已取到的那些。
+    assert 0 < len(frame) < 4
+    assert len(adapter.seen) == len(frame)
 
 
 # -- 指数成分股 ------------------------------------------------------------

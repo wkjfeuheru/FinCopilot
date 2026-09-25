@@ -27,6 +27,14 @@ AKSHARE_ENDPOINTS: Final[dict[str, tuple[str, ...]]] = {
     # 更丰富的两个来源都不可用时才会用到。
     "quote": ("stock_zh_a_spot_em", "stock_zh_a_hist_tx", "stock_zh_a_spot"),
     "kline": ("stock_zh_a_hist", "stock_zh_a_daily", "stock_zh_a_hist_tx"),
+    # 指数 K 线是独立的候选链：股票端点按号段拼市场（000300 会被当成深市股票），
+    # 指数必须走指数端点。三种形态各不相同：
+    #   index_zh_a_hist      裸代码 + 周期/起止日期（EM，字段最全，含成交量/振幅）
+    #   stock_zh_index_daily_tx  sh 前缀 + 起止日期（腾讯；实测 000300/000985 均有当前
+    #                        数据，是新浪"部分指数数据缺失"的补充，但无 volume 列）
+    #   stock_zh_index_daily  sh 前缀，无日期参数（新浪；实测 sh000300 完整，
+    #                        但 sh000985 只到 2016 年——陈旧，由适配器的陈旧防护拒绝）
+    "index_kline": ("index_zh_a_hist", "stock_zh_index_daily_tx", "stock_zh_index_daily"),
     "indicators": ("stock_financial_analysis_indicator",),
     "financials": ("stock_financial_abstract",),
     "valuation": ("stock_zh_valuation_baidu",),
@@ -349,7 +357,18 @@ INDEX_ALIASES: Final[dict[str, str]] = {
     "上证50": "000016", "sz50": "000016", "000016": "000016",
     "科创50": "000688", "kc50": "000688", "000688": "000688",
     "上证指数": "000001", "000001": "000001",
+    "中证全指": "000985", "csi_all": "000985", "000985": "000985",
 }
+
+# 指数代码集合（INDEX_ALIASES 的取值集）。K 线取数据此分流：同一串 6 位数字
+# "000985" 在股票号段里指向一只深市个股（实测收盘约 17 元），在中证体系里是
+# 中证全指（约 4400 点）——不看这张表就取数，拿回来的会是另一只证券的数据。
+INDEX_CODES: Final[frozenset[str]] = frozenset(INDEX_ALIASES.values())
+
+
+def is_index_symbol(symbol: str) -> bool:
+    """6 位代码是否为中证/上证指数代码（按 INDEX_ALIASES 的收录判定）。"""
+    return str(symbol or "").strip() in INDEX_CODES
 
 
 def normalize_index(index: str) -> str:
@@ -410,6 +429,11 @@ FUYAO_ENDPOINTS: Final[dict[str, str]] = {
     "financials:现金流": "get_a_share_financials_cash_flow_statements",
     "indicators": "get_a_share_financials_indicators",
     "index_constituents": "get_a_share_index_constituents_ths_stock_list",
+    # 指数 K 线与股票 K 线同构（thscode/interval/start/end，同样 10 年窗口、同样
+    # 无复权——响应 data.adjust 恒为 null），但落在 a-share-index 服务上。实测
+    # 000300.SH 有完整日线；中证全指 000985 上游不收录（code=1002），由
+    # FUYAO_INDEX_THSCODES 的缺席表达，未收录的指数直接让位给 akshare。
+    "index_kline": "get_a_share_index_prices_historical",
 }
 
 # --- 复权方式 ----------------------------------------------------------
@@ -588,6 +612,10 @@ def fuyao_report_periods(years: int, *, today: date | None = None) -> list[str]:
 # 键与 ``INDEX_ALIASES`` 的取值集合一致：``DataAccess.index_constituents`` 先经
 # ``normalize_index``，因此适配器只会看到这些规范代码。表里没有的指数（如同花顺的
 # 概念指数）经数据集派发器按其 thscode 直接查询，不走这条路径。
+#
+# 中证全指（000985）刻意缺席：实测同花顺指数服务对它返回 code=1002 Unknown
+# thscode（其目录收录的特色指数里没有中证全指），收录只会换来一次注定失败的
+# 请求；它的 K 线与成分股都由 akshare 兜底（新浪指数端点实测有 000985 序列）。
 FUYAO_INDEX_THSCODES: Final[dict[str, str]] = {
     "000300": "000300.SH",
     "000905": "000905.SH",

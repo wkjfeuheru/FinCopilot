@@ -362,3 +362,100 @@ def test_non_auto_string_modes_still_require_confirmation(tmp_path):
 
     assert decision.verdict is Verdict.DENY
     assert "网络" in decision.reason
+
+
+# -- 会话级"始终允许此类操作"（docs 03.7.1）--------------------------------------
+
+
+def test_write_tool_allowed_without_asking_when_session_approved(tmp_path):
+    """用户给出会话级授权后，写类调用免问——重试同一操作不再反复弹框。"""
+    asked: list[str] = []
+
+    async def confirm(name, args):
+        asked.append(name)
+        return True
+
+    approved: set[str] = {"write"}
+    gate = PermissionGate(
+        settings=make_settings(tmp_path),
+        confirm=confirm,
+        session_approved=approved,
+    )
+
+    decision = asyncio.run(gate.check(FakeTool(permission=PermissionLevel.WRITE), {}))
+
+    assert decision.verdict is Verdict.ALLOW
+    assert "本会话" in decision.reason
+    assert asked == []  # 免问：确认回调根本没被调用
+
+
+def test_write_tool_still_asks_without_session_approval(tmp_path):
+    """未命中集合（等价于新建会话）时仍逐次确认。"""
+    calls = 0
+
+    async def confirm(name, args):
+        nonlocal calls
+        calls += 1
+        return True
+
+    gate = PermissionGate(
+        settings=make_settings(tmp_path), confirm=confirm, session_approved=set()
+    )
+
+    decision = asyncio.run(gate.check(FakeTool(permission=PermissionLevel.WRITE), {}))
+
+    assert decision.verdict is Verdict.ALLOW
+    assert calls == 1
+
+
+def test_session_approval_does_not_bypass_deny_rules(tmp_path):
+    """硬边界优先于会话授权：携带交易意图的参数即使已被"始终允许"也要拒绝。"""
+    gate = PermissionGate(
+        settings=make_settings(tmp_path),
+        confirm=lambda name, args: True,
+        session_approved={"write"},
+    )
+
+    decision = asyncio.run(
+        gate.check(FakeTool(permission=PermissionLevel.WRITE), {"note": "帮我下单 买入"})
+    )
+
+    assert decision.verdict is Verdict.DENY
+
+
+def test_session_approval_does_not_bypass_cache_write_denial(tmp_path):
+    """缓存投毒防线同样不被会话授权穿透。"""
+    settings = make_settings(tmp_path)
+    target = str(settings.data.cache_dir / "parquet" / "x.parquet")
+    gate = PermissionGate(
+        settings=settings,
+        confirm=lambda name, args: True,
+        session_approved={"write"},
+    )
+
+    decision = asyncio.run(
+        gate.check(FakeTool(permission=PermissionLevel.WRITE), {"path": target})
+    )
+
+    assert decision.verdict is Verdict.DENY
+    assert "缓存" in decision.reason
+
+
+def test_session_approval_does_not_cover_egress(tmp_path):
+    """会话授权只作用于写类：外发仍走它自己的确认，不被会话授权短路。"""
+    asked: list[str] = []
+
+    async def confirm(name, args):
+        asked.append(name)
+        return True
+
+    gate = PermissionGate(
+        settings=make_settings(tmp_path),
+        confirm=confirm,
+        session_approved={"write"},
+    )
+
+    decision = asyncio.run(gate.check(FakeTool(name="web_search", egress=True), {"query": "a"}))
+
+    assert decision.verdict is Verdict.ALLOW
+    assert asked == ["web_search"]  # 仍被询问：会话授权没有替外发免问

@@ -10,7 +10,7 @@ from finharness.tools.fin.window import note_actual_window
 
 @tool(
     name="get_kline",
-    description="查询A股历史K线（日/周/月），输出区间摘要与近期明细。",
+    description="查询A股或指数历史K线（日/周/月），输出区间摘要与近期明细。",
     capability=Capability.MARKET,
     group=ToolGroup.FIN_DATA,
     timeout=30,
@@ -18,9 +18,12 @@ from finharness.tools.fin.window import note_actual_window
     output_schema_note="返回区间涨跌、极值、均线与近期明细（markdown）。",
 )
 class GetKlineTool(BaseTool):
-    @param("symbol", desc="6位A股代码")
+    @param(
+        "symbol",
+        desc="6位A股代码，或指数代码（如 000300 沪深300、000905 中证500、000985 中证全指）",
+    )
     @param("period", desc="周期：day/week/month")
-    @param("adjust", desc="复权：qfq前复权/hfq后复权/None不复权")
+    @param("adjust", desc="复权：qfq前复权/hfq后复权/None不复权（指数无复权概念，该参数被忽略）")
     @param("years", desc="回溯年数，如 1 表示近一年")
     async def _dispatch(
         self, *, symbol: str, period: str = "day", adjust: str | None = None, years: int = 1

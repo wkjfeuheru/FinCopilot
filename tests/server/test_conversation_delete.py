@@ -75,6 +75,30 @@ def test_delete_spares_user_preferences(tmp_path):
     assert store.get_notes(user_id=user_id) == {"report_style": "简洁"}
 
 
+def test_delete_removes_episodes_sourced_from_the_conversation(tmp_path):
+    """删除对话时，其来源的跨对话情节连同蒸馏台账一并清理。
+
+    否则"删了对话，记忆还在"——下次开新对话时首轮仍会被重新注入该情节。
+    """
+    client = make_client(tmp_path)
+    cid = conversation_id_from(client.post("/v1/chat/stream", json={"message": "对话"}).text)
+    store = client.app.state.memory_store
+    user_id = client.finharness_user["id"]
+    store.add_ltm_episode(
+        kind="task_result", summary="该对话产生的结论", user_id=user_id,
+        source_conversation_id=cid,
+    )
+    store.add_ltm_episode(
+        kind="decision", summary="别的对话的情节", user_id=user_id,
+        source_conversation_id="c_other",
+    )
+
+    client.delete(f"/v1/conversations/{cid}")
+
+    remaining = store.list_ltm_episodes(user_id=user_id)
+    assert [episode.summary for episode in remaining] == ["别的对话的情节"]
+
+
 def test_delete_unknown_conversation_is_a_404(tmp_path):
     client = make_client(tmp_path)
 

@@ -2,7 +2,9 @@
 
 规则优先级为 deny > 缓存拒写 > 模式回退。读类工具默认放行，但网络外发
 （联网检索、逐篇抓取研报全文）首次须经确认，之后在本对话内免问；写类
-工具在 DEFAULT/PLAN 下需确认，在 AUTO 下直接通过。``path`` 目标解析后
+工具在 DEFAULT/PLAN 下需确认，在 AUTO 下直接通过，若用户已在弹窗里给出
+**会话级**的"始终允许此类操作"（``WRITE_CATEGORY``），则本会话内免问。
+``path`` 目标解析后
 位于 output 目录内的写入被视为产物（artefact）写入，直接放行；写入
 data_cache 则被结构性拒绝——缓存的 lookup 键跨用户共享，模型侧的一次
 写入就能替换他人稍后命中的载荷。
@@ -30,6 +32,12 @@ _PATH_ARG_KEYS = ("path", "file", "filename", "target")
 # 使 web_search 与研报全文抓取共享一次授权——它们把不可信第三方文本拉入
 # 上下文的性质相同，分开问只会打断用户两次。
 EGRESS_CATEGORY = "egress"
+
+# 写类工具的"本会话始终允许"类别：与 egress 同为风险类别键，但生存期不同——
+# 它由调用方按**会话**持有一份（服务端在 loop_factory 内新建，随执行会话被
+# SessionRegistry 回收），因此新建会话或会话 TTL 过期重建后即失效。重试同一
+# 写操作反复弹框是它要解决的问题；授权不应活到下一个会话。
+WRITE_CATEGORY = "write"
 
 
 def _egress_requested(tool, args: dict) -> bool:
@@ -95,6 +103,12 @@ class PermissionGate:
     对话首次确认后免问。由调用方传入并共享（同一对话的多个 gate 实例
     看到同一份），进程内存活；对话结束即随 registry 消亡，重启后重新
     询问——免问授权的生存期不应长于它所授权的那个对话。
+
+    ``session_approved`` 是**会话级**的"始终允许"集合：用户在写工具确认
+    弹窗里选了"始终允许此类操作（本会话内）"后，``WRITE_CATEGORY`` 被记入，
+    本会话内后续写类调用免问。与 ``confirmed_categories`` 的区别只在生存期：
+    它由调用方按会话持有（服务端每次新建执行会话都新建一份），会话结束或
+    过期重建即失效，是比对话更短的授权窗口。
     """
 
     def __init__(
@@ -107,6 +121,7 @@ class PermissionGate:
         conversation_id: str = "local",
         confirmed_categories: set[str] | None = None,
         confirm_egress: Callable[[str, dict], Awaitable[bool]] | None = None,
+        session_approved: set[str] | None = None,
     ) -> None:
         self.settings = settings
         # ``mode`` 规范化后再存：下方对 AUTO 的判定用 ``is`` 比较枚举成员，而签名虽然
@@ -126,6 +141,9 @@ class PermissionGate:
         self.conversation_id = conversation_id
         self.confirmed_categories = (
             confirmed_categories if confirmed_categories is not None else set()
+        )
+        self.session_approved = (
+            session_approved if session_approved is not None else set()
         )
         # 可达性来自 workspace（唯一来源），与工具侧同源判定：门与工具因此
         # 不可能对"这是不是产物写入"得出不同结论。此前两者各自拼根，
@@ -165,6 +183,13 @@ class PermissionGate:
         # 5. 写类工具的模式回退。
         if self.mode is PermissionMode.AUTO:
             return GateDecision(Verdict.ALLOW, "auto 模式放行写类工具")
+
+        # 5b. 本会话"始终允许此类操作"：用户已在确认弹窗里给出会话级授权。
+        #     放在 AUTO 之后、交互通道之前：它只替代"逐次询问"这一步，不
+        #     绕过上方任何一道硬边界（deny 规则、缓存拒写）。仅写类走到
+        #     这里——读类在上一步已返回，外发走 _check_egress。
+        if WRITE_CATEGORY in self.session_approved:
+            return GateDecision(Verdict.ALLOW, "本会话已允许写类工具")
 
         if self.confirm is None:
             # 非交互式调用方：拒绝，而不是静默放行。
