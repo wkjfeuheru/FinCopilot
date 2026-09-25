@@ -25,6 +25,8 @@ from pathlib import Path
 
 from finharness.context.memory.records import (
     CHECKPOINT_STATUSES,
+    INDEX_AGENT_STATES_BY_CONVERSATION,
+    INDEX_AGENT_STATES_BY_RUN,
     INDEX_CITATIONS_BY_CONVERSATION,
     INDEX_CONCLUSIONS_BY_SUBJECT,
     INDEX_CONVERSATIONS_BY_USER,
@@ -38,6 +40,7 @@ from finharness.context.memory.records import (
     LTM_FACT_KINDS,
     LTM_MAX_STATEMENT_CHARS,
     LTM_MAX_SUMMARY_CHARS,
+    SCHEMA_AGENT_STATE_SNAPSHOTS,
     SCHEMA_CITATIONS,
     SCHEMA_CONCLUSIONS,
     SCHEMA_CONVERSATIONS,
@@ -60,10 +63,41 @@ from finharness.context.memory.records import (
     _notes_has_user_scoped_pk,
 )
 from finharness.data.citation import Citation
+from finharness.engine.state import AgentPhase, AgentState, state_to_dict
 from finharness.types import Msg
 from finharness.utils.clock import utc_now_iso
 from finharness.utils.jsonx import stable_dumps
 from finharness.utils.sqlite import SqliteStore
+
+
+def _snapshot_resumable(state: AgentState) -> bool:
+    """Denormalized resumable flag: nonterminal, or complete with outcome.resumable."""
+    if state.phase is AgentPhase.ERROR:
+        return False
+    if state.phase is AgentPhase.COMPLETE:
+        return state.outcome is not None and state.outcome.resumable
+    return True
+
+
+def insert_agent_state(connection: sqlite3.Connection, state: AgentState) -> None:
+    """Append one agent FSM snapshot row inside an open transaction."""
+    connection.execute(
+        "INSERT INTO agent_state_snapshots ("
+        " user_id, conversation_id, run_id, revision, phase, schema_version,"
+        " resumable, state_json, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            state.user_id,
+            state.conversation_id,
+            state.run_id,
+            int(state.revision),
+            state.phase.value,
+            int(state.schema_version),
+            1 if _snapshot_resumable(state) else 0,
+            json.dumps(state_to_dict(state), ensure_ascii=False),
+            state.updated_at,
+        ),
+    )
 
 
 class MemoryStore(SqliteStore):
@@ -85,6 +119,9 @@ class MemoryStore(SqliteStore):
             connection.execute(SCHEMA_LTM_PROCESSED)
             connection.execute(SCHEMA_TURN_CHECKPOINTS)
             self._migrate(connection)
+            connection.execute(SCHEMA_AGENT_STATE_SNAPSHOTS)
+            connection.execute(INDEX_AGENT_STATES_BY_CONVERSATION)
+            connection.execute(INDEX_AGENT_STATES_BY_RUN)
             connection.execute(INDEX_MESSAGES_BY_CONVERSATION)
             connection.execute(INDEX_CONCLUSIONS_BY_SUBJECT)
             connection.execute(INDEX_CITATIONS_BY_CONVERSATION)
@@ -394,35 +431,60 @@ class MemoryStore(SqliteStore):
         }
 
     # -- 对话记录 --------------------------------------------------------------
+    @staticmethod
+    def _append_messages(
+        connection: sqlite3.Connection,
+        conversation_id: str,
+        messages: list[Msg] | tuple[Msg, ...],
+    ) -> tuple[int, int]:
+        """在已打开的连接上写入消息；返回分配到的 seq 区间。"""
+        if not messages:
+            return (0, 0)
+        now = utc_now_iso()
+        user_id = MemoryStore._conversation_user(connection, conversation_id)
+        row = connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        base = int(row["max_seq"])
+        rows = [
+            (
+                user_id,
+                conversation_id,
+                base + offset,
+                message.role,
+                message.content,
+                _encode_payload(message),
+                now,
+            )
+            for offset, message in enumerate(messages, start=1)
+        ]
+        connection.executemany(
+            "INSERT INTO messages (user_id, conversation_id, seq, role, content, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        return (base + 1, base + len(messages))
+
     def append_messages(self, conversation_id: str, messages: list[Msg]) -> tuple[int, int]:
         """在单个事务中写入消息；返回分配到的 seq 区间。"""
         if not messages:
             return (0, 0)
-        now = utc_now_iso()
         with self._connect() as connection:
-            user_id = self._conversation_user(connection, conversation_id)
-            row = connection.execute(
-                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM messages WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            base = int(row["max_seq"])
-            rows = [
-                (
-                    user_id,
-                    conversation_id,
-                    base + offset,
-                    message.role,
-                    message.content,
-                    _encode_payload(message),
-                    now,
-                )
-                for offset, message in enumerate(messages, start=1)
-            ]
-            connection.executemany(
-                "INSERT INTO messages (user_id, conversation_id, seq, role, content, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
-        return (base + 1, base + len(messages))
+            return self._append_messages(connection, conversation_id, messages)
+
+    def commit_agent_transition(
+        self, state: AgentState, *, messages: tuple[Msg, ...] = ()
+    ) -> None:
+        """Atomically append optional messages and one FSM snapshot revision."""
+        with self._connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                # Default sqlite3 isolation may already have an open transaction;
+                # the with-block commit still keeps message + snapshot atomic.
+                pass
+            self._append_messages(connection, state.conversation_id, messages)
+            insert_agent_state(connection, state)
 
     def message_seq_range(self, conversation_id: str) -> tuple[int, int]:
         with self._connect() as connection:
@@ -1586,6 +1648,7 @@ class MemoryStore(SqliteStore):
                 "DELETE FROM conclusions WHERE conversation_id = ?",
                 "DELETE FROM conversation_symbols WHERE conversation_id = ?",
                 "DELETE FROM turn_checkpoints WHERE conversation_id = ?",
+                "DELETE FROM agent_state_snapshots WHERE conversation_id = ?",
                 "DELETE FROM conversations WHERE conversation_id = ?",
             ):
                 connection.execute(statement, (conversation_id,))
@@ -1647,6 +1710,13 @@ class MemoryStore(SqliteStore):
                     " FROM ltm_facts WHERE user_id = ? ORDER BY updated_at",
                     user_id,
                 ),
+                "agent_state_snapshots": rows(
+                    "SELECT conversation_id, run_id, revision, phase, schema_version,"
+                    " resumable, state_json, created_at"
+                    " FROM agent_state_snapshots WHERE user_id = ?"
+                    " ORDER BY conversation_id, run_id, revision",
+                    user_id,
+                ),
             }
 
     def purge_user_data(self, *, user_id: str) -> dict[str, int]:
@@ -1663,6 +1733,7 @@ class MemoryStore(SqliteStore):
             ("conclusions", "DELETE FROM conclusions WHERE user_id = ?"),
             ("conversation_symbols", "DELETE FROM conversation_symbols WHERE user_id = ?"),
             ("turn_checkpoints", "DELETE FROM turn_checkpoints WHERE user_id = ?"),
+            ("agent_state_snapshots", "DELETE FROM agent_state_snapshots WHERE user_id = ?"),
             ("ltm_processed", "DELETE FROM ltm_processed WHERE user_id = ?"),
             ("ltm_episodes", "DELETE FROM ltm_episodes WHERE user_id = ?"),
             ("ltm_facts", "DELETE FROM ltm_facts WHERE user_id = ?"),

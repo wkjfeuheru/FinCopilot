@@ -11,6 +11,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
+from finharness.engine.state import AgentState
 from finharness.types import Msg, ToolUse
 
 SCHEMA_CONVERSATIONS = """
@@ -201,6 +202,34 @@ CREATE TABLE IF NOT EXISTS turn_checkpoints (
 # stopped 表示用户中止或传输断开；completed 表示整轮成功交付。
 CHECKPOINT_STATUSES = ("running", "stopped", "completed")
 
+# Agent FSM snapshots (append-only revisions for restart recovery).
+SCHEMA_AGENT_STATE_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS agent_state_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    resumable INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (run_id, revision),
+    FOREIGN KEY (user_id, conversation_id)
+      REFERENCES conversations(user_id, conversation_id)
+      ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+)
+"""
+INDEX_AGENT_STATES_BY_CONVERSATION = (
+    "CREATE INDEX IF NOT EXISTS idx_agent_states_conversation "
+    "ON agent_state_snapshots(user_id, conversation_id, id DESC)"
+)
+INDEX_AGENT_STATES_BY_RUN = (
+    "CREATE INDEX IF NOT EXISTS idx_agent_states_run "
+    "ON agent_state_snapshots(user_id, run_id, revision DESC)"
+)
+
 INDEX_MESSAGES_BY_CONVERSATION = (
     "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, seq)"
 )
@@ -289,6 +318,22 @@ class TurnCheckpoint:
     @property
     def recoverable(self) -> bool:
         return self.status == "stopped"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentStateSnapshot:
+    """Indexed fields for one append-only agent FSM snapshot plus decoded state."""
+
+    user_id: str
+    conversation_id: str
+    run_id: str
+    revision: int
+    phase: str
+    schema_version: int
+    resumable: bool
+    created_at: str
+    state: AgentState
+    id: int = 0
 
 
 # 跨对话情节记忆的类别。task_result 由引擎每轮结构化写入（无 LLM）；
