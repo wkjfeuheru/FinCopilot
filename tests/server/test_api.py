@@ -811,7 +811,7 @@ def test_stream_synthesizes_done_when_engine_ends_without_one(
     from finharness.engine.loop import AgentLoop
     from finharness.types import AgentTurnOutcome
 
-    async def silent_run(self, user_msg: str) -> AgentTurnOutcome:
+    async def silent_run(self, user_msg: str, *, resume: bool = False) -> AgentTurnOutcome:
         # 引擎正常返回，但不向 sink 发任何终止事件。
         return AgentTurnOutcome(answer="done-ish")
 
@@ -831,7 +831,7 @@ def test_stream_reports_terminal_error_when_engine_raises(monkeypatch, tmp_path)
     """引擎抛出异常时，客户端仍应收到 ``error`` 与 ``done``，而不是静默断流。"""
     from finharness.engine.loop import AgentLoop
 
-    async def exploding_run(self, user_msg: str):
+    async def exploding_run(self, user_msg: str, *, resume: bool = False):
         raise RuntimeError("engine blew up")
 
     monkeypatch.setattr(AgentLoop, "run", exploding_run)
@@ -853,7 +853,7 @@ def test_stream_emits_heartbeat_during_silence(monkeypatch, tmp_path) -> None:
     from finharness.engine.loop import AgentLoop
     from finharness.types import AgentTurnOutcome
 
-    async def slow_run(self, user_msg: str) -> AgentTurnOutcome:
+    async def slow_run(self, user_msg: str, *, resume: bool = False) -> AgentTurnOutcome:
         await asyncio.sleep(0.3)
         return AgentTurnOutcome(answer="late")
 
@@ -905,3 +905,203 @@ def test_chat_survives_unwritable_token_vocab_cache(tmp_path, monkeypatch) -> No
     assert response.status_code == 200
     names = [name for name, _ in parse_events(response.text)]
     assert names[-1] == "done", response.text[:400]
+
+
+# --- Explicit resume / abandon / history (agent-loop FSM) ----------------------
+
+from dataclasses import replace
+
+from finharness.context.memory.state_store import SqliteAgentStateStore
+from finharness.engine.state import (
+    HydrationFinished,
+    StopRequested,
+    new_agent_state,
+    state_from_dict,
+    transition,
+)
+from finharness.server.api import ChatRequest
+from finharness.types import Msg
+from tests.server.conftest import authed_client
+
+_RESUME_CTX: dict = {}
+
+
+def _resume_settings(tmp_path) -> Settings:
+    return Settings(
+        data={"cache_dir": tmp_path / "cache"},
+        paths={
+            "output_dir": tmp_path / "output",
+            "memory_db": tmp_path / "state" / "memory.db",
+            "auth_db": tmp_path / "state" / "users.db",
+        },
+    )
+
+
+def stream_all(client: TestClient, payload: dict) -> list[dict]:
+    response = client.post("/v1/chat/stream", json=payload)
+    assert response.status_code == 200, response.text
+    return [{"event": name, "data": data} for name, data in parse_events(response.text)]
+
+
+def latest_state(run_id: str):
+    memory = _RESUME_CTX["memory"]
+    user_id = _RESUME_CTX["user_id"]
+    return SqliteAgentStateStore(memory).latest_for_run(run_id, user_id)
+
+
+def latest_state_for_conversation(conversation_id: str):
+    memory = _RESUME_CTX["memory"]
+    user_id = _RESUME_CTX["user_id"]
+    with memory._connect() as connection:
+        row = connection.execute(
+            "SELECT state_json FROM agent_state_snapshots"
+            " WHERE user_id = ? AND conversation_id = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (user_id, conversation_id),
+        ).fetchone()
+    assert row is not None
+    return state_from_dict(json.loads(row["state_json"]))
+
+
+@pytest.fixture
+def client(tmp_path):
+    app = create_app(
+        FakeProvider(["answer from run"]),
+        settings=_resume_settings(tmp_path),
+        single_tenant=True,
+    )
+    authed = authed_client(TestClient(app))
+    _RESUME_CTX["memory"] = authed.app.state.memory_store
+    _RESUME_CTX["user_id"] = authed.finharness_user["id"]
+    return authed
+
+
+@pytest.fixture
+def seeded_state(client):
+    memory = client.app.state.memory_store
+    user_id = client.finharness_user["id"]
+    memory.ensure_conversation("c1", user_id=user_id, title="prior")
+    memory.append_messages("c1", [Msg.user("prior question")])
+    store = SqliteAgentStateStore(memory)
+    hydrate = new_agent_state(
+        run_id="old_run", conversation_id="c1", user_id=user_id, now="t0"
+    )
+    thinking = transition(hydrate, HydrationFinished(False, None, at="t1"))
+    stopped = replace(
+        transition(thinking, StopRequested(at="t2")),
+        turn=2,
+    )
+    store.save(stopped)
+    return stopped
+
+
+def test_chat_request_defaults_resume_to_false():
+    request = ChatRequest(message="new")
+    assert request.resume is False
+
+
+def test_normal_message_abandons_resumable_run(client, seeded_state):
+    stream_all(client, {"conversation_id": "c1", "message": "new question"})
+    assert latest_state("old_run").outcome.kind == "abandoned"
+    assert latest_state_for_conversation("c1").run_id != "old_run"
+
+
+def test_resume_keeps_run_id_and_increments_revision(client, seeded_state):
+    events = stream_all(
+        client, {"conversation_id": "c1", "message": "", "resume": True}
+    )
+    states = [event["data"] for event in events if event["event"] == "state"]
+    assert states[0]["run_id"] == "old_run"
+    assert states[0]["revision"] > seeded_state.revision
+
+
+def test_resume_without_snapshot_or_checkpoint_returns_409(client):
+    memory = client.app.state.memory_store
+    user_id = client.finharness_user["id"]
+    memory.ensure_conversation("c_empty", user_id=user_id, title="t")
+    memory.append_messages("c_empty", [Msg.user("hi")])
+
+    response = client.post(
+        "/v1/chat/stream",
+        json={"conversation_id": "c_empty", "message": "", "resume": True},
+    )
+
+    assert response.status_code == 409
+    detail = str(response.json().get("detail", "")).lower()
+    assert "resumable" in detail or "no resumable" in detail
+
+
+def test_history_includes_public_state_when_fsm_snapshot_exists(client, seeded_state):
+    body = client.get("/v1/conversations/c1/messages").json()
+
+    assert body["resumable"] is not None
+    assert body["resumable"]["reason"] == "user_stopped"
+    assert body["resumable"]["rounds"] == 2
+    assert "updated_at" in body["resumable"]
+    assert "plan" not in body["resumable"]
+    state = body["resumable"]["state"]
+    assert state["run_id"] == "old_run"
+    assert state["phase"] == "complete"
+    assert state["revision"] == seeded_state.revision
+    assert "calls" in state
+    assert "confirmation" in state
+
+
+def test_history_falls_back_to_checkpoint_when_no_fsm_snapshot(client):
+    memory = client.app.state.memory_store
+    user_id = client.finharness_user["id"]
+    memory.ensure_conversation("c_legacy", user_id=user_id, title="t")
+    memory.append_messages("c_legacy", [Msg.user("stopped")])
+    memory.save_checkpoint(
+        "c_legacy",
+        status="stopped",
+        reason="user_stopped",
+        rounds=2,
+        plan={"plan_id": "p1", "goal": "g", "steps": [{"seq": 1, "action": "a"}]},
+    )
+
+    body = client.get("/v1/conversations/c_legacy/messages").json()
+
+    assert body["resumable"]["reason"] == "user_stopped"
+    assert body["resumable"]["rounds"] == 2
+    assert body["resumable"]["plan"] == {
+        "plan_id": "p1",
+        "goal": "g",
+        "steps": [{"seq": 1, "action": "a"}],
+    }
+    assert "updated_at" in body["resumable"]
+    assert "state" not in body["resumable"]
+
+
+def test_resume_with_legacy_checkpoint_starts_new_fsm_run(client):
+    memory = client.app.state.memory_store
+    user_id = client.finharness_user["id"]
+    memory.ensure_conversation("c_ckpt", user_id=user_id, title="t")
+    memory.append_messages("c_ckpt", [Msg.user("stopped")])
+    memory.save_checkpoint(
+        "c_ckpt",
+        status="stopped",
+        reason="user_stopped",
+        rounds=3,
+        plan={
+            "plan_id": "plan_legacy",
+            "goal": "finish research",
+            "steps": [{"seq": 1, "action": "fetch", "status": "done"}],
+            "revision": 1,
+        },
+    )
+
+    events = stream_all(
+        client, {"conversation_id": "c_ckpt", "message": "", "resume": True}
+    )
+    states = [event["data"] for event in events if event["event"] == "state"]
+    assert states
+    assert states[0]["phase"] == "hydrate"
+    assert states[0]["run_id"] != "old_run"
+
+    store = SqliteAgentStateStore(memory)
+    assert store.latest_for_run(states[0]["run_id"], user_id) is not None
+    body = client.get("/v1/conversations/c_ckpt/messages").json()
+    if body["resumable"] is not None and "state" in body["resumable"]:
+        assert "plan" not in body["resumable"]
+        assert body["resumable"]["state"]["run_id"] == states[0]["run_id"]

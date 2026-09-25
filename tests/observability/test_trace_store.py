@@ -164,3 +164,17 @@ def test_cleanup_removes_old_runs(store):
         conn.execute("UPDATE trace_runs SET started_at = '2000-01-01T00:00:00.000+00:00' WHERE run_id='old'")
     assert store.cleanup(30) == 1
     assert store.run_detail("old") is None
+
+
+def test_trace_store_records_state_events_without_special_casing(store):
+    """TraceStore already records every non-delta event — including FSM ``state``."""
+    store.start_run(run_id="tr_state", input="resume me")
+    store.record_event(
+        "tr_state",
+        "state",
+        {"run_id": "r1", "revision": 2, "phase": "hydrate"},
+    )
+    detail = store.run_detail("tr_state")
+    assert detail is not None
+    assert [event["kind"] for event in detail["events"]] == ["state"]
+    assert detail["events"][0]["payload"]["phase"] == "hydrate"

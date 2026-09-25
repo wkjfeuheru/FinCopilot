@@ -1092,6 +1092,11 @@ class AgentLoop(PlanProgressMixin):
             await machine.dispatch(ResumeRequested(at=utc_now_iso()))
         else:
             self._reset_run_locals()
+            # A normal new message abandons any older resumable run before
+            # hydrate, so eval/scripts share the same supersede semantics.
+            state_store.abandon_latest(
+                self.conversation_id, self.user_id, now=utc_now_iso()
+            )
             if isinstance(self.store, MemoryStore):
                 self.store.ensure_conversation(
                     self.conversation_id,

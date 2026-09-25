@@ -32,6 +32,7 @@ from finharness.compute.protocol import TaskSigner
 from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
 from finharness.config.store import ConfigStore
+from finharness.context.memory.state_store import SqliteAgentStateStore
 from finharness.context.memory.store import MemoryStore
 from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
@@ -43,6 +44,7 @@ from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
 from finharness.engine.prompt import system_prompt
+from finharness.engine.state import public_state_view
 from finharness.hooks.audit import AuditHook, AuditLogWriter
 from finharness.hooks.base import HookChain
 from finharness.observability import build_observer, get_logger, setup_logging
@@ -83,6 +85,10 @@ class ChatRequest(BaseModel):
     # 因为服务端会从对话中解析出它。
     session_id: str | None = None
     message: str
+    # Explicit recovery: resume=true continues the latest resumable FSM run
+    # (or hydrates a legacy TurnCheckpoint into a new run). A normal message
+    # abandons any older resumable run before starting fresh.
+    resume: bool = False
 
 
 class RespondRequest(BaseModel):
@@ -132,6 +138,8 @@ class QueueSink:
             "loop_guard",
             "plan_progress",
             "interactive_request",
+            # FSM public phase view — clients rebuild AgentTrace from these.
+            "state",
             # ``answer`` 与终态的 ``done`` 也属于失败轮次的重放记录：
             # 重新加载的对话仍须展示本次运行已确立的部分发现。
             "answer",
@@ -1175,9 +1183,21 @@ def create_app(
                 rendered.append(item)
         # 上一轮被停止时报告可继续（docs 03.3）：客户端据此在刷新后仍能显示
         # "继续研究"入口，而不是把一次中断当成一次普通的失败。
+        # FSM snapshot is authoritative when present; TurnCheckpoint is the
+        # legacy fallback until the first explicit resume creates a snapshot.
+        state_store = SqliteAgentStateStore(memory_store)
+        snapshot = state_store.latest_resumable(conversation_id, user.id)
         checkpoint = memory_store.load_latest_checkpoint(conversation_id)
         resumable = None
-        if checkpoint is not None and checkpoint.recoverable:
+        if snapshot is not None:
+            outcome = snapshot.outcome
+            resumable = {
+                "reason": (outcome.reason if outcome is not None else None) or "",
+                "rounds": snapshot.turn,
+                "updated_at": snapshot.updated_at,
+                "state": public_state_view(snapshot),
+            }
+        elif checkpoint is not None and checkpoint.recoverable:
             resumable = {
                 "reason": checkpoint.reason,
                 "rounds": checkpoint.rounds,
@@ -1312,6 +1332,27 @@ def create_app(
                 detail=f"本时段对话轮次已达上限，请 {turn_decision.retry_after_s} 秒后重试",
                 headers={"Retry-After": str(turn_decision.retry_after_s)},
             )
+
+        # Explicit resume routing (before mark_busy): 409 when nothing to
+        # resume; FSM snapshot resumes in-place; recoverable TurnCheckpoint
+        # alone starts a new FSM run so hydrate can restore the old plan.
+        loop_resume = False
+        run_message = request.message
+        if request.resume:
+            agent_states = SqliteAgentStateStore(memory_store)
+            snapshot = agent_states.latest_resumable(
+                session.conversation_id, user.id
+            )
+            checkpoint = memory_store.load_latest_checkpoint(session.conversation_id)
+            has_legacy = checkpoint is not None and checkpoint.recoverable
+            if snapshot is None and not has_legacy:
+                raise HTTPException(
+                    status_code=409,
+                    detail="no resumable agent state for this conversation",
+                )
+            run_message = request.message or ""
+            loop_resume = snapshot is not None
+
         sink = QueueSink()
         session.loop.output = sink
         # 停止信号挂在会话上，使 POST /v1/chat/stop 能从此处之外置位它；
@@ -1364,7 +1405,9 @@ def create_app(
             record_trace_event = None
         sink = QueueSink(trace_recorder=record_trace_event)
         session.loop.output = sink
-        task = asyncio.create_task(session.loop.run(request.message))
+        task = asyncio.create_task(
+            session.loop.run(run_message, resume=loop_resume)
+        )
 
         async def events() -> AsyncIterator[str]:
             """SSE 事件生成器：转发引擎事件并在结束时补齐元数据。

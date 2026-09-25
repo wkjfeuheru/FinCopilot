@@ -268,3 +268,51 @@ def test_every_run_consumes_the_previous_checkpoint_even_when_memory_is_loaded(t
         "新一轮运行途中旧断点仍可见——模型在为新请求工作时，界面可能仍显示"
         "上一轮的'继续研究'入口"
     )
+
+
+def test_legacy_checkpoint_resume_creates_fsm_snapshot_and_restores_plan(tmp_path):
+    """Explicit resume with only TurnCheckpoint: new FSM run + plan restore.
+
+    Once the FSM snapshot exists it is authoritative; the old checkpoint must
+    not override public state (plan may still be consumed into ctx).
+    """
+    store = MemoryStore(tmp_path / "memory.db")
+    conversation_id = "c_legacy_fsm"
+    plan = Plan(
+        plan_id="plan_legacy",
+        goal="完成深度研究",
+        steps=[PlanStep(seq=1, action="取数", status="done")],
+        revision=2,
+    )
+    store.ensure_conversation(conversation_id, user_id="", title="t")
+    store.save_checkpoint(
+        conversation_id,
+        status="stopped",
+        reason="user_stopped",
+        rounds=4,
+        plan=plan.to_dict(),
+    )
+
+    loop = build_loop(
+        tmp_path,
+        ScriptedProvider([text_round("继续后的答案")]),
+        store=store,
+        conversation_id=conversation_id,
+    )
+
+    async def run():
+        # Legacy path: no FSM snapshot → resume=False so hydrate restores plan.
+        return await loop.run("", resume=False)
+
+    asyncio.run(run())
+
+    assert loop.ctx.plan is not None
+    assert loop.ctx.plan.plan_id == "plan_legacy"
+    with store._connect() as connection:
+        rows = connection.execute(
+            "SELECT run_id, phase FROM agent_state_snapshots"
+            " WHERE conversation_id = ? ORDER BY id",
+            (conversation_id,),
+        ).fetchall()
+    assert rows, "legacy resume must create FSM snapshots"
+    assert rows[-1]["phase"] in {"complete", "error"}
