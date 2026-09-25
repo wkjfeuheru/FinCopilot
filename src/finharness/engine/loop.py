@@ -1036,11 +1036,18 @@ class AgentLoop(PlanProgressMixin):
         )
 
     def _after_dispatch(self, messages: tuple[Msg, ...]) -> None:
-        """Apply committed Msgs to in-process WorkingMemory (already in SQLite)."""
+        """Apply committed Msgs to WorkingMemory; drop them from pending."""
         known = {id(message) for message in self.memory.raw}
         for message in messages:
             if id(message) not in known:
                 self.memory.append(message, track=False)
+        committed = {id(message) for message in messages}
+        if committed:
+            self.memory.pending = [
+                message
+                for message in self.memory.pending
+                if id(message) not in committed
+            ]
 
     def _tool_permission(self, name: str) -> str:
         resolve = getattr(self.registry, "resolve", None)
@@ -1373,8 +1380,8 @@ class AgentLoop(PlanProgressMixin):
                 for tool_use in tool_uses
             }
             assistant = Msg(role="assistant", content=None, tool_uses=list(tool_uses))
+            # Keep pending until dispatch commits; clear in _after_dispatch.
             pending = tuple(self.memory.pending)
-            self.memory.pending = []
             return EffectResult(
                 ModelFinished(
                     answer="",
@@ -1595,17 +1602,29 @@ class AgentLoop(PlanProgressMixin):
     async def _persist_aborted_results(
         self, machine: AgentStateMachine, calls: tuple
     ) -> list[tuple[str, str]]:
-        """Persist FAILED/aborted results for every call still lacking a result."""
+        """Persist FAILED/aborted results for every call still lacking a result.
+
+        Trust durable ``machine.state.calls`` (result_json or terminal status),
+        not in-process ``_finished_call_ids`` — cancel can land after save and
+        before local bookkeeping, and must not clobber a completed result.
+        """
         aborted: list[tuple[str, str]] = []
+        terminal = {
+            CallStatus.COMPLETED,
+            CallStatus.FAILED,
+            CallStatus.UNCERTAIN,
+        }
         for call in calls:
-            if call.call_id in self._finished_call_ids:
-                current = next(
-                    (c for c in machine.state.calls if c.call_id == call.call_id),
-                    None,
-                )
-                if current is not None and current.result_json is not None:
-                    aborted.append((call.call_id, current.result_json))
-                    continue
+            current = next(
+                (c for c in machine.state.calls if c.call_id == call.call_id),
+                call,
+            )
+            if current.result_json is not None:
+                aborted.append((call.call_id, current.result_json))
+                continue
+            if current.status in terminal:
+                # Terminal without a result payload (e.g. UNCERTAIN): do not invent cancel.
+                continue
             result_json = json.dumps(
                 {
                     "ok": False,
@@ -1614,16 +1633,15 @@ class AgentLoop(PlanProgressMixin):
                 },
                 ensure_ascii=False,
             )
-            if call.call_id not in self._finished_call_ids:
-                await machine.dispatch(
-                    ToolCallFinished(
-                        call_id=call.call_id,
-                        status=CallStatus.FAILED,
-                        result_json=result_json,
-                        at=utc_now_iso(),
-                    )
+            await machine.dispatch(
+                ToolCallFinished(
+                    call_id=call.call_id,
+                    status=CallStatus.FAILED,
+                    result_json=result_json,
+                    at=utc_now_iso(),
                 )
-                self._finished_call_ids.add(call.call_id)
+            )
+            self._finished_call_ids.add(call.call_id)
             aborted.append((call.call_id, result_json))
         return aborted
 

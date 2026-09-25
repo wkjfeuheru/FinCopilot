@@ -219,3 +219,94 @@ def test_recovery_marks_uncommitted_write_as_uncertain(tmp_path):
     assert state.phase is AgentPhase.AWAITING_CONFIRMATION
     assert state.calls[0].status is CallStatus.UNCERTAIN
     assert "上次执行结果未知" in state.confirmation.prompt
+
+
+def test_cancel_abort_does_not_clobber_durable_finished_call(tmp_path):
+    """Durable ToolCallFinished must win even if _finished_call_ids missed the id."""
+    from finharness.engine.machine import AgentStateMachine
+
+    store = _memory(tmp_path)
+    store.ensure_conversation("conv", user_id="", title="test")
+    durable = '{"ok":true,"content":"kept"}'
+    state = replace(
+        new_agent_state(
+            run_id="run", conversation_id="conv", user_id="", now="t0"
+        ),
+        phase=AgentPhase.TOOL_USE,
+        revision=1,
+        turn=1,
+        tool_calls=2,
+        calls=(
+            call("done", status="completed", result_json=durable),
+            call("open", status="running"),
+        ),
+        updated_at="t1",
+    )
+    machine = AgentStateMachine(state, store=SqliteAgentStateStore(store), output=None)
+    loop = AgentLoop(
+        provider=ScriptedProvider([]),
+        registry=StubRegistry(),
+        settings=_settings(),
+        system="test",
+        store=store,
+        conversation_id="conv",
+        user_id="",
+    )
+    loop._machine = machine
+    loop._finished_call_ids = set()  # simulate cancel between save and local bookkeeping
+
+    aborted = asyncio.run(loop._persist_aborted_results(machine, state.calls))
+
+    done = next(c for c in machine.state.calls if c.call_id == "done")
+    assert done.status is CallStatus.COMPLETED
+    assert done.result_json == durable
+    by_id = dict(aborted)
+    assert by_id["done"] == durable
+    assert "cancel" in json.loads(by_id["open"])["error"]
+
+
+def test_pending_survives_until_model_finished_after_dispatch(tmp_path):
+    """User frame must remain flushable if ModelFinished dispatch never runs."""
+    from finharness.engine.machine import AgentStateMachine
+
+    store = _memory(tmp_path)
+    tool = RecordingTool("quote")
+    registry = StubRegistry({"quote": tool}, read_only={"quote"})
+    provider = ScriptedProvider(
+        [tool_round(ToolUse("c1", "quote", {"call_id": "c1"}))]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        registry=registry,
+        settings=_settings(),
+        system="test",
+        store=store,
+        conversation_id="conv",
+        user_id="",
+    )
+    store.ensure_conversation("conv", user_id="", title="test")
+    initial = new_agent_state(
+        run_id="run", conversation_id="conv", user_id="", now="t0"
+    )
+    machine = AgentStateMachine(initial, store=SqliteAgentStateStore(store), output=None)
+    loop._machine = machine
+
+    async def drive():
+        await machine.start()
+        loop._last_user_msg = "quote"
+        hydrate = await loop._effect_hydrate(machine.state)
+        await machine.dispatch(hydrate.event, messages=hydrate.messages)
+        loop._after_dispatch(hydrate.messages)
+        assert any(m.role == "user" for m in loop.memory.pending)
+        thinking = machine.state
+        assert thinking.phase is AgentPhase.THINKING
+        result = await loop._effect_think(thinking)
+        # Pending must still hold the user frame until dispatch succeeds.
+        assert any(m.role == "user" for m in loop.memory.pending)
+        assert any(m.role == "user" for m in result.messages)
+        assert any(
+            getattr(m, "tool_uses", None) for m in result.messages
+        )
+        return result
+
+    asyncio.run(drive())
