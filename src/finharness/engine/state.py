@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from typing import Any
@@ -287,7 +288,7 @@ def _is_resumable(state: AgentState) -> bool:
 
 
 def _copy_args(args: Mapping[str, Any]) -> dict[str, Any]:
-    return dict(args)
+    return deepcopy(dict(args))
 
 
 def _persisted_from_tool_use(
@@ -349,6 +350,11 @@ def transition(state: AgentState, event: AgentEvent) -> AgentState:
 
     if isinstance(event, HydrationFinished):
         _require(state.phase is AgentPhase.HYDRATE, state, event)
+        if event.needs_compaction and event.resume_phase is not None:
+            raise InvalidTransition(
+                "HydrationFinished cannot set needs_compaction with resume_phase; "
+                "compact and resume are mutually exclusive"
+            )
         if event.needs_compaction:
             phase = AgentPhase.COMPACT
         elif event.resume_phase is not None:

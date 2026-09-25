@@ -126,6 +126,19 @@ def test_hydrate_to_compact_when_compaction_needed():
     assert next_state.updated_at == "t1"
 
 
+def test_hydrate_rejects_compaction_combined_with_resume_phase():
+    state = new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0")
+    with pytest.raises(InvalidTransition):
+        transition(
+            state,
+            HydrationFinished(
+                needs_compaction=True,
+                resume_phase=AgentPhase.TOOL_USE,
+                at="t1",
+            ),
+        )
+
+
 def test_hydrate_to_resume_phase_tooluse():
     state = new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0")
     next_state = transition(
@@ -516,6 +529,35 @@ def test_json_round_trip_preserves_state():
     restored = state_from_dict(payload)
     assert restored == state
     assert restored is not state
+
+
+def test_persisted_call_args_are_deep_copied():
+    nested = {"symbol": "AAPL", "filters": {"market": "US"}}
+    original = ToolUse(call_id="c1", name="quote", args=nested)
+    state = replace(
+        new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0"),
+        phase=AgentPhase.THINKING,
+        revision=1,
+    )
+    next_state = transition(
+        state,
+        ModelFinished(
+            answer="",
+            tool_uses=(original,),
+            usage=UsageDelta(),
+            at="t2",
+            permissions={"c1": "read"},
+        ),
+    )
+    call_args = next_state.calls[0].args
+    assert call_args == nested
+    assert call_args is not nested
+    assert call_args["filters"] is not nested["filters"]
+    nested["filters"]["market"] = "mutated"
+    assert call_args["filters"]["market"] == "US"
+    payload = state_to_dict(next_state)
+    payload["calls"][0]["args"]["filters"]["market"] = "payload-mutated"
+    assert next_state.calls[0].args["filters"]["market"] == "US"
 
 
 def test_state_from_dict_rejects_unsupported_schema_version():
