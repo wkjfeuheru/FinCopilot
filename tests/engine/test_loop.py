@@ -558,10 +558,53 @@ def test_unknown_and_non_read_only_tools_backfill_failures_and_keep_going():
         for event in events
         if event.kind == "tool_status" and event.data["status"] == "failed"
     ]
-    assert [event.data["call_id"] for event in failed] == ["call_unknown", "call_write"]
+    # DENY (write) rejects sequentially before ALLOW/unknown gather.
+    assert [event.data["call_id"] for event in failed] == ["call_write", "call_unknown"]
     assert outcome.answer == "final"
     assert outcome.succeeded is True
     assert outcome.tool_calls == 3
+
+
+def test_deny_rejects_sequentially_before_allow_gather():
+    """Mixed DENY+ALLOW: DENY tool_status(failed) precedes any ALLOW started.
+
+    Keeps unified ``_execute_one`` bookkeeping but must not race DENY under
+    ``asyncio.gather`` with ALLOW — otherwise SSE ordering is nondeterministic.
+    """
+
+    async def run():
+        sink = Sink()
+        slow = RecordingTool("get_quote", content="报价", delay=0.05)
+        writer = RecordingTool("write_note", permission=PermissionLevel.WRITE)
+        registry = StubRegistry(
+            {"get_quote": slow, "write_note": writer}, read_only={"get_quote"}
+        )
+        provider = ScriptedProvider(
+            [
+                tool_round(
+                    ToolUse("call_allow", "get_quote", {"symbol": "600519"}),
+                    ToolUse("call_deny", "write_note", {"text": "x"}),
+                ),
+                text_round("done"),
+            ]
+        )
+        loop = make_loop(provider, registry=registry, output=sink)
+        outcome = await loop.run("混合拒绝与放行")
+        return outcome, sink.events, writer, slow
+
+    outcome, events, writer, slow = asyncio.run(run())
+
+    statuses = [
+        (event.data["call_id"], event.data["status"])
+        for event in events
+        if event.kind == "tool_status"
+    ]
+    deny_failed = statuses.index(("call_deny", "failed"))
+    allow_started = statuses.index(("call_allow", "started"))
+    assert deny_failed < allow_started, statuses
+    assert writer.calls == []
+    assert slow.calls == [{"symbol": "600519"}]
+    assert outcome.succeeded is True
 
 
 def test_tool_exception_and_timeout_backfill_failures_and_model_recovers():

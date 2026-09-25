@@ -1538,14 +1538,17 @@ class AgentLoop(PlanProgressMixin):
             }
         ]
 
-        allow_calls, confirm_specs = await self._partition_tool_calls(to_run)
+        allow_calls, deny_calls, confirm_specs = await self._partition_tool_calls(
+            to_run
+        )
         for call in machine.state.calls:
             if call.result_json is not None:
                 results_by_id[call.call_id] = call.result_json
         if confirm_specs:
-            if allow_calls:
+            if allow_calls or deny_calls:
                 abort = await self._run_allow_calls(
                     allow_calls,
+                    deny_calls=deny_calls,
                     run_one=run_one,
                     results_by_id=results_by_id,
                     machine=machine,
@@ -1591,6 +1594,7 @@ class AgentLoop(PlanProgressMixin):
 
         abort = await self._run_allow_calls(
             allow_calls,
+            deny_calls=deny_calls,
             run_one=run_one,
             results_by_id=results_by_id,
             machine=machine,
@@ -1658,6 +1662,7 @@ class AgentLoop(PlanProgressMixin):
         self,
         allow_calls: list,
         *,
+        deny_calls: list | None = None,
         run_one,
         results_by_id: dict[str, str],
         machine: AgentStateMachine,
@@ -1669,10 +1674,19 @@ class AgentLoop(PlanProgressMixin):
         llm_first_ms: int,
         llm_ms: int,
     ) -> EffectResult | None:
-        """Execute allowed calls; return an EffectResult on abort paths, else None."""
-        if not allow_calls:
-            return None
+        """Reject DENY sequentially via run_one, then gather ALLOW calls.
+
+        DENY still goes through ``_execute_one`` (observer/stats/tool_status), but
+        never races under ``asyncio.gather`` with ALLOW — SSE failed-before-started
+        ordering for mixed batches stays deterministic.
+        """
+        deny_calls = list(deny_calls or [])
         try:
+            for call in deny_calls:
+                call_id, result_json = await run_one(call)
+                results_by_id[call_id] = result_json
+            if not allow_calls:
+                return None
             finished = await asyncio.gather(*(run_one(call) for call in allow_calls))
             for call_id, result_json in finished:
                 results_by_id[call_id] = result_json
@@ -1728,17 +1742,21 @@ class AgentLoop(PlanProgressMixin):
 
     async def _partition_tool_calls(
         self, to_run: list
-    ) -> tuple[list, list[tuple[str, ConfirmationSpec]]]:
-        """Split pending calls into immediately executable vs confirmation-needed.
+    ) -> tuple[list, list, list[tuple[str, ConfirmationSpec]]]:
+        """Split pending calls into ALLOW, DENY, and confirmation-needed.
 
-        Immediate DENY results are persisted here. CONFIRM / ask_user leave
-        tooluse via ``ConfirmationRequested`` (no await inside gather).
+        DENY calls are returned separately so the caller can reject them
+        sequentially via ``run_one`` → ``_execute_one`` (unified observer/stats/
+        tool_status bookkeeping) before ``asyncio.gather`` on ALLOW. CONFIRM /
+        ask_user leave tooluse via ``ConfirmationRequested`` (no await inside
+        gather).
         """
         allow_calls: list = []
+        deny_calls: list = []
         confirm_specs: list[tuple[str, ConfirmationSpec]] = []
         machine = self._machine
         if machine is None:
-            return list(to_run), []
+            return list(to_run), [], []
 
         for call in to_run:
             if call.call_id in self._confirmation_approved_ids:
@@ -1773,16 +1791,17 @@ class AgentLoop(PlanProgressMixin):
             else:
                 decision = await self.gate.check(tool, dict(call.args))
 
+            if decision.verdict is Verdict.DENY:
+                deny_calls.append(call)
+                continue
+
             if decision.verdict is Verdict.CONFIRM and decision.confirmation is not None:
                 confirm_specs.append((call.call_id, decision.confirmation))
                 continue
 
-            # DENY and ALLOW both execute via run_one → _execute_one so observer
-            # spans, SessionStats requests, and tool_status ordering stay unified.
-            # (Immediate partition-side _reject skipped those bookkeeping paths.)
             allow_calls.append(call)
 
-        return allow_calls, confirm_specs
+        return allow_calls, deny_calls, confirm_specs
 
     async def _persist_aborted_results(
         self, machine: AgentStateMachine, calls: tuple
