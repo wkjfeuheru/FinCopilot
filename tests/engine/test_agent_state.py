@@ -107,6 +107,7 @@ def test_new_agent_state_defaults():
     assert state.schema_version == SCHEMA_VERSION == 1
     assert state.revision == 0
     assert state.phase is AgentPhase.HYDRATE
+    assert state.resume_phase is None
     assert state.turn == 0
     assert state.calls == ()
     assert state.confirmation is None
@@ -122,18 +123,54 @@ def test_hydrate_to_compact_when_compaction_needed():
         state, HydrationFinished(needs_compaction=True, resume_phase=None, at="t1")
     )
     assert next_state.phase is AgentPhase.COMPACT
+    assert next_state.resume_phase is None
     assert next_state.revision == 1
     assert next_state.updated_at == "t1"
 
 
-def test_hydrate_rejects_compaction_combined_with_resume_phase():
+def test_hydrate_compact_then_resume_to_tooluse():
+    state = new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0")
+    compacting = transition(
+        state,
+        HydrationFinished(
+            needs_compaction=True,
+            resume_phase=AgentPhase.TOOL_USE,
+            at="t1",
+        ),
+    )
+    assert compacting.phase is AgentPhase.COMPACT
+    assert compacting.resume_phase is AgentPhase.TOOL_USE
+    resumed = transition(compacting, CompactionFinished(at="t2"))
+    assert resumed.phase is AgentPhase.TOOL_USE
+    assert resumed.resume_phase is None
+    assert resumed.compactions == 1
+
+
+def test_hydrate_compact_then_resume_to_awaiting_confirmation():
+    state = new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0")
+    compacting = transition(
+        state,
+        HydrationFinished(
+            needs_compaction=True,
+            resume_phase=AgentPhase.AWAITING_CONFIRMATION,
+            at="t1",
+        ),
+    )
+    assert compacting.phase is AgentPhase.COMPACT
+    assert compacting.resume_phase is AgentPhase.AWAITING_CONFIRMATION
+    resumed = transition(compacting, CompactionFinished(at="t2"))
+    assert resumed.phase is AgentPhase.AWAITING_CONFIRMATION
+    assert resumed.resume_phase is None
+
+
+def test_hydrate_rejects_illegal_resume_phase():
     state = new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0")
     with pytest.raises(InvalidTransition):
         transition(
             state,
             HydrationFinished(
                 needs_compaction=True,
-                resume_phase=AgentPhase.TOOL_USE,
+                resume_phase=AgentPhase.COMPLETE,
                 at="t1",
             ),
         )
@@ -148,6 +185,7 @@ def test_hydrate_to_resume_phase_tooluse():
         ),
     )
     assert next_state.phase is AgentPhase.TOOL_USE
+    assert next_state.resume_phase is None
 
 
 def test_hydrate_to_awaiting_confirmation_via_resume_phase():
@@ -161,6 +199,7 @@ def test_hydrate_to_awaiting_confirmation_via_resume_phase():
         ),
     )
     assert next_state.phase is AgentPhase.AWAITING_CONFIRMATION
+    assert next_state.resume_phase is None
 
 
 def test_compact_to_thinking_increments_compactions():
@@ -169,9 +208,11 @@ def test_compact_to_thinking_increments_compactions():
         phase=AgentPhase.COMPACT,
         revision=1,
         compactions=0,
+        resume_phase=None,
     )
     next_state = transition(state, CompactionFinished(at="t2"))
     assert next_state.phase is AgentPhase.THINKING
+    assert next_state.resume_phase is None
     assert next_state.compactions == 1
     assert next_state.revision == 2
 
@@ -497,7 +538,8 @@ def test_state_is_frozen():
 def test_json_round_trip_preserves_state():
     state = replace(
         new_agent_state(run_id="r1", conversation_id="c1", user_id="u1", now="t0"),
-        phase=AgentPhase.TOOL_USE,
+        phase=AgentPhase.COMPACT,
+        resume_phase=AgentPhase.TOOL_USE,
         revision=2,
         turn=1,
         input_tokens=5,
@@ -526,9 +568,11 @@ def test_json_round_trip_preserves_state():
     payload = state_to_dict(state)
     assert isinstance(payload["calls"][0]["args"], dict)
     assert payload["calls"][0]["args"] is not state.calls[0].args
+    assert payload["resume_phase"] == "tooluse"
     restored = state_from_dict(payload)
     assert restored == state
     assert restored is not state
+    assert restored.resume_phase is AgentPhase.TOOL_USE
 
 
 def test_persisted_call_args_are_deep_copied():
@@ -584,6 +628,7 @@ def test_public_view_shape_omits_sensitive_fields():
     view = public_state_view(state)
     assert set(view["calls"][0]) == {"call_id", "name", "status"}
     assert "args" not in view
+    assert "resume_phase" not in view
     assert "result_json" not in json.dumps(view)
     assert view["phase"] == "tooluse"
     assert view["outcome"] == {

@@ -81,6 +81,7 @@ class AgentState:
     user_id: str
     revision: int
     phase: AgentPhase
+    resume_phase: AgentPhase | None
     turn: int
     input_tokens: int
     output_tokens: int
@@ -248,6 +249,7 @@ def new_agent_state(
         user_id=user_id,
         revision=0,
         phase=AgentPhase.HYDRATE,
+        resume_phase=None,
         turn=0,
         input_tokens=0,
         output_tokens=0,
@@ -350,26 +352,40 @@ def transition(state: AgentState, event: AgentEvent) -> AgentState:
 
     if isinstance(event, HydrationFinished):
         _require(state.phase is AgentPhase.HYDRATE, state, event)
-        if event.needs_compaction and event.resume_phase is not None:
-            raise InvalidTransition(
-                "HydrationFinished cannot set needs_compaction with resume_phase; "
-                "compact and resume are mutually exclusive"
-            )
-        if event.needs_compaction:
-            phase = AgentPhase.COMPACT
-        elif event.resume_phase is not None:
+        if event.resume_phase is not None:
             _require(event.resume_phase in _HYDRATE_RESUME_PHASES, state, event)
-            phase = event.resume_phase
-        else:
-            phase = AgentPhase.THINKING
-        return _advance(state, event, phase=phase)
-
-    if isinstance(event, CompactionFinished):
-        _require(state.phase is AgentPhase.COMPACT, state, event)
+        if event.needs_compaction:
+            return _advance(
+                state,
+                event,
+                phase=AgentPhase.COMPACT,
+                resume_phase=event.resume_phase,
+            )
+        if event.resume_phase is not None:
+            return _advance(
+                state,
+                event,
+                phase=event.resume_phase,
+                resume_phase=None,
+            )
         return _advance(
             state,
             event,
             phase=AgentPhase.THINKING,
+            resume_phase=None,
+        )
+
+    if isinstance(event, CompactionFinished):
+        _require(state.phase is AgentPhase.COMPACT, state, event)
+        if state.resume_phase in _HYDRATE_RESUME_PHASES:
+            phase = state.resume_phase
+        else:
+            phase = AgentPhase.THINKING
+        return _advance(
+            state,
+            event,
+            phase=phase,
+            resume_phase=None,
             compactions=state.compactions + 1,
         )
 
@@ -528,6 +544,9 @@ def state_to_dict(state: AgentState) -> dict[str, Any]:
         "user_id": state.user_id,
         "revision": state.revision,
         "phase": state.phase.value,
+        "resume_phase": None
+        if state.resume_phase is None
+        else state.resume_phase.value,
         "turn": state.turn,
         "input_tokens": state.input_tokens,
         "output_tokens": state.output_tokens,
@@ -570,6 +589,8 @@ def state_from_dict(payload: Mapping[str, Any]) -> AgentState:
             f"unsupported schema_version: {version!r}; expected {SCHEMA_VERSION}"
         )
     phase = AgentPhase(payload["phase"])
+    resume_raw = payload.get("resume_phase")
+    resume_phase = None if resume_raw is None else AgentPhase(resume_raw)
     calls = tuple(
         PersistedToolCall(
             call_id=item["call_id"],
@@ -603,6 +624,7 @@ def state_from_dict(payload: Mapping[str, Any]) -> AgentState:
         user_id=payload["user_id"],
         revision=int(payload["revision"]),
         phase=phase,
+        resume_phase=resume_phase,
         turn=int(payload["turn"]),
         input_tokens=int(payload["input_tokens"]),
         output_tokens=int(payload["output_tokens"]),
