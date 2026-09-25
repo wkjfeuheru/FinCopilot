@@ -142,7 +142,9 @@ Effect 完成
 
 ```text
 hydrate -> compact | thinking | tooluse | awaitingconfirmation
-compact -> thinking
+compact -> thinking | tooluse | awaitingconfirmation
+  （后两者仅当快照存有 resume_phase ∈ {tooluse, awaitingconfirmation}；
+   resume_phase 是恢复字段，不是第二个公开阶段）
 thinking -> tooluse | complete | error
 tooluse -> awaitingconfirmation | thinking | complete | error
 awaitingconfirmation -> tooluse | complete | error

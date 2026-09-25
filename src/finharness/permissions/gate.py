@@ -12,13 +12,19 @@ data_cache 则被结构性拒绝——缓存的 lookup 键跨用户共享，模�
 **deny 规则先于读/写分流，且两个闸门都执行它。** 只读闸门只描述"这个工具不会
 改状态"，不描述"它的入参可信"：一段携带下单指令的文本参数在只读工具上同样是
 攻击，因此 ``ReadOnlyGate`` 也必须扫描（docs 03.7.2）。
+
+决策与交互分离：``decide()`` 同步返回是否需要确认；``resolve()`` 把用户答案
+映射为 allow/deny 并更新免问集合。``check()`` 仍是兼容适配器，供仍注入
+confirm 回调的直接调用方使用。
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Protocol
 
+from finharness.hooks.audit import summarize_args
 from finharness.permissions.modes import PermissionMode, Verdict
 from finharness.permissions.rules import RuleHit, scan_args, scan_text
 from finharness.tools.base import PermissionLevel
@@ -39,6 +45,8 @@ EGRESS_CATEGORY = "egress"
 # 写操作反复弹框是它要解决的问题；授权不应活到下一个会话。
 WRITE_CATEGORY = "write"
 
+_APPROVE_ONCE = frozenset({"y", "y_remember", "y_session"})
+
 
 def _egress_requested(tool, args: dict) -> bool:
     """判定一次读类调用是否构成网络外发。
@@ -58,9 +66,24 @@ def _egress_requested(tool, args: dict) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfirmationSpec:
+    kind: str
+    prompt: str
+    options: tuple[str, ...]
+    category: str
+    call_ids: tuple[str, ...] = ()
+    multi_select: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class GateDecision:
     verdict: Verdict
     reason: str = ""
+    confirmation: ConfirmationSpec | None = None
+
+
+class InteractivePort(Protocol):
+    async def prompt(self, spec: ConfirmationSpec) -> str | None: ...
 
 
 def _scan_tool(tool, args: dict, patterns: tuple[str, ...] | None) -> RuleHit | None:
@@ -87,13 +110,16 @@ class ReadOnlyGate:
     def __init__(self, deny_patterns: tuple[str, ...] | None = None) -> None:
         self._deny_patterns = deny_patterns
 
-    async def check(self, tool, args: dict) -> GateDecision:  # noqa: ARG002 - 保持接口一致
+    def decide(self, tool, args: dict) -> GateDecision:  # noqa: ARG002 - 保持接口一致
         hit = _scan_tool(tool, args, self._deny_patterns)
         if hit is not None:
             return GateDecision(Verdict.DENY, hit.reason())
         if tool.permission is PermissionLevel.READ:
             return GateDecision(Verdict.ALLOW)
         return GateDecision(Verdict.DENY, f"tool is not read-only: {tool.name}")
+
+    async def check(self, tool, args: dict) -> GateDecision:
+        return self.decide(tool, args)
 
 
 class PermissionGate:
@@ -104,11 +130,11 @@ class PermissionGate:
     看到同一份），进程内存活；对话结束即随 registry 消亡，重启后重新
     询问——免问授权的生存期不应长于它所授权的那个对话。
 
-    ``session_approved`` 是**会话级**的"始终允许"集合：用户在写工具确认
-    弹窗里选了"始终允许此类操作（本会话内）"后，``WRITE_CATEGORY`` 被记入，
-    本会话内后续写类调用免问。与 ``confirmed_categories`` 的区别只在生存期：
-    它由调用方按会话持有（服务端每次新建执行会话都新建一份），会话结束或
-    过期重建即失效，是比对话更短的授权窗口。
+    ``session_approved`` 是**会话级**的"始终允许"集合（``y_session``）：用户
+    在写工具确认弹窗里选了"始终允许此类操作（本会话内）"后，``WRITE_CATEGORY``
+    被记入，本会话内后续写类调用免问。与 ``confirmed_categories`` 的区别只在
+    生存期：它由调用方按会话持有（服务端每次新建执行会话都新建一份），会话
+    结束或过期重建即失效，是比对话更短的授权窗口。
     """
 
     def __init__(
@@ -120,8 +146,8 @@ class PermissionGate:
         mode: PermissionMode | None = None,
         conversation_id: str = "local",
         confirmed_categories: set[str] | None = None,
-        confirm_egress: Callable[[str, dict], Awaitable[bool]] | None = None,
         session_approved: set[str] | None = None,
+        confirm_egress: Callable[[str, dict], Awaitable[bool]] | None = None,
     ) -> None:
         self.settings = settings
         # ``mode`` 规范化后再存：下方对 AUTO 的判定用 ``is`` 比较枚举成员，而签名虽然
@@ -151,73 +177,98 @@ class PermissionGate:
         self.workspace = Workspace(settings)
         self._deny_patterns = deny_patterns
 
-    async def check(self, tool, args: dict) -> GateDecision:
-        """决定裁决。当存在回调时，CONFIRM 在此处被应答。"""
-        # 1. 交易意图规则优先于一切，包括读类工具：
-        #    一个携带下单指令的数据参数仍然是一次攻击。
+    def decide(self, tool, args: dict) -> GateDecision:
+        """同步裁决：需要确认时返回 ``CONFIRM`` + ``ConfirmationSpec``，不 await。"""
         hit = self._scan_deny(tool, args)
         if hit is not None:
             return GateDecision(Verdict.DENY, hit.reason())
 
-        # 2. 写入共享缓存结构性拒绝：lookup 键跨用户共享，模型侧写入
-        #    即缓存投毒。即使 AUTO 模式、即使参数带路径白名单键。
-        #    **仅限写入**：缓存的两棵子树（parquet/、pdf/）对读取是开放的，
-        #    读类工具本就以它们为工作对象——研报正文落盘后由 read_pdf 精读、
-        #    summarize_document 摘要，复核子代理也据此重读载荷。此处若不分
-        #    读写一律拒绝，这条设计内的主流程会整条不可用，也与 workspace
-        #    的可读契约（output/ + cache 的 parquet/pdf）相矛盾。读类调用
-        #    的可达性由工具侧 resolve_read 把关，它只放行那两棵子树。
         if tool.permission is not PermissionLevel.READ and self._path_in_cache(args):
             return GateDecision(Verdict.DENY, "缓存目录不可写：data_cache 载荷为共享只读")
 
-        # 3. 读类工具：默认放行；网络外发首次须确认。
         if tool.permission is PermissionLevel.READ:
             if not _egress_requested(tool, args):
                 return GateDecision(Verdict.ALLOW)
-            return await self._check_egress(tool, args)
+            return self._decide_egress(tool, args)
 
-        # 4. 白名单目录内的产物写入绕过确认。
         if self._path_in_whitelist(args):
             return GateDecision(Verdict.ALLOW, "写入白名单目录（output）")
 
-        # 5. 写类工具的模式回退。
         if self.mode is PermissionMode.AUTO:
             return GateDecision(Verdict.ALLOW, "auto 模式放行写类工具")
 
-        # 5b. 本会话"始终允许此类操作"：用户已在确认弹窗里给出会话级授权。
-        #     放在 AUTO 之后、交互通道之前：它只替代"逐次询问"这一步，不
-        #     绕过上方任何一道硬边界（deny 规则、缓存拒写）。仅写类走到
-        #     这里——读类在上一步已返回，外发走 _check_egress。
+        # 本会话"始终允许此类操作"：只替代"逐次询问"，不绕过 deny / 缓存拒写。
         if WRITE_CATEGORY in self.session_approved:
             return GateDecision(Verdict.ALLOW, "本会话已允许写类工具")
 
-        if self.confirm is None:
-            # 非交互式调用方：拒绝，而不是静默放行。
+        prompt = f"工具 {tool.name} 将执行，入参：{summarize_args(args)}"
+        return GateDecision(
+            Verdict.CONFIRM,
+            "写类工具需确认",
+            confirmation=ConfirmationSpec(
+                kind="permission",
+                prompt=prompt,
+                options=("y", "y_session", "n"),
+                category=WRITE_CATEGORY,
+            ),
+        )
+
+    def resolve(self, spec: ConfirmationSpec, answer: str | None) -> GateDecision:
+        """把用户答案映射为 allow/deny，并更新免问集合。"""
+        if answer is None or answer == "n" or answer not in _APPROVE_ONCE:
+            return GateDecision(Verdict.DENY, "用户已拒绝该工具调用")
+        if answer == "y_remember":
+            self.confirmed_categories.add(spec.category)
+        elif answer == "y_session":
+            self.session_approved.add(spec.category)
+        if spec.category == EGRESS_CATEGORY:
+            return GateDecision(Verdict.ALLOW, "用户已确认网络访问")
+        return GateDecision(Verdict.ALLOW, "用户已确认")
+
+    async def check(self, tool, args: dict) -> GateDecision:
+        """兼容适配器：``decide`` 后若需确认则 await 回调，再 ``resolve``。"""
+        decision = self.decide(tool, args)
+        if decision.verdict is not Verdict.CONFIRM:
+            return decision
+        spec = decision.confirmation
+        if spec is None:
             return GateDecision(Verdict.DENY, f"写类工具需确认，但当前无交互通道：{tool.name}")
-        approved = await self.confirm(tool.name, args)
-        if approved:
-            return GateDecision(Verdict.ALLOW, "用户已确认")
-        return GateDecision(Verdict.DENY, "用户已拒绝该工具调用")
 
-    async def _check_egress(self, tool, args: dict) -> GateDecision:
-        """网络外发的确认链；与写工具共用模式语义但独立于它计免问。
+        callback = (
+            self.confirm_egress if spec.category == EGRESS_CATEGORY else self.confirm
+        )
+        if callback is None:
+            if spec.category == EGRESS_CATEGORY:
+                return GateDecision(
+                    Verdict.DENY, f"网络访问需确认，但当前无交互通道：{tool.name}"
+                )
+            return GateDecision(
+                Verdict.DENY, f"写类工具需确认，但当前无交互通道：{tool.name}"
+            )
+        approved = await callback(tool.name, args)
+        return self.resolve(spec, "y" if approved else "n")
 
-        是否记入"本对话不再询问"由 ``confirm_egress`` 的实现决定（它是
-        唯一知道用户选了"允许一次"还是"允许并记住"的一方）；本方法只
-        消费 ``confirmed_categories`` 与放行结果。
-        """
+    def _decide_egress(self, tool, args: dict) -> GateDecision:
         if EGRESS_CATEGORY in self.confirmed_categories:
             return GateDecision(Verdict.ALLOW, "本对话已确认网络访问")
 
         if self.mode is PermissionMode.AUTO:
             return GateDecision(Verdict.ALLOW, "auto 模式放行网络访问")
 
-        if self.confirm_egress is None:
-            return GateDecision(Verdict.DENY, f"网络访问需确认，但当前无交互通道：{tool.name}")
-        approved = await self.confirm_egress(tool.name, args)
-        if approved:
-            return GateDecision(Verdict.ALLOW, "用户已确认网络访问")
-        return GateDecision(Verdict.DENY, "用户已拒绝该网络访问")
+        prompt = (
+            f"工具 {tool.name} 将访问外部网络并引入第三方内容，"
+            f"入参：{summarize_args(args)}"
+        )
+        return GateDecision(
+            Verdict.CONFIRM,
+            "网络访问需确认",
+            confirmation=ConfirmationSpec(
+                kind="permission",
+                prompt=prompt,
+                options=("y", "y_remember", "n"),
+                category=EGRESS_CATEGORY,
+            ),
+        )
 
     # -- 辅助方法 --------------------------------------------------------------
     def _scan_deny(self, tool, args: dict):

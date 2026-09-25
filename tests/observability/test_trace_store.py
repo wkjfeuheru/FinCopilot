@@ -188,3 +188,17 @@ def test_concurrent_record_event_assigns_unique_monotonic_seq(store):
     detail = store.run_detail("r")
     seqs = sorted(event["seq"] for event in detail["events"])
     assert seqs == list(range(1, workers + 1))
+
+
+def test_trace_store_records_state_events_without_special_casing(store):
+    """TraceStore already records every non-delta event — including FSM ``state``."""
+    store.start_run(run_id="tr_state", input="resume me")
+    store.record_event(
+        "tr_state",
+        "state",
+        {"run_id": "r1", "revision": 2, "phase": "hydrate"},
+    )
+    detail = store.run_detail("tr_state")
+    assert detail is not None
+    assert [event["kind"] for event in detail["events"]] == ["state"]
+    assert detail["events"][0]["payload"]["phase"] == "hydrate"

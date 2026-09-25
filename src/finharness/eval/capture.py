@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from finharness.permissions.gate import ConfirmationSpec
 from finharness.types import EngineEvent
 
 
@@ -41,6 +42,12 @@ class InteractionChannel:
       confirm — 批准写操作确认；
       deny    — 拒绝写操作确认；
       answer  — ask_user 以 ``answer`` 作答。
+
+    Implements ``InteractivePort.prompt`` so AgentLoop FSM confirmation can
+    use the same channel object passed as ``loop.interactive``.
+
+    Does not emit ``interaction_resolved``: that edge is owned by the loop
+    after ``ConfirmationResolved`` is persisted.
     """
 
     def __init__(self, policy: str = "answer", answer: str = "综合") -> None:
@@ -53,10 +60,21 @@ class InteractionChannel:
         self.answer = answer
         self.log = []
 
+    async def prompt(self, spec: ConfirmationSpec) -> str | None:
+        """InteractivePort adapter used by the agent FSM confirmation phase."""
+        kind = "question" if getattr(spec, "kind", "") == "question" else "confirm"
+        return await self.ask(
+            kind,
+            getattr(spec, "prompt", ""),
+            list(getattr(spec, "options", ()) or []),
+            multi_select=bool(getattr(spec, "multi_select", False)),
+        )
+
     async def ask(
         self, kind: str, prompt: str, options: list[str], *, multi_select: bool = False
     ) -> str | None:
         """引擎循环的 ``interactive`` 回调（也是权限门禁的确认来源）。"""
+        del multi_select
         if kind == "confirm":
             approved = self.policy == "confirm"
             response: str | None = "y" if approved else "n"
@@ -71,6 +89,7 @@ class InteractionChannel:
 
     async def confirm(self, name: str, args: dict) -> bool:
         """权限门禁的 ``confirm`` 回调：返回写操作是否获批。"""
+        del args
         return await self.ask("confirm", name, []) == "y"
 
 

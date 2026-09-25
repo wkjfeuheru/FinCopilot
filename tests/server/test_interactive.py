@@ -174,6 +174,266 @@ def test_respond_endpoint_resolves_the_apps_pending_request(tmp_path):
     assert asyncio.run(scenario()) == "y"
 
 
+# -- FSM-owned confirmation ordering (Task 6) ---------------------------------
+
+
+class _ConfirmBusPort:
+    """InteractivePort wrapping ConfirmBus; emits interactive_request via sink."""
+
+    def __init__(self, bus: ConfirmBus, sink, *, answer: str = "y", loop=None) -> None:
+        self.bus = bus
+        self.sink = sink
+        self.answer = answer
+        self.loop = loop
+        self.request_ids: list[str] = []
+
+    async def prompt(self, spec) -> str | None:
+        from finharness.types import EngineEvent
+
+        async def announce(payload: dict) -> None:
+            self.request_ids.append(payload["request_id"])
+            await self.sink.emit(EngineEvent("interactive_request", payload))
+            await _answer_latest(self.bus, self.answer)
+
+        kind = "question" if getattr(spec, "kind", "") == "question" else "confirm"
+        payload, answer = await self.bus.request(
+            session_id="s",
+            kind=kind,
+            prompt=spec.prompt,
+            options=list(spec.options),
+            multi_select=bool(getattr(spec, "multi_select", False)),
+            announce=announce,
+        )
+        # Queue for post-ConfirmationResolved emit (same contract as server api).
+        assert self.loop is not None
+        self.loop.queue_interaction_resolved(
+            {
+                "request_id": payload.get("request_id"),
+                "answer": answer,
+                "timeout": answer is None,
+            }
+        )
+        return answer
+
+
+async def run_confirming_tool(tmp_path, answer: str = "y"):
+    """Drive a write tool that needs confirmation; return (events, loop)."""
+    from test_loop import ScriptedProvider, Sink, StubRegistry, text_round, tool_round
+
+    from finharness.config.settings import ContextSettings, PermissionSettings, ToolSettings
+    from finharness.context.memory.store import MemoryStore
+    from finharness.engine.loop import AgentLoop
+    from finharness.permissions.gate import PermissionGate
+    from finharness.tools.base import PermissionLevel
+    from finharness.types import ToolResult, ToolUse
+    from tests.conftest import settings_with_cache
+
+    class WriteTool:
+        name = "write"
+        permission = PermissionLevel.WRITE
+        timeout = None
+
+        async def run(self, **kwargs) -> ToolResult:
+            return ToolResult(content="wrote", ok=True)
+
+    settings = settings_with_cache(
+        tmp_path,
+        permission=PermissionSettings(default_mode="default"),
+        context=ContextSettings(max_turns=30, max_result_tokens=1000),
+        tools=ToolSettings(timeout_default_s=30),
+    )
+    store = MemoryStore(tmp_path / "memory.db")
+    sink = Sink()
+    bus = ConfirmBus(ttl_s=2.0)
+    port = _ConfirmBusPort(bus, sink, answer=answer)
+    gate = PermissionGate(settings=settings)
+    tool = WriteTool()
+    registry = StubRegistry({"write": tool}, read_only=set())
+    provider = ScriptedProvider(
+        [
+            tool_round(ToolUse("c1", "write", {"path": "out.txt"})),
+            text_round("done"),
+        ]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        registry=registry,
+        settings=settings,
+        system="test",
+        output=sink,
+        store=store,
+        conversation_id="conv",
+        user_id="",
+        gate=gate,
+        interactive=port,
+    )
+    port.loop = loop
+    await loop.run("please write")
+    return sink.events, loop
+
+
+def test_confirmation_state_precedes_interactive_request(tmp_path):
+    events, _loop = asyncio.run(run_confirming_tool(tmp_path, answer="y"))
+    kinds = [event.kind for event in events]
+    awaiting = next(
+        i
+        for i, event in enumerate(events)
+        if event.kind == "state" and event.data["phase"] == "awaitingconfirmation"
+    )
+    request = kinds.index("interactive_request")
+    assert awaiting < request
+
+
+def test_confirmation_resolved_persists_before_interaction_resolved(tmp_path):
+    """ConfirmationResolved state/revision must precede interaction_resolved."""
+    events, _loop = asyncio.run(run_confirming_tool(tmp_path, answer="y"))
+    awaiting = next(
+        i
+        for i, event in enumerate(events)
+        if event.kind == "state" and event.data["phase"] == "awaitingconfirmation"
+    )
+    # ConfirmationResolved leaves awaitingconfirmation → tooluse (confirmation cleared).
+    resolved_state = next(
+        i
+        for i, event in enumerate(events)
+        if i > awaiting
+        and event.kind == "state"
+        and event.data["phase"] == "tooluse"
+        and event.data.get("confirmation") is None
+    )
+    interaction_resolved = next(
+        i for i, event in enumerate(events) if event.kind == "interaction_resolved"
+    )
+    assert resolved_state < interaction_resolved
+
+
+class _ScriptedPort:
+    """Answers by kind: question text vs permission y/n."""
+
+    def __init__(self, *, question_answer: str = "近一年", confirm_answer: str = "y") -> None:
+        self.question_answer = question_answer
+        self.confirm_answer = confirm_answer
+        self.specs: list = []
+
+    async def prompt(self, spec) -> str | None:
+        self.specs.append(spec)
+        if getattr(spec, "kind", "") == "question":
+            return self.question_answer
+        return self.confirm_answer
+
+
+async def run_mixed_question_and_write(tmp_path, *, confirm_answer: str = "y"):
+    """One model round requests ask_user then write; return port + write tool + outcome."""
+    from test_loop import ScriptedProvider, Sink, StubRegistry, text_round, tool_round
+
+    from finharness.config.settings import ContextSettings, PermissionSettings, ToolSettings
+    from finharness.context.memory.store import MemoryStore
+    from finharness.engine.loop import AgentLoop
+    from finharness.permissions.gate import PermissionGate
+    from finharness.tools.base import PermissionLevel
+    from finharness.types import ToolResult, ToolUse
+    from tests.conftest import settings_with_cache
+
+    class AskTool:
+        name = "ask_user"
+        permission = PermissionLevel.READ
+        timeout = None
+        needs_interactive = True
+        interactive = None
+
+        async def run(self, **kwargs) -> ToolResult:
+            answer = await self.interactive(
+                "question",
+                kwargs.get("question", ""),
+                list(kwargs.get("options") or []),
+                multi_select=bool(kwargs.get("multi_select", False)),
+            )
+            return ToolResult(content=f"用户回答：{answer}", ok=True)
+
+    class WriteTool:
+        name = "write"
+        permission = PermissionLevel.WRITE
+        timeout = None
+
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def run(self, **kwargs) -> ToolResult:
+            self.calls.append(dict(kwargs))
+            return ToolResult(content="wrote", ok=True)
+
+    settings = settings_with_cache(
+        tmp_path,
+        permission=PermissionSettings(default_mode="default"),
+        context=ContextSettings(max_turns=30, max_result_tokens=1000),
+        tools=ToolSettings(timeout_default_s=30),
+    )
+    ask = AskTool()
+    write = WriteTool()
+    port = _ScriptedPort(confirm_answer=confirm_answer)
+    sink = Sink()
+    loop = AgentLoop(
+        provider=ScriptedProvider(
+            [
+                tool_round(
+                    ToolUse(
+                        "q1",
+                        "ask_user",
+                        {
+                            "question": "时段？",
+                            "options": ["近一年"],
+                            "multi_select": True,
+                        },
+                    ),
+                    ToolUse("w1", "write", {"path": "out.txt"}),
+                ),
+                text_round("done"),
+            ]
+        ),
+        registry=StubRegistry({"ask_user": ask, "write": write}, read_only={"ask_user"}),
+        settings=settings,
+        system="test",
+        output=sink,
+        store=MemoryStore(tmp_path / "memory.db"),
+        conversation_id="conv",
+        user_id="",
+        gate=PermissionGate(settings=settings),
+        interactive=port,
+    )
+    outcome = await loop.run("mix")
+    return port, write, outcome, loop
+
+
+def test_question_and_write_confirm_separately(tmp_path):
+    """Homogeneous groups only: answering a question must not approve a write."""
+    port, write, outcome, _loop = asyncio.run(
+        run_mixed_question_and_write(tmp_path, confirm_answer="y")
+    )
+    assert outcome.succeeded is True
+    assert [getattr(spec, "kind", None) for spec in port.specs] == [
+        "question",
+        "permission",
+    ]
+    assert port.specs[0].category == "question"
+    assert port.specs[0].multi_select is True
+    assert port.specs[0].call_ids == ("q1",)
+    assert port.specs[1].category == "write"
+    assert port.specs[1].call_ids == ("w1",)
+    assert write.calls, "write must run only after its own permission confirm"
+
+
+def test_confirmation_denied_synthesizes_failed_tool_result(tmp_path):
+    """InteractivePort 'n' → ConfirmationResolved(False) → FAILED tool_result content."""
+    import json
+
+    _events, loop = asyncio.run(run_confirming_tool(tmp_path, answer="n"))
+    tool_msgs = [msg for msg in loop.messages if msg.role == "tool_result"]
+    assert tool_msgs, "denied confirmation must still produce a tool_result Msg"
+    payloads = {call_id: json.loads(raw) for call_id, raw in tool_msgs[0].tool_results}
+    assert payloads["c1"]["ok"] is False
+    assert "用户已拒绝" in payloads["c1"]["error"]
+
+
 # -- 网络外发确认（docs 03.7.1）------------------------------------------------
 
 
@@ -465,9 +725,23 @@ async def _answer_pending(bus: ConfirmBus, value: str) -> None:
     raise AssertionError("no pending request appeared to answer")
 
 
+async def _confirm_via_port(loop, bus: ConfirmBus, tool, args: dict, answer: str):
+    """Production path: decide → InteractivePort.prompt → resolve."""
+    from finharness.permissions.modes import Verdict
+
+    decision = loop.gate.decide(tool, args)
+    if decision.verdict is not Verdict.CONFIRM:
+        return decision
+    spec = decision.confirmation
+    assert spec is not None
+    answerer = asyncio.ensure_future(_answer_pending(bus, answer))
+    user_answer = await loop.interactive.prompt(spec)
+    await answerer
+    return loop.gate.resolve(spec, user_answer)
+
+
 def test_write_confirm_offers_session_option_and_remembers_within_session(tmp_path):
     """写类确认提供会话级选项；应答后本会话内第二次写调用不再宣告提示。"""
-    from finharness.permissions.gate import WRITE_CATEGORY
     from finharness.tools.base import PermissionLevel
     from tests.permissions.test_gate import FakeTool
 
@@ -482,11 +756,9 @@ def test_write_confirm_offers_session_option_and_remembers_within_session(tmp_pa
         sink = _CollectingSink()
         loop.output = sink
 
-        answerer = asyncio.ensure_future(_answer_pending(bus, "y_session"))
-        first = await loop.gate.check(write_tool, {})
-        await answerer
+        first = await _confirm_via_port(loop, bus, write_tool, {}, "y_session")
         # 会话级授权已记录；同会话内第二次写调用免问。
-        second = await loop.gate.check(write_tool, {})
+        second = await _confirm_via_port(loop, bus, write_tool, {}, "y_session")
         return first, second, sink
 
     first, second, sink = asyncio.run(scenario())
@@ -515,17 +787,17 @@ def test_session_approval_does_not_survive_into_a_new_session(tmp_path):
         # 会话 A：给出"始终允许"。
         first_session = await registry.ensure(conversation_id="conv-a", user_id="u1")
         first_session.loop.output = _CollectingSink()
-        answerer = asyncio.ensure_future(_answer_pending(bus, "y_session"))
-        await first_session.loop.gate.check(write_tool, {})
-        await answerer
+        await _confirm_via_port(
+            first_session.loop, bus, write_tool, {}, "y_session"
+        )
 
         # 会话 B（新执行会话）：同一对话也拿不到 A 的授权——会话已换。
         new_session = await registry.ensure(conversation_id="conv-b", user_id="u1")
         sink = _CollectingSink()
         new_session.loop.output = sink
-        answerer = asyncio.ensure_future(_answer_pending(bus, "y_session"))
-        decision = await new_session.loop.gate.check(write_tool, {})
-        await answerer
+        decision = await _confirm_via_port(
+            new_session.loop, bus, write_tool, {}, "y_session"
+        )
         return decision, sink
 
     decision, sink = asyncio.run(scenario())

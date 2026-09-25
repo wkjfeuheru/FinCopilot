@@ -298,6 +298,48 @@ def test_passing_case_yields_full_composite():
 # -- 端到端离线 -------------------------------------------------------
 
 
+async def run_offline_case(tmp_path, *, answer: str = "ok"):
+    """Drive one offline EvalCase through EvalRunner with a text-only provider.
+
+    Uses ScriptedProvider so the turn finishes without tool_use — expected
+    public phases are hydrate → thinking → complete.
+    """
+    import sys
+
+    from finharness.config.settings import Settings
+    from finharness.eval.runner import EvalRunner
+    from finharness.eval.schema import EvalCase
+
+    engine_dir = str(REPO_ROOT / "tests" / "engine")
+    if engine_dir not in sys.path:
+        sys.path.insert(0, engine_dir)
+    from test_loop import ScriptedProvider, text_round  # noqa: E402
+
+    case = EvalCase.model_validate(
+        {"id": "OFF-STATE-1", "turns": [{"user": "q"}]}
+    )
+    provider = ScriptedProvider([text_round(answer)])
+    runner = EvalRunner(
+        base_settings=Settings(),
+        provider=provider,
+        run_dir=Path(tmp_path) / "runs",
+        offline=True,
+    )
+    return await runner.run_case(case)
+
+
+def test_eval_records_explicit_agent_states(tmp_path):
+    import asyncio
+
+    run = asyncio.run(run_offline_case(tmp_path, answer="ok"))
+    phases = [
+        event.data["phase"]
+        for event in run.turns[0].events
+        if event.kind == "state"
+    ]
+    assert phases == ["hydrate", "thinking", "complete"]
+
+
 def test_offline_selfcheck_end_to_end(tmp_path):
     """CLI 驱动真实 engine 跑完每一个 case 并写出产物。"""
     from finharness.eval import cli

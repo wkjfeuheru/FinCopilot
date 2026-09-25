@@ -11,6 +11,13 @@ import {
 import { Button, Empty } from "antd";
 import { artifactUrl, fetchCitations, respondChat, stopChat, streamChat } from "../api/client";
 import type { Citation, ResumableTurn } from "../api/client";
+import {
+  asPublicAgentState,
+  presentAgentPhase,
+  reduceAgentState,
+  resolveHighLevelTraceStatus,
+  type PublicAgentState,
+} from "../lib/agentState";
 import { Interaction, InteractionPrompt } from "./InteractionPrompt";
 import { enqueue, resolve } from "../lib/interactionQueue";
 import { Message, MessageList } from "./MessageList";
@@ -43,7 +50,7 @@ type Props = {
    * "继续研究"入口依然出现，而不是把那次中断当成一次普通失败。
    */
   resumable?: ResumableTurn | null;
-  /** 续做一轮：把续做提示作为新的提问提交。 */
+  /** 续做一轮：显式 resume=true，不伪造用户提问。 */
   onResume?: () => void;
   /**
    * 新一轮结束后，父组件据此刷新可继续状态。
@@ -74,10 +81,6 @@ const STREAM_IDLE_TIMEOUT_MS = 90_000;
  * 路径上同样会落库并留下断点，因此兜底不会丢成果，只是少了那份"部分答案"
  * 事件的收尾叙事。 */
 const STOP_GRACE_MS = 8_000;
-
-/** 续做时提交的提示。它与断点一起构成"在同一计划上继续"：计划由服务端
- * 从断点恢复，这条提示只负责让模型把注意力放回未完成的步骤上。 */
-const RESUME_PROMPT = "请接着上次未完成的部分继续研究，不要重复已经完成的步骤。";
 
 /** 断点横幅的措辞，取决于上一轮是怎么停下的。
  *
@@ -182,6 +185,8 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
   // 本轮流是否仍在进行。收尾时置 false，使清空队列不再重新装上看门狗
   // （流已结束，装上只会在 90s 后报一次虚假的"无数据"中断）。
   const streamActiveRef = useRef(false);
+  // 本轮最新的 public agent state（按 run_id + revision 收敛）。
+  const agentStateRef = useRef<PublicAgentState | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   // 用户是否已请求停止本轮，以及为此启动的兜底计时器。后者在宽限期内
   // 收到 done 时取消，否则到点即硬断连接。
@@ -369,14 +374,17 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
   }
 
   /** 提交一条提问并消费它的流。与表单解耦，使"继续研究"走同一条路径。 */
-  async function sendMessage(message: string) {
+  async function sendMessage(message: string, options?: { resume?: boolean }) {
+    const resume = options?.resume === true;
     runStartedRef.current = performance.now();
     firstTokenRef.current = null;
     stoppingRef.current = false;
     setStopping(false);
+    agentStateRef.current = null;
     setMessages((current) => [
       ...current,
-      { role: "user", text: message },
+      // 显式 resume 不伪造用户气泡；普通发送才追加提问。
+      ...(resume ? [] : [{ role: "user" as const, text: message }]),
       {
         role: "assistant",
         text: "",
@@ -389,8 +397,8 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
     ]);
     setBusy(true);
     settledRef.current = false;
-    // 记住这轮的提问：错误气泡用它提供一键重试。
-    lastPromptRef.current = message;
+    // 记住这轮的提问：错误气泡用它提供一键重试。resume 无用户提问可重试。
+    lastPromptRef.current = resume ? null : message;
     const controller = new AbortController();
     abortRef.current = controller;
     streamActiveRef.current = true;
@@ -406,6 +414,20 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           const conversation = event.data.conversation_id ? String(event.data.conversation_id) : null;
           streamIdsRef.current = { session, conversation };
           onSession(session, conversation);
+        }
+        if (event.event === "state") {
+          const incoming = asPublicAgentState(event.data);
+          if (incoming) {
+            const next = reduceAgentState(agentStateRef.current, incoming);
+            if (next !== agentStateRef.current) {
+              agentStateRef.current = next;
+              const presented = presentAgentPhase(next);
+              setStatus(presented.label);
+              if (presented.status !== "running") {
+                updateTrace((trace) => ({ ...trace, status: presented.status }));
+              }
+            }
+          }
         }
         if (event.event === "tool_status") {
           const name = String(event.data.name ?? "tool");
@@ -679,17 +701,21 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           }));
           const agentRuns = Object.values(perAgent).reduce((sum, value) => sum + Number(value.runs ?? 0), 0);
           const succeeded = event.data.succeeded !== false;
+          const doneStatus = succeeded ? ("done" as const) : stopped ? ("stopped" as const) : ("error" as const);
+          // High-level status: state is primary when present; done only for
+          // metrics / plan / step close-out (and legacy servers with no state).
+          const highLevelStatus = resolveHighLevelTraceStatus(agentStateRef.current, doneStatus);
           updateTrace((trace) => {
             const withoutAgents = trace.steps.filter((step) => step.kind !== "agent");
             const hasFinal = withoutAgents.some((step) => step.key === "final");
-            const resting = succeeded ? "done" as const : stopped ? "stopped" as const : "error" as const;
+            const resting = doneStatus;
             const closedSteps = withoutAgents.map((step) => ({
               ...step,
               status: step.status === "running" ? resting : step.status,
             }));
             return {
               ...trace,
-              status: succeeded ? "done" : stopped ? "stopped" : "error",
+              status: highLevelStatus,
               plan: planFromEvent((event.data.plan as Record<string, unknown> | undefined) ?? {}) ?? trace.plan,
               steps: [
                 ...closedSteps,
@@ -718,7 +744,7 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           // 用流里已知的对话 id，而不是发送时刻闭包里的那个（新对话时它是 null）。
           onRefreshResumable?.(streamIdsRef.current.conversation);
         }
-      }, controller.signal);
+      }, controller.signal, resume);
     } catch (error) {
       // 用户停止会让我们主动断开连接，那是一个 AbortError；它不是错误，
       // 不该向用户报错。真正的传输失败仍照常提示。
@@ -795,10 +821,11 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
     });
   }
 
-  /** 在上一轮被停止后接着研究：计划由服务端从断点恢复。 */
+  /** 在上一轮被停止后接着研究：显式 resume=true，不追加伪造用户提问。 */
   function resume() {
     if (busy) return;
-    void sendMessage(RESUME_PROMPT);
+    onResume?.();
+    void sendMessage("", { resume: true });
   }
 
   async function handleRespond(requestId: string, response: string) {

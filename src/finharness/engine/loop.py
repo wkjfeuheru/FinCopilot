@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,8 @@ from typing import Any
 from finharness.config.settings import Settings
 from finharness.context.compaction import AutoCompactor, CompactionResult
 from finharness.context.memory.short_term import Episode, ShortTermMemory
+from finharness.context.memory.state_store import MemoryStateStore, SqliteAgentStateStore
+from finharness.context.memory.store import MemoryStore
 from finharness.context.memory.summary import SummaryLayer
 from finharness.context.memory.working import WorkingMemory
 from finharness.context.session import Plan, ResearchContext
@@ -21,13 +24,33 @@ from finharness.data.citation import (
     fingerprint_text,
 )
 from finharness.engine.cost import SessionStats
+from finharness.engine.machine import AgentStateMachine
 from finharness.engine.plan_progress import PlanProgressMixin
 from finharness.engine.retry import RetryPolicy, stream_with_retry
+from finharness.engine.runner import AgentRunner, EffectResult, RunnerEffects
+from finharness.engine.state import (
+    AgentPhase,
+    AgentState,
+    CallStatus,
+    CompactionFinished,
+    ConfirmationRequested,
+    ConfirmationResolved,
+    HydrationFinished,
+    ModelFinished,
+    ResumeRequested,
+    RunFailed,
+    StopRequested,
+    ToolBatchFinished,
+    ToolCallFinished,
+    ToolCallStarted,
+    UsageDelta,
+    new_agent_state,
+)
 from finharness.hooks.base import HookChain
 from finharness.observability import NullObserver
 from finharness.observability.context import update_turn
 from finharness.observability.logs import get_logger
-from finharness.permissions.gate import ReadOnlyGate
+from finharness.permissions.gate import ConfirmationSpec, GateDecision, ReadOnlyGate
 from finharness.permissions.modes import Verdict
 from finharness.provider.base import Provider
 from finharness.shared.budget import resolve_result_budget
@@ -56,6 +79,7 @@ from finharness.types import (
     ToolResult,
     ToolUse,
 )
+from finharness.utils.clock import utc_now_iso
 
 
 class _CompactionMarker:
@@ -227,6 +251,28 @@ class AgentLoop(PlanProgressMixin):
         # 协作式停止信号（docs 03.3）。默认 None，使 eval、脚本与子代理等
         # 不经过服务层的调用方行为完全不变：没有信号就永远不检查。
         self.stop_signal: StopSignal | None = None
+        # FSM 运行期暂存：答案不在 AgentState 上。
+        self._pending_answer: str = ""
+        self._pending_error: str | None = None
+        self._pending_reason: str | None = None
+        self._pending_fail_kind: str = ""
+        self._pending_fail_message: str = ""
+        self._think_deltas: list[str] = []
+        self._think_round_input: int = 0
+        self._think_round_output: int = 0
+        self._think_llm_first_ms: int = 0
+        self._think_llm_ms: int = 0
+        self._machine: AgentStateMachine | None = None
+        self._is_resume: bool = False
+        self._resume_phase: AgentPhase | None = None
+        self._finished_call_ids: set[str] = set()
+        # FSM confirmation: ephemeral prompt payload + one-shot answers (not persisted).
+        self._pending_confirm_spec: ConfirmationSpec | None = None
+        self._confirmation_approved_ids: set[str] = set()
+        self._interaction_answer: str | None = None
+        self._skip_permission_ids: set[str] = set()
+        # Queued by InteractivePort; emitted in _after_dispatch after ConfirmationResolved.
+        self._pending_interaction_resolved: dict[str, Any] | None = None
 
     def _stopped(self) -> bool:
         """是否已收到停止请求；无信号时恒为 False。"""
@@ -390,9 +436,7 @@ class AgentLoop(PlanProgressMixin):
             return
         self._memory_loaded = True
 
-        self.store.ensure_conversation(
-            self.conversation_id, user_id=self.user_id, title=_title_from(user_msg)
-        )
+        # 对话行由 ``run()`` 在 ``machine.start()`` 之前创建（外键）。
         # 对话记录，让模型从会话中途续接，而不是从头开始。
         # track=False：重放的历史已经存储过；再缓冲它会以重复的序号再次写入。
         #
@@ -598,9 +642,8 @@ class AgentLoop(PlanProgressMixin):
         note = review.get("unresolved_note")
         self.ctx.note_review_finding(topic, str(note) if note else None)
 
-    async def _maybe_compact(self) -> None:
-        """当下一次请求将超出窗口预算时，对历史进行折叠压缩。"""
-        compactor = AutoCompactor(
+    def _build_compactor(self) -> AutoCompactor:
+        return AutoCompactor(
             provider=self.provider,
             memory=self.memory,
             settings=self.settings,
@@ -612,9 +655,9 @@ class AgentLoop(PlanProgressMixin):
             # 摘要调用的 token 计入会话总量，使成本视图完整。
             on_usage=lambda i, o: self._account_compaction_usage(i, o),
         )
-        if not compactor.needs_compaction():
-            return
-        result = await compactor.compact()
+
+    async def _apply_compaction_result(self, result: CompactionResult) -> None:
+        """Emit/audit one compaction result (degrade still continues)."""
         if not result.compacted and result.warning is None:
             return
         self.compactions.append(result)
@@ -644,6 +687,14 @@ class AgentLoop(PlanProgressMixin):
                 )
             except Exception:  # noqa: BLE001 - 审计失败绝不能中断一轮
                 self._log_audit_failure("compact")
+
+    async def _maybe_compact(self) -> None:
+        """当下一次请求将超出窗口预算时，对历史进行折叠压缩。"""
+        compactor = self._build_compactor()
+        if not compactor.needs_compaction():
+            return
+        result = await compactor.compact()
+        await self._apply_compaction_result(result)
 
     def _log_audit_failure(self, action: str, tool_name: str = "?") -> None:
         """审计写入失败时必须留下痕迹。
@@ -914,11 +965,11 @@ class AgentLoop(PlanProgressMixin):
             rounds=self.rounds,
         )
 
-    async def run(self, user_msg: str) -> AgentTurnOutcome:
+    async def run(self, user_msg: str, *, resume: bool = False) -> AgentTurnOutcome:
         """运行一次完整的 agent 轮次循环，返回本轮结果。
 
         重置各项按运行维护的状态，在需要时加载持久化记忆，然后交由
-        ``_run_turns`` 逐步执行模型调用与工具调用，最后持久化本轮消息。
+        ``AgentRunner`` 按显式阶段执行，最后持久化本轮消息。
 
         本方法持有一轮请求的根 Span：它是所有入口（服务端、eval、脚本）共同
         的执行边界，因此请求级耗时只在这里统计一次，不会重复计数。
@@ -929,7 +980,7 @@ class AgentLoop(PlanProgressMixin):
             model=model,
             emit_metric=self.call_type == "main",
         ) as span:
-            outcome = await self._run_once(user_msg)
+            outcome = await self._run_once(user_msg, resume=resume)
             # 根 Span 的成功状态取自引擎的结论，而不是"没有抛异常"。
             span.set_attribute("status", "ok" if outcome.succeeded else "error")
             span.set_attribute("reason", outcome.reason or "ok")
@@ -948,29 +999,13 @@ class AgentLoop(PlanProgressMixin):
                 )
             return outcome
 
-    async def _run_once(self, user_msg: str) -> AgentTurnOutcome:
-        """``run`` 的实际执行体；根 Span 由调用方持有。"""
-        # 记住该问题：scope/偏离信号从它读取任务自身的 symbol 与 capability，
-        # 这才是事实依据，而非计划可能不完整的重述。
-        self._last_user_msg = user_msg or ""
-        # 在对话首轮，于构建 prompt 之前加载已持久化的记忆。后续轮次复用
-        # 它（见 ctx）而非重新查询：系统提示词每轮要测量三次，这些测量必须一致。
-        await self._load_memory_if_first_turn(user_msg)
-        # 断点属于"一轮"，而一个会话可承载多轮，因此它必须在每次 run() 都检查：
-        # 会话复用时上面的加载会提前返回，挂在里面就会漏掉"同一窗口内继续"。
-        # 放在这里（而非更晚）是为了让本轮第一次 prompt 组装就能看到恢复的计划。
-        self._restore_checkpoint()
-        # 语义召回按**本轮问题**刷新（docs 03.6.4 LTM）：与情节的标的驱动不同，
-        # "哪个知识跟当前问题相关"只有拿到问题文本才能判断。它发生在 prompt
-        # 组装之前，因此本轮三次测量看到的是同一份文本。
-        self.ctx.refresh_semantic_recall(user_msg, index=self.semantic_index)
-        # 在追加之前打开本轮的写缓冲区，这样用户消息会被缓存以供持久化，
-        # 而不会被重置操作丢弃。
-        self.memory.pending = []
-        if user_msg:
-            self.memory.append_user(user_msg)
+    def _make_state_store(self) -> MemoryStateStore | SqliteAgentStateStore:
+        if isinstance(self.store, MemoryStore):
+            return SqliteAgentStateStore(self.store)
+        return MemoryStateStore()
 
-        # 按运行维护的状态：轮次预算按请求计算，因此计数器随之重置。
+    def _reset_run_locals(self) -> None:
+        """按运行维护的状态：轮次预算按请求计算，因此计数器随之重置。"""
         self.turn = 0
         self._call_counts = {}
         self._reminded = set()
@@ -979,22 +1014,137 @@ class AgentLoop(PlanProgressMixin):
         self._plan_stall_turns = 0
         self._reported_drift = set()
         self._reported_mismatch = set()
-        # 轨迹记录按问题保存，与其他按运行维护的状态一样。
         self.trace = []
         self.rounds = 0
         self._call_meta = {}
+        self._pending_answer = ""
+        self._pending_error = None
+        self._pending_reason = None
+        self._pending_fail_kind = ""
+        self._pending_fail_message = ""
+        self._think_deltas = []
+        self._think_round_input = 0
+        self._think_round_output = 0
+        self._think_llm_first_ms = 0
+        self._think_llm_ms = 0
+        self._finished_call_ids = set()
+        self._pending_confirm_spec = None
+        self._confirmation_approved_ids = set()
+        self._interaction_answer = None
+        self._skip_permission_ids = set()
+        self._pending_interaction_resolved = None
 
-        # 路由：从问题本身推断需要哪些方法论，并注入其正文。放在轮次循环之前，因此
-        # 第一次模型调用就已经看得到方法，而不是等到某一轮才补上——简单提问没有计划，
-        # 这是它唯一能拿到方法论的时机。
-        if self.route_skills:
-            await self._route_methodology()
+    def queue_interaction_resolved(self, payload: dict[str, Any]) -> None:
+        """InteractivePort stashes resolved metadata; emit after ConfirmationResolved."""
+        self._pending_interaction_resolved = payload
 
+    def _failed_resume_outcome(self) -> AgentTurnOutcome:
+        reason = "no_resumable_state"
+        message = "no resumable agent state for this conversation"
+        return AgentTurnOutcome(
+            answer="",
+            succeeded=False,
+            usage=self.usage,
+            error=message,
+            reason=reason,
+            tool_calls=0,
+            retry_count=self.stats.retry_count,
+            tool_duration_ms=self.stats.snapshot().tool_duration_ms,
+            citations=self._citation_ids(),
+            trace=list(self.trace),
+            rounds=self.rounds,
+        )
+
+    async def _after_dispatch(self, messages: tuple[Msg, ...]) -> None:
+        """Apply committed Msgs; emit queued interaction_resolved after persist."""
+        known = {id(message) for message in self.memory.raw}
+        for message in messages:
+            if id(message) not in known:
+                self.memory.append(message, track=False)
+        committed = {id(message) for message in messages}
+        if committed:
+            self.memory.pending = [
+                message
+                for message in self.memory.pending
+                if id(message) not in committed
+            ]
+        pending = self._pending_interaction_resolved
+        if pending is not None:
+            self._pending_interaction_resolved = None
+            await self._emit("interaction_resolved", pending)
+
+    def _tool_permission(self, name: str) -> str:
+        resolve = getattr(self.registry, "resolve", None)
+        tool = resolve(name) if callable(resolve) else None
+        if tool is None:
+            return "unknown"
+        is_read_only = getattr(self.registry, "is_read_only", None)
+        if callable(is_read_only) and is_read_only(name):
+            return "read"
+        return "write"
+
+    async def _run_once(self, user_msg: str, *, resume: bool = False) -> AgentTurnOutcome:
+        """``run`` 的实际执行体；根 Span 由调用方持有。"""
+        # 记住该问题：scope/偏离信号从它读取任务自身的 symbol 与 capability，
+        # 这才是事实依据，而非计划可能不完整的重述。
+        self._last_user_msg = user_msg or ""
+        state_store = self._make_state_store()
+        self._is_resume = False
+        self._resume_phase = None
+
+        if resume:
+            snapshot = state_store.latest_resumable(self.conversation_id, self.user_id)
+            if snapshot is None:
+                return self._failed_resume_outcome()
+            self._reset_run_locals()
+            self._is_resume = True
+            self._resume_phase = snapshot.phase
+            machine = AgentStateMachine(
+                snapshot, store=state_store, output=self.output
+            )
+            self._machine = machine
+            await machine.dispatch(ResumeRequested(at=utc_now_iso()))
+        else:
+            self._reset_run_locals()
+            # A normal new message abandons any older resumable run before
+            # hydrate, so eval/scripts share the same supersede semantics.
+            state_store.abandon_latest(
+                self.conversation_id, self.user_id, now=utc_now_iso()
+            )
+            if isinstance(self.store, MemoryStore):
+                self.store.ensure_conversation(
+                    self.conversation_id,
+                    user_id=self.user_id,
+                    title=_title_from(user_msg),
+                )
+            initial = new_agent_state(
+                run_id=str(uuid.uuid4()),
+                conversation_id=self.conversation_id,
+                user_id=self.user_id,
+                now=utc_now_iso(),
+            )
+            machine = AgentStateMachine(
+                initial, store=state_store, output=self.output
+            )
+            self._machine = machine
+            await machine.start()
+
+        effects = RunnerEffects(
+            hydrate=self._effect_hydrate,
+            compact=self._effect_compact,
+            think=self._effect_think,
+            use_tools=self._effect_tooluse,
+            await_confirmation=self._effect_await_confirmation,
+            finish=self._finish_run,
+        )
+        runner = AgentRunner(
+            machine, effects, after_dispatch=self._after_dispatch
+        )
         try:
-            outcome = await self._run_turns()
+            outcome = await runner.run()
         except BaseException:
             # 硬取消（连接被掐断、任务被取消、进程即将退出）也必须留下本轮成果。
-            # ``CancelledError`` 继承自 ``BaseException``，会穿出 ``_run_turns``
+            # ``CancelledError`` 继承自 ``BaseException``，会穿出 runner
             # 里所有 ``except Exception``；若不在这里兜住，下面的持久化将被跳过，
             # 用户消息与已完成的取数会一并消失——这正是"中断即丢数据"的成因。
             # ``_persist_turn``/``_save_checkpoint`` 是同步 SQLite 写入，在被取消
@@ -1002,6 +1152,8 @@ class AgentLoop(PlanProgressMixin):
             self._persist_turn()
             self._save_checkpoint(status="stopped", reason="interrupted")
             raise
+        finally:
+            self._machine = None
         self._persist_turn()
         # 断点是"可继续"状态的载体：正常交付记 completed，运行失败（含用户停止）
         # 记 stopped。判据取自引擎结论而非异常与否——停止本就不抛异常。
@@ -1011,6 +1163,54 @@ class AgentLoop(PlanProgressMixin):
             partial_answer=outcome.answer if not outcome.succeeded else "",
         )
         return outcome
+
+    async def _effect_hydrate(self, state: AgentState) -> EffectResult:
+        """Load memory, restore checkpoint, recall, route; decide compaction."""
+        await self._load_memory_if_first_turn(self._last_user_msg)
+        # 断点属于"一轮"，而一个会话可承载多轮，因此它必须在每次 run() 都检查：
+        # 会话复用时上面的加载会提前返回，挂在里面就会漏掉"同一窗口内继续"。
+        # 放在这里（而非更晚）是为了让本轮第一次 prompt 组装就能看到恢复的计划。
+        self._restore_checkpoint()
+        # 语义召回按**本轮问题**刷新（docs 03.6.4 LTM）：与情节的标的驱动不同，
+        # "哪个知识跟当前问题相关"只有拿到问题文本才能判断。它发生在 prompt
+        # 组装之前，因此本轮三次测量看到的是同一份文本。
+        self.ctx.refresh_semantic_recall(self._last_user_msg, index=self.semantic_index)
+        # 在追加之前打开本轮的写缓冲区，这样用户消息会被缓存以供持久化，
+        # 而不会被重置操作丢弃。
+        self.memory.pending = []
+        # Resume must not duplicate the user frame already in durable history.
+        if not self._is_resume and self._last_user_msg:
+            self.memory.append_user(self._last_user_msg)
+
+        # 路由：从问题本身推断需要哪些方法论，并注入其正文。放在轮次循环之前，因此
+        # 第一次模型调用就已经看得到方法，而不是等到某一轮才补上——简单提问没有计划，
+        # 这是它唯一能拿到方法论的时机。
+        if self.route_skills and not self._is_resume:
+            await self._route_methodology()
+
+        mid_tool_round = self._resume_phase in {
+            AgentPhase.TOOL_USE,
+            AgentPhase.AWAITING_CONFIRMATION,
+        }
+        if mid_tool_round:
+            needs_compaction = False
+            resume_phase = self._resume_phase
+        else:
+            needs_compaction = self._build_compactor().needs_compaction()
+            allowed = {
+                AgentPhase.THINKING,
+                AgentPhase.TOOL_USE,
+                AgentPhase.AWAITING_CONFIRMATION,
+            }
+            candidate = self._resume_phase or state.resume_phase
+            resume_phase = candidate if candidate in allowed else None
+        return EffectResult(
+            HydrationFinished(
+                needs_compaction=needs_compaction,
+                resume_phase=resume_phase,
+                at=utc_now_iso(),
+            )
+        )
 
     async def _route_methodology(self) -> list[str]:
         """按问题意图注入方法论正文，返回本次新注入的目标键。
@@ -1052,265 +1252,740 @@ class AgentLoop(PlanProgressMixin):
             )
         return injected
 
-    async def _run_turns(self) -> AgentTurnOutcome:
-        """驱动模型轮次直到产出最终答案、耗尽轮次预算或触发中止。
+    async def _effect_compact(self, state: AgentState) -> EffectResult:
+        """Run compaction body; degrade still continues to thinking."""
+        del state
+        compactor = self._build_compactor()
+        result = await compactor.compact()
+        await self._apply_compaction_result(result)
+        return EffectResult(CompactionFinished(at=utc_now_iso()))
 
-        每轮做窗口维护、流式请求模型、执行工具调用并记录轨迹；某个调用触发
-        循环防护时以部分答案提前结束，轮次耗尽时同样如此。
-        """
-        tool_calls_total = 0
-        model = getattr(self.provider, "model", "") or ""
-        # 完整 Prompt 只在明确要求时构造，避免默认开启追踪时白算一遍消息历史。
-        capture_messages = bool(getattr(self.observer, "tracing_capture_payloads", False))
-        for _ in range(self.settings.context.max_turns):
-            # 轮次边界是停止的第一个自然检查点：一轮已经完整收尾，此时停下
-            # 不会破坏对话记录的格式（不存在半截的工具调用）。
-            if self._stopped():
-                return await self._stop_turn(tool_calls=tool_calls_total)
-            self.turn += 1
-            update_turn(self.turn)
-            # 窗口维护发生在轮次之间，绝不在请求中途，并且即使摘要失败也不能
-            # 中断对话。
-            await self._maybe_compact()
-            deltas: list[str] = []
-            tool_uses: list[ToolUse] = []
-            # 为轨迹记录按轮捕获耗时/token。时钟在请求之前启动，因此首 token
-            # 延迟是按轮计算的，而非按运行；token 是本轮的，与模型看到的一致。
-            round_started = self.stats.now()
-            first_token_at: float | None = None
-            round_input = 0
-            round_output = 0
-            # 停止请求是否在本轮流式期间到达。逐 chunk 检查是覆盖最常见场景的
-            # 检查点：用户按下停止时，多半正看着一段长回答在流式输出。
-            stop_requested = False
-            # LLM 子 Span 必须包住整个 ``async for`` 消费过程，而不只是
-            # provider.stream() 返回的生成器对象——后者在第一次迭代前不会发起
-            # 请求，越过消费边界关 Span 会得到 0 耗时。
-            async with self.observer.llm_span(
-                model=model,
-                call_type=self.call_type,
-                messages=self._request_messages() if capture_messages else None,
-                tool_count=len(self.registry.schemas()),
-            ) as llm_span:
-                try:
-                    async for chunk in stream_with_retry(
-                        lambda: self.provider.stream(
-                            system=self._system_prompt(),
-                            messages=self._request_messages(),
-                            tools=self.registry.schemas(),
-                            usage=self.usage,
-                        ),
-                        policy=self.retry_policy,
-                        on_retry=lambda error, index, delay: self._on_retry(error, index, delay),
-                    ):
-                        if self._stopped():
-                            # 立刻停止消费，不再等待后续 chunk。此刻尚未收到
-                            # MESSAGE_END，因此 ``tool_uses`` 仍为空——不会留下
-                            # 一个缺少配对的工具调用帧。
-                            stop_requested = True
-                            break
-                        if chunk.event is StreamEvent.TEXT_DELTA:
-                            # 每个 delta 一到就流式输出，使答案在生成过程中逐步显现，
-                            # 而不是在结束时一次性涌出。仍然保留缓冲区，以组装
-                            # 最终答案和持久化的消息。
-                            if first_token_at is None:
-                                first_token_at = self.stats.now()
-                                llm_span.mark_first_token()
-                            deltas.append(chunk.data)
-                            await self._emit("text_delta", {"text": chunk.data})
-                        elif chunk.event is StreamEvent.MESSAGE_END and isinstance(
-                            chunk.data, ModelUsage
-                        ):
-                            tool_uses = list(chunk.data.tool_uses)
-                            round_input += chunk.data.input_tokens
-                            round_output += chunk.data.output_tokens
-                            self.usage.input_tokens += chunk.data.input_tokens
-                            self.usage.output_tokens += chunk.data.output_tokens
-                            self.usage.cache_hit_tokens += chunk.data.cache_hit_tokens
-                            self.usage.cache_miss_tokens += chunk.data.cache_miss_tokens
-                            self.stats.add_usage(
-                                chunk.data.input_tokens,
-                                chunk.data.output_tokens,
-                                cache_hit_tokens=chunk.data.cache_hit_tokens,
-                                cache_miss_tokens=chunk.data.cache_miss_tokens,
-                            )
-                            # token 指标的唯一权威发射点；Span 结束时统一上报，
-                            # 避免主循环与子 Agent 两处各发一次导致双计。
-                            llm_span.set_usage(chunk.data)
-                except Exception as exc:
-                    # 本轮的请求从未完成；记录它实际产出的内容，使失败运行的轨迹
-                    # 能显示失败点。
-                    llm_span.fail(str(exc))
-                    self._record_round(
-                        thought="".join(deltas),
-                        actions=[],
-                        results=[],
-                        input_tokens=round_input,
-                        output_tokens=round_output,
-                        llm_first_ms=(
-                            round((first_token_at - round_started) * 1000)
-                            if first_token_at is not None
-                            else 0
-                        ),
-                        llm_ms=round((self.stats.now() - round_started) * 1000),
-                    )
-                    return await self._fail(
-                        kind=type(exc).__name__,
-                        message=str(exc),
-                        reason="provider_error",
-                        tool_calls=tool_calls_total,
-                        error=str(exc),
-                        # 交还早先轮次已确立的内容；第 N 轮发生 provider 失败
-                        # 绝不能丢弃第 1..N-1 轮。
-                        answer=(
-                            self._partial_answer(reason="provider_error")
-                            if self._has_partial_findings()
-                            else ""
-                        ),
-                    )
-
-            stream_ended = self.stats.now()
-            llm_first_ms = (
-                round((first_token_at - round_started) * 1000)
-                if first_token_at is not None
-                else 0
+    async def _effect_think(self, state: AgentState) -> EffectResult:
+        """One provider stream; return ModelFinished / StopRequested / RunFailed."""
+        now = utc_now_iso()
+        if state.turn >= self.settings.context.max_turns:
+            self._pending_reason = "max_turns_exhausted"
+            self._pending_fail_kind = "max_turns_exhausted"
+            self._pending_fail_message = "maximum agent turns exhausted"
+            self._pending_error = None
+            self._pending_answer = self._partial_answer(reason="max_turns_exhausted")
+            return EffectResult(
+                RunFailed(
+                    kind="max_turns_exhausted",
+                    message="maximum agent turns exhausted",
+                    at=now,
+                )
             )
-            llm_ms = round((stream_ended - round_started) * 1000)
 
-            if stop_requested:
-                # 停止发生在流式期间：记录这一轮实际产出的内容（对失败/中止的
-                # 运行，轨迹要能显示停止点），然后按停止收尾。此前各轮已确立的
-                # 发现由 ``_stop_turn`` 汇总交付。
+        if self._stopped():
+            self._pending_reason = "user_stopped"
+            return EffectResult(StopRequested(at=now))
+
+        self.turn = state.turn + 1
+        update_turn(self.turn)
+        # Mid-run window maintenance (after tool rounds). First-turn compact is
+        # an explicit COMPACT phase when hydrate reported needs_compaction.
+        await self._maybe_compact()
+
+        model = getattr(self.provider, "model", "") or ""
+        capture_messages = bool(getattr(self.observer, "tracing_capture_payloads", False))
+        deltas: list[str] = []
+        tool_uses: list[ToolUse] = []
+        round_started = self.stats.now()
+        first_token_at: float | None = None
+        round_input = 0
+        round_output = 0
+        stop_requested = False
+
+        async with self.observer.llm_span(
+            model=model,
+            call_type=self.call_type,
+            messages=self._request_messages() if capture_messages else None,
+            tool_count=len(self.registry.schemas()),
+        ) as llm_span:
+            try:
+                async for chunk in stream_with_retry(
+                    lambda: self.provider.stream(
+                        system=self._system_prompt(),
+                        messages=self._request_messages(),
+                        tools=self.registry.schemas(),
+                        usage=self.usage,
+                    ),
+                    policy=self.retry_policy,
+                    on_retry=lambda error, index, delay: self._on_retry(
+                        error, index, delay
+                    ),
+                ):
+                    if self._stopped():
+                        stop_requested = True
+                        break
+                    if chunk.event is StreamEvent.TEXT_DELTA:
+                        if first_token_at is None:
+                            first_token_at = self.stats.now()
+                            llm_span.mark_first_token()
+                        deltas.append(chunk.data)
+                        await self._emit("text_delta", {"text": chunk.data})
+                    elif chunk.event is StreamEvent.MESSAGE_END and isinstance(
+                        chunk.data, ModelUsage
+                    ):
+                        tool_uses = list(chunk.data.tool_uses)
+                        round_input += chunk.data.input_tokens
+                        round_output += chunk.data.output_tokens
+                        self.usage.input_tokens += chunk.data.input_tokens
+                        self.usage.output_tokens += chunk.data.output_tokens
+                        self.usage.cache_hit_tokens += chunk.data.cache_hit_tokens
+                        self.usage.cache_miss_tokens += chunk.data.cache_miss_tokens
+                        self.stats.add_usage(
+                            chunk.data.input_tokens,
+                            chunk.data.output_tokens,
+                            cache_hit_tokens=chunk.data.cache_hit_tokens,
+                            cache_miss_tokens=chunk.data.cache_miss_tokens,
+                        )
+                        llm_span.set_usage(chunk.data)
+            except Exception as exc:
+                llm_span.fail(str(exc))
                 self._record_round(
                     thought="".join(deltas),
                     actions=[],
                     results=[],
                     input_tokens=round_input,
                     output_tokens=round_output,
-                    llm_first_ms=llm_first_ms,
-                    llm_ms=llm_ms,
+                    llm_first_ms=(
+                        round((first_token_at - round_started) * 1000)
+                        if first_token_at is not None
+                        else 0
+                    ),
+                    llm_ms=round((self.stats.now() - round_started) * 1000),
                 )
-                return await self._stop_turn(tool_calls=tool_calls_total)
+                self._pending_reason = "provider_error"
+                self._pending_fail_kind = type(exc).__name__
+                self._pending_fail_message = str(exc)
+                self._pending_error = str(exc)
+                self._pending_answer = (
+                    self._partial_answer(reason="provider_error")
+                    if self._has_partial_findings()
+                    else ""
+                )
+                return EffectResult(
+                    RunFailed(
+                        kind=type(exc).__name__,
+                        message=str(exc),
+                        at=utc_now_iso(),
+                    )
+                )
 
-            if tool_uses:
-                # 本轮结果是一次工具调用，因此此前流出的任何文本都只是草稿，
-                # 而非答案。在展示工具活动之前告知客户端丢弃它；最终答案会在
-                # 后续某一轮流式输出。
-                if deltas:
-                    await self._emit("text_reset", {})
-                self.memory.append_assistant(
-                    Msg(role="assistant", content=None, tool_uses=tool_uses)
-                )
-                try:
-                    results = list(
-                        await asyncio.gather(
-                            *(self._execute_one(tool_use) for tool_use in tool_uses)
-                        )
-                    )
-                except LoopDetected as detected:
-                    # 为每个调用配对，使对话记录保持格式良好，然后带着已经确立
-                    # 的内容结束本次运行。
-                    aborted = self._aborted_results(tool_uses)
-                    self.memory.append(
-                        Msg(role="tool_result", content=None, tool_results=aborted)
-                    )
-                    # 记录触发中止的这一轮：是哪个调用触发了防护、带着什么参数，
-                    # 这是核心的轨迹观测。
-                    self._record_round(
-                        thought="".join(deltas),
-                        actions=tool_uses,
-                        results=aborted,
-                        input_tokens=round_input,
-                        output_tokens=round_output,
-                        llm_first_ms=llm_first_ms,
-                        llm_ms=llm_ms,
-                    )
-                    await self._audit_detection(detected)
-                    return await self._fail(
-                        kind="loop_detected",
-                        message=str(detected),
-                        reason="loop_detected",
-                        tool_calls=tool_calls_total,
-                        error=str(detected),
-                        answer=self._partial_answer(reason="loop_detected"),
-                    )
-                except BaseException:
-                    # 被中止的一轮绝不能让 assistant 帧缺少配对的 tool 消息，
-                    # 否则下一次请求格式错误。
-                    self.memory.append(
-                        Msg(
-                            role="tool_result",
-                            content=None,
-                            tool_results=self._aborted_results(tool_uses),
-                        )
-                    )
-                    raise
-                self.memory.append(
-                    Msg(role="tool_result", content=None, tool_results=results)
-                )
-                tool_calls_total += len(results)
-                self._record_round(
-                    thought="".join(deltas),
-                    actions=tool_uses,
-                    results=results,
-                    input_tokens=round_input,
-                    output_tokens=round_output,
-                    llm_first_ms=llm_first_ms,
-                    llm_ms=llm_ms,
-                )
-                # 停止可能在一次耗时较长的工具调用期间到达。此时工具已经跑完，
-                # 其结果已写入本轮缓冲区，因此在这里停下既不浪费这次取数，也
-                # 不会留下缺少配对的工具帧——这是"停止保留成果"最关键的一处。
-                if self._stopped():
-                    return await self._stop_turn(tool_calls=tool_calls_total)
-                # 计划进展在刚运行完的这一轮上评估，然后搭载到下一次请求。
-                # 它是一个信号，绝不是闸门：一轮绝不会因为偏离计划而被拒绝。
-                progress = self._plan_progress(tool_uses)
-                if progress is not None:
-                    self._plan_hint = self._plan_hint_text(progress)
-                    # 轮次序号使监控端能把"跑偏"定位到具体一轮（drift 首现轮）。
-                    progress["turn"] = self.turn
-                    await self._emit("plan_progress", progress)
-                continue
+        stream_ended = self.stats.now()
+        llm_first_ms = (
+            round((first_token_at - round_started) * 1000)
+            if first_token_at is not None
+            else 0
+        )
+        llm_ms = round((stream_ended - round_started) * 1000)
+        self._think_deltas = deltas
+        self._think_round_input = round_input
+        self._think_round_output = round_output
+        self._think_llm_first_ms = llm_first_ms
+        self._think_llm_ms = llm_ms
 
-            answer = "".join(deltas)
+        if stop_requested:
             self._record_round(
-                thought="",
+                thought="".join(deltas),
                 actions=[],
                 results=[],
                 input_tokens=round_input,
                 output_tokens=round_output,
                 llm_first_ms=llm_first_ms,
                 llm_ms=llm_ms,
-                answer=answer,
             )
-            await self._emit("answer", {"text": answer})
-            await self._emit(
-                "done",
-                self._done_payload(
-                    succeeded=True, reason=None, tool_calls=tool_calls_total
+            self._pending_reason = "user_stopped"
+            return EffectResult(StopRequested(at=utc_now_iso()))
+
+        usage = UsageDelta(input_tokens=round_input, output_tokens=round_output)
+        if tool_uses:
+            if deltas:
+                await self._emit("text_reset", {})
+            permissions = {
+                tool_use.call_id: self._tool_permission(tool_use.name)
+                for tool_use in tool_uses
+            }
+            assistant = Msg(role="assistant", content=None, tool_uses=list(tool_uses))
+            # Keep pending until dispatch commits; clear in _after_dispatch.
+            pending = tuple(self.memory.pending)
+            return EffectResult(
+                ModelFinished(
+                    answer="",
+                    tool_uses=tuple(tool_uses),
+                    usage=usage,
+                    at=utc_now_iso(),
+                    permissions=permissions,
                 ),
-            )
-            self.memory.append_assistant(Msg(role="assistant", content=answer))
-            return AgentTurnOutcome(
-                answer=answer,
-                usage=self.usage,
-                tool_calls=tool_calls_total,
-                retry_count=self.stats.retry_count,
-                tool_duration_ms=self.stats.snapshot().tool_duration_ms,
-                citations=self._citation_ids(),
-                trace=list(self.trace),
-                rounds=self.rounds,
+                messages=pending + (assistant,),
             )
 
+        answer = "".join(deltas)
+        self._pending_answer = answer
+        self._pending_reason = None
+        self._record_round(
+            thought="",
+            actions=[],
+            results=[],
+            input_tokens=round_input,
+            output_tokens=round_output,
+            llm_first_ms=llm_first_ms,
+            llm_ms=llm_ms,
+            answer=answer,
+        )
+        return EffectResult(
+            ModelFinished(
+                answer=answer,
+                tool_uses=(),
+                usage=usage,
+                at=utc_now_iso(),
+            )
+        )
+
+    async def _effect_tooluse(self, state: AgentState) -> EffectResult:
+        """Execute/recover persisted tool calls; finalize one tool-result Msg."""
+        machine = self._machine
+        if machine is None:
+            raise RuntimeError("tooluse effect requires an active state machine")
+
+        now = utc_now_iso()
+        deltas = self._think_deltas
+        round_input = self._think_round_input
+        round_output = self._think_round_output
+        llm_first_ms = self._think_llm_first_ms
+        llm_ms = self._think_llm_ms
+        self._finished_call_ids = {
+            call.call_id
+            for call in state.calls
+            if call.status in {CallStatus.COMPLETED, CallStatus.FAILED}
+            and call.result_json is not None
+        }
+
+        if self._is_resume:
+            # Consume resume classification once: after confirmation resolves,
+            # re-entering tooluse must execute (not re-prompt uncertain writes).
+            self._is_resume = False
+            uncertain_ids: list[str] = []
+            for call in state.calls:
+                if call.status in {CallStatus.COMPLETED, CallStatus.FAILED}:
+                    continue
+                if call.status is CallStatus.UNCERTAIN:
+                    uncertain_ids.append(call.call_id)
+                    continue
+                if call.status in {CallStatus.PENDING, CallStatus.RUNNING}:
+                    if call.permission == "read":
+                        continue
+                    uncertain_ids.append(call.call_id)
+
+            if uncertain_ids:
+                for call_id in uncertain_ids:
+                    current = next(
+                        c for c in machine.state.calls if c.call_id == call_id
+                    )
+                    if current.status is not CallStatus.UNCERTAIN:
+                        await machine.dispatch(
+                            ToolCallFinished(
+                                call_id=call_id,
+                                status=CallStatus.UNCERTAIN,
+                                result_json=None,
+                                at=utc_now_iso(),
+                            )
+                        )
+                return EffectResult(
+                    ConfirmationRequested(
+                        prompt="上次执行结果未知，是否重试该写操作？",
+                        options=("y", "n"),
+                        call_ids=tuple(uncertain_ids),
+                        at=utc_now_iso(),
+                        kind="permission",
+                        category="write",
+                    )
+                )
+
+        tool_uses = [
+            ToolUse(call_id=call.call_id, name=call.name, args=dict(call.args))
+            for call in state.calls
+        ]
+        results_by_id: dict[str, str] = {
+            call.call_id: call.result_json
+            for call in state.calls
+            if call.status in {CallStatus.COMPLETED, CallStatus.FAILED}
+            and call.result_json is not None
+        }
+
+        async def run_one(call) -> tuple[str, str]:
+            tool_use = ToolUse(
+                call_id=call.call_id, name=call.name, args=dict(call.args)
+            )
+            await machine.dispatch(
+                ToolCallStarted(call_id=call.call_id, at=utc_now_iso())
+            )
+            call_id, result_json = await self._execute_one(tool_use)
+            status = CallStatus.COMPLETED
+            try:
+                payload = json.loads(result_json)
+                if isinstance(payload, dict) and not payload.get("ok", True):
+                    status = CallStatus.FAILED
+            except (TypeError, ValueError):
+                pass
+            await machine.dispatch(
+                ToolCallFinished(
+                    call_id=call_id,
+                    status=status,
+                    result_json=result_json,
+                    at=utc_now_iso(),
+                )
+            )
+            self._finished_call_ids.add(call_id)
+            return call_id, result_json
+
+        to_run = [
+            call
+            for call in state.calls
+            if call.call_id not in results_by_id
+            and call.status
+            in {
+                CallStatus.PENDING,
+                CallStatus.RUNNING,
+            }
+        ]
+
+        allow_calls, deny_calls, confirm_specs = await self._partition_tool_calls(
+            to_run
+        )
+        for call in machine.state.calls:
+            if call.result_json is not None:
+                results_by_id[call.call_id] = call.result_json
+        if confirm_specs:
+            if allow_calls or deny_calls:
+                abort = await self._run_allow_calls(
+                    allow_calls,
+                    deny_calls=deny_calls,
+                    run_one=run_one,
+                    results_by_id=results_by_id,
+                    machine=machine,
+                    state=state,
+                    tool_uses=tool_uses,
+                    deltas=deltas,
+                    round_input=round_input,
+                    round_output=round_output,
+                    llm_first_ms=llm_first_ms,
+                    llm_ms=llm_ms,
+                )
+                if abort is not None:
+                    return abort
+            # One homogeneous group (same kind+category) per ConfirmationRequested;
+            # leave other pending confirms for the next tooluse pass.
+            first_spec = confirm_specs[0][1]
+            group = [
+                (call_id, spec)
+                for call_id, spec in confirm_specs
+                if spec.kind == first_spec.kind and spec.category == first_spec.category
+            ]
+            call_ids = tuple(call_id for call_id, _ in group)
+            merged = ConfirmationSpec(
+                kind=first_spec.kind,
+                prompt=first_spec.prompt,
+                options=first_spec.options,
+                category=first_spec.category,
+                call_ids=call_ids,
+                multi_select=first_spec.multi_select,
+            )
+            self._pending_confirm_spec = merged
+            return EffectResult(
+                ConfirmationRequested(
+                    prompt=merged.prompt,
+                    options=merged.options,
+                    call_ids=call_ids,
+                    at=utc_now_iso(),
+                    kind=merged.kind,
+                    category=merged.category,
+                    multi_select=merged.multi_select,
+                )
+            )
+
+        abort = await self._run_allow_calls(
+            allow_calls,
+            deny_calls=deny_calls,
+            run_one=run_one,
+            results_by_id=results_by_id,
+            machine=machine,
+            state=state,
+            tool_uses=tool_uses,
+            deltas=deltas,
+            round_input=round_input,
+            round_output=round_output,
+            llm_first_ms=llm_first_ms,
+            llm_ms=llm_ms,
+        )
+        if abort is not None:
+            return abort
+
+        for call in state.calls:
+            if (
+                call.status is CallStatus.FAILED
+                and call.call_id not in results_by_id
+            ):
+                tool_use = ToolUse(
+                    call_id=call.call_id, name=call.name, args=dict(call.args)
+                )
+                # Populate _call_meta so refused_tools / eval scorers see the name.
+                self._note_call(
+                    tool_use,
+                    ok=False,
+                    error="用户已拒绝该工具调用",
+                    duration_ms=0,
+                )
+                results_by_id[call.call_id] = json.dumps(
+                    {
+                        "ok": False,
+                        "content": "",
+                        "error": "用户已拒绝该工具调用",
+                    },
+                    ensure_ascii=False,
+                )
+
+        ordered = [
+            (call.call_id, results_by_id[call.call_id]) for call in state.calls
+        ]
+        tool_msg = Msg(role="tool_result", content=None, tool_results=ordered)
+        self._record_round(
+            thought="".join(deltas),
+            actions=tool_uses,
+            results=ordered,
+            input_tokens=round_input,
+            output_tokens=round_output,
+            llm_first_ms=llm_first_ms,
+            llm_ms=llm_ms,
+        )
+        if self._stopped():
+            self._pending_reason = "user_stopped"
+            return EffectResult(
+                StopRequested(at=utc_now_iso()), messages=(tool_msg,)
+            )
+        progress = self._plan_progress(tool_uses)
+        if progress is not None:
+            self._plan_hint = self._plan_hint_text(progress)
+            progress["turn"] = self.turn
+            await self._emit("plan_progress", progress)
+        return EffectResult(ToolBatchFinished(at=now), messages=(tool_msg,))
+
+    async def _run_allow_calls(
+        self,
+        allow_calls: list,
+        *,
+        deny_calls: list | None = None,
+        run_one,
+        results_by_id: dict[str, str],
+        machine: AgentStateMachine,
+        state: AgentState,
+        tool_uses: list,
+        deltas: list[str],
+        round_input: int,
+        round_output: int,
+        llm_first_ms: int,
+        llm_ms: int,
+    ) -> EffectResult | None:
+        """Reject DENY sequentially via run_one, then gather ALLOW calls.
+
+        DENY still goes through ``_execute_one`` (observer/stats/tool_status), but
+        never races under ``asyncio.gather`` with ALLOW — SSE failed-before-started
+        ordering for mixed batches stays deterministic.
+        """
+        deny_calls = list(deny_calls or [])
+        try:
+            for call in deny_calls:
+                call_id, result_json = await run_one(call)
+                results_by_id[call_id] = result_json
+            if not allow_calls:
+                return None
+            finished = await asyncio.gather(*(run_one(call) for call in allow_calls))
+            for call_id, result_json in finished:
+                results_by_id[call_id] = result_json
+        except LoopDetected as detected:
+            aborted = await self._persist_aborted_results(machine, state.calls)
+            for call_id, result_json in aborted:
+                results_by_id.setdefault(call_id, result_json)
+            ordered = [
+                (call.call_id, results_by_id[call.call_id])
+                for call in state.calls
+                if call.call_id in results_by_id
+            ]
+            tool_msg = Msg(role="tool_result", content=None, tool_results=ordered)
+            self._record_round(
+                thought="".join(deltas),
+                actions=tool_uses,
+                results=ordered,
+                input_tokens=round_input,
+                output_tokens=round_output,
+                llm_first_ms=llm_first_ms,
+                llm_ms=llm_ms,
+            )
+            await self._audit_detection(detected)
+            self._pending_reason = "loop_detected"
+            self._pending_fail_kind = "loop_detected"
+            self._pending_fail_message = str(detected)
+            self._pending_error = str(detected)
+            self._pending_answer = self._partial_answer(reason="loop_detected")
+            return EffectResult(
+                RunFailed(
+                    kind="loop_detected",
+                    message=str(detected),
+                    at=utc_now_iso(),
+                ),
+                messages=(tool_msg,),
+            )
+        except BaseException:
+            aborted = await self._persist_aborted_results(machine, state.calls)
+            for call_id, result_json in aborted:
+                results_by_id.setdefault(call_id, result_json)
+            ordered = [
+                (call.call_id, results_by_id[call.call_id])
+                for call in state.calls
+                if call.call_id in results_by_id
+            ]
+            tool_msg = Msg(role="tool_result", content=None, tool_results=ordered)
+            await machine.dispatch(
+                ToolBatchFinished(at=utc_now_iso()), messages=(tool_msg,)
+            )
+            await self._after_dispatch((tool_msg,))
+            raise
+        return None
+
+    async def _partition_tool_calls(
+        self, to_run: list
+    ) -> tuple[list, list, list[tuple[str, ConfirmationSpec]]]:
+        """Split pending calls into ALLOW, DENY, and confirmation-needed.
+
+        DENY calls are returned separately so the caller can reject them
+        sequentially via ``run_one`` → ``_execute_one`` (unified observer/stats/
+        tool_status bookkeeping) before ``asyncio.gather`` on ALLOW. CONFIRM /
+        ask_user leave tooluse via ``ConfirmationRequested`` (no await inside
+        gather).
+        """
+        allow_calls: list = []
+        deny_calls: list = []
+        confirm_specs: list[tuple[str, ConfirmationSpec]] = []
+        machine = self._machine
+        if machine is None:
+            return list(to_run), [], []
+
+        for call in to_run:
+            if call.call_id in self._confirmation_approved_ids:
+                self._confirmation_approved_ids.discard(call.call_id)
+                self._skip_permission_ids.add(call.call_id)
+                allow_calls.append(call)
+                continue
+
+            tool = self.registry.resolve(call.name)
+            if tool is None:
+                allow_calls.append(call)
+                continue
+
+            if getattr(tool, "needs_interactive", False):
+                options = call.args.get("options") or []
+                if not isinstance(options, list):
+                    options = list(options) if options else []
+                spec = ConfirmationSpec(
+                    kind="question",
+                    prompt=str(call.args.get("question") or ""),
+                    options=tuple(str(item) for item in options),
+                    category="question",
+                    call_ids=(call.call_id,),
+                    multi_select=bool(call.args.get("multi_select", False)),
+                )
+                confirm_specs.append((call.call_id, spec))
+                continue
+
+            decide = getattr(self.gate, "decide", None)
+            if callable(decide):
+                decision = decide(tool, dict(call.args))
+            else:
+                decision = await self.gate.check(tool, dict(call.args))
+
+            if decision.verdict is Verdict.DENY:
+                deny_calls.append(call)
+                continue
+
+            if decision.verdict is Verdict.CONFIRM and decision.confirmation is not None:
+                confirm_specs.append((call.call_id, decision.confirmation))
+                continue
+
+            allow_calls.append(call)
+
+        return allow_calls, deny_calls, confirm_specs
+
+    async def _persist_aborted_results(
+        self, machine: AgentStateMachine, calls: tuple
+    ) -> list[tuple[str, str]]:
+        """Persist FAILED/aborted results for every call still lacking a result.
+
+        Trust durable ``machine.state.calls`` (result_json or terminal status),
+        not in-process ``_finished_call_ids`` — cancel can land after save and
+        before local bookkeeping, and must not clobber a completed result.
+        """
+        aborted: list[tuple[str, str]] = []
+        terminal = {
+            CallStatus.COMPLETED,
+            CallStatus.FAILED,
+            CallStatus.UNCERTAIN,
+        }
+        for call in calls:
+            current = next(
+                (c for c in machine.state.calls if c.call_id == call.call_id),
+                call,
+            )
+            if current.result_json is not None:
+                aborted.append((call.call_id, current.result_json))
+                continue
+            if current.status in terminal:
+                # Terminal without a result payload (e.g. UNCERTAIN): do not invent cancel.
+                continue
+            result_json = json.dumps(
+                {
+                    "ok": False,
+                    "content": "",
+                    "error": f"tool call cancelled: {call.name}",
+                },
+                ensure_ascii=False,
+            )
+            await machine.dispatch(
+                ToolCallFinished(
+                    call_id=call.call_id,
+                    status=CallStatus.FAILED,
+                    result_json=result_json,
+                    at=utc_now_iso(),
+                )
+            )
+            self._finished_call_ids.add(call.call_id)
+            aborted.append((call.call_id, result_json))
+        return aborted
+
+    async def _effect_await_confirmation(self, state: AgentState) -> EffectResult:
+        """Prompt via InteractivePort; resolve; return ConfirmationResolved.
+
+        ``state`` has already been persisted as awaitingconfirmation before this
+        effect runs, so public ``state`` precedes ``interactive_request``.
+        """
+        # Confirmation already encodes the resume decision; do not re-classify
+        # writes as uncertain when tooluse runs after resolve.
+        self._is_resume = False
+        conf = state.confirmation
+        now = utc_now_iso()
+        if conf is None:
+            return EffectResult(ConfirmationResolved(approved=False, at=now))
+
+        spec = self._pending_confirm_spec
+        if spec is None:
+            spec = ConfirmationSpec(
+                kind=conf.kind,
+                prompt=conf.prompt,
+                options=tuple(conf.options),
+                category=conf.category,
+                call_ids=tuple(conf.call_ids),
+                multi_select=conf.multi_select,
+            )
+        self._pending_confirm_spec = None
+
+        answer: str | None = None
+        port = self.interactive
+        if port is not None and hasattr(port, "prompt"):
+            answer = await port.prompt(spec)
+        elif callable(port):
+            kind = "question" if spec.kind == "question" else "confirm"
+            answer = await port(
+                kind,
+                spec.prompt,
+                list(spec.options),
+                multi_select=spec.multi_select,
+            )
+        elif spec.kind != "question":
+            # Legacy PermissionGate(confirm=...) without InteractivePort.
+            callback = getattr(self.gate, "confirm", None)
+            if callable(callback):
+                for call in state.calls:
+                    if call.call_id not in (spec.call_ids or conf.call_ids):
+                        continue
+                    approved_bool = await callback(call.name, dict(call.args))
+                    answer = "y" if approved_bool else "n"
+                    break
+
+        if spec.kind == "question":
+            self._interaction_answer = answer
+            approved = True
+        else:
+            resolve = getattr(self.gate, "resolve", None)
+            if callable(resolve):
+                decision = resolve(spec, answer)
+                approved = decision.verdict is Verdict.ALLOW
+            else:
+                approved = answer in {"y", "y_remember", "y_session"}
+
+        if approved:
+            self._confirmation_approved_ids.update(spec.call_ids or conf.call_ids)
+
+        return EffectResult(
+            ConfirmationResolved(approved=approved, answer=answer, at=now)
+        )
+
+    async def _finish_run(self, state: AgentState) -> AgentTurnOutcome:
+        """Emit answer/error/done and build AgentTurnOutcome from loop + counters."""
+        tool_calls = state.tool_calls
+        if state.phase is AgentPhase.COMPLETE and state.outcome is not None:
+            if state.outcome.kind == "stopped":
+                return await self._stop_turn(tool_calls=tool_calls)
+            if state.outcome.kind == "succeeded":
+                answer = self._pending_answer
+                await self._emit("answer", {"text": answer})
+                await self._emit(
+                    "done",
+                    self._done_payload(
+                        succeeded=True, reason=None, tool_calls=tool_calls
+                    ),
+                )
+                self.memory.append_assistant(Msg(role="assistant", content=answer))
+                return AgentTurnOutcome(
+                    answer=answer,
+                    usage=self.usage,
+                    tool_calls=tool_calls,
+                    retry_count=self.stats.retry_count,
+                    tool_duration_ms=self.stats.snapshot().tool_duration_ms,
+                    citations=self._citation_ids(),
+                    trace=list(self.trace),
+                    rounds=self.rounds,
+                )
+            # Other complete kinds (e.g. abandoned): treat as unsuccessful finish.
+            reason = state.outcome.reason or state.outcome.kind
+            return await self._fail(
+                kind=state.outcome.kind,
+                message=reason or state.outcome.kind,
+                reason=reason,
+                tool_calls=tool_calls,
+                error=None,
+                answer=self._pending_answer,
+            )
+
+        if state.phase is AgentPhase.ERROR and state.error is not None:
+            reason = self._pending_reason or state.error.kind
+            return await self._fail(
+                kind=self._pending_fail_kind or state.error.kind,
+                message=self._pending_fail_message or state.error.message,
+                reason=reason,
+                tool_calls=tool_calls,
+                error=self._pending_error,
+                answer=self._pending_answer,
+            )
+
+        # Defensive fallback — should not be reached after a normal runner exit.
         return await self._fail(
-            kind="max_turns_exhausted",
-            message="maximum agent turns exhausted",
-            reason="max_turns_exhausted",
-            tool_calls=tool_calls_total,
-            error=None,
-            # 预算耗尽并不等于空跑：报告它已经确立的内容。
-            answer=self._partial_answer(reason="max_turns_exhausted"),
+            kind="internal_error",
+            message="agent runner finished without a terminal outcome",
+            reason="internal_error",
+            tool_calls=tool_calls,
+            error="internal_error",
+            answer=self._pending_answer,
         )
 
     def _truncate(self, content: str, limit: int, *, recovery_path: str | None = None) -> str:
@@ -1450,8 +2125,16 @@ class AgentLoop(PlanProgressMixin):
             meta = self._call_meta.get(call_id)
             if meta is None:
                 ok, error, preview = self._decode_observation(rendered)
+                action_name = next(
+                    (action.name for action in actions if action.call_id == call_id),
+                    "",
+                )
                 meta = ObservedCall(
-                    call_id=call_id, name="", ok=ok, error=error, preview=preview
+                    call_id=call_id,
+                    name=action_name,
+                    ok=ok,
+                    error=error,
+                    preview=preview,
                 )
             observations.append(meta)
         self.trace.append(
@@ -1628,7 +2311,24 @@ class AgentLoop(PlanProgressMixin):
             )
 
         # 治理链（docs 03.3.3）：先做权限判定，再执行 pre-hooks。
-        decision = await self.gate.check(tool, tool_use.args)
+        # 已经过 FSM 确认的调用跳过闸门，避免 plain "y" 再次变成 CONFIRM。
+        if tool_use.call_id in self._skip_permission_ids:
+            self._skip_permission_ids.discard(tool_use.call_id)
+            decision = GateDecision(Verdict.ALLOW, "用户已确认")
+        else:
+            decide = getattr(self.gate, "decide", None)
+            if callable(decide):
+                decision = decide(tool, tool_use.args)
+                if decision.verdict is Verdict.CONFIRM:
+                    # 不应在 execute 路径上再 await 用户；当作拒绝以免卡死。
+                    decision = GateDecision(
+                        Verdict.DENY,
+                        decision.reason
+                        or f"写类工具需确认，但当前无交互通道：{tool.name}",
+                        confirmation=None,
+                    )
+            else:
+                decision = await self.gate.check(tool, tool_use.args)
         if decision.verdict is Verdict.DENY:
             await self._audit(tool, tool_use.args, action="denied", verdict="deny")
             span.set_attribute("status", "denied")
@@ -1655,8 +2355,17 @@ class AgentLoop(PlanProgressMixin):
             tool_use.name, tool.timeout or default_timeout
         )
         started_at = self.stats.now()
-        if getattr(tool, "needs_interactive", False) and self.interactive is not None:
-            tool.interactive = self.interactive
+        if getattr(tool, "needs_interactive", False):
+            captured = self._interaction_answer
+            self._interaction_answer = None
+
+            async def _oneshot(
+                kind, prompt, options, *, multi_select: bool = False
+            ):
+                del kind, prompt, options, multi_select
+                return captured
+
+            tool.interactive = _oneshot
         # 对派发 sub-agent 的工具采用同样的模式（docs 03.10）：工具自身无法
         # 构建协调器，因此由循环把会话的协调器交给它。
         if getattr(tool, "needs_coordinator", False) and self.coordinator is not None:

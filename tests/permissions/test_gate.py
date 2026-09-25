@@ -459,3 +459,60 @@ def test_session_approval_does_not_cover_egress(tmp_path):
 
     assert decision.verdict is Verdict.ALLOW
     assert asked == ["web_search"]  # 仍被询问：会话授权没有替外发免问
+
+
+# -- decide / resolve (Task 6) -------------------------------------------------
+
+
+def test_resolve_y_remember_updates_confirmed_categories(tmp_path):
+    from finharness.permissions.gate import EGRESS_CATEGORY, ConfirmationSpec
+
+    gate = PermissionGate(settings=make_settings(tmp_path))
+    spec = ConfirmationSpec(
+        kind="permission",
+        prompt="egress?",
+        options=("y", "y_remember", "n"),
+        category=EGRESS_CATEGORY,
+    )
+
+    decision = gate.resolve(spec, "y_remember")
+
+    assert decision.verdict is Verdict.ALLOW
+    assert EGRESS_CATEGORY in gate.confirmed_categories
+
+
+def test_resolve_y_session_updates_session_approved(tmp_path):
+    from finharness.permissions.gate import ConfirmationSpec
+
+    gate = PermissionGate(settings=make_settings(tmp_path))
+    spec = ConfirmationSpec(
+        kind="permission",
+        prompt="write?",
+        options=("y", "y_session", "n"),
+        category="write",
+    )
+
+    decision = gate.resolve(spec, "y_session")
+
+    assert decision.verdict is Verdict.ALLOW
+    assert "write" in gate.session_approved
+
+
+def test_decide_write_returns_confirm_with_y_session_option(tmp_path):
+    from finharness.permissions.gate import ConfirmationSpec
+
+    gate = PermissionGate(settings=make_settings(tmp_path))
+    decision = gate.decide(FakeTool(permission=PermissionLevel.WRITE), {"path": "x"})
+
+    assert decision.verdict is Verdict.CONFIRM
+    assert decision.confirmation is not None
+    assert isinstance(decision.confirmation, ConfirmationSpec)
+    assert decision.confirmation.options == ("y", "y_session", "n")
+    assert decision.confirmation.category == "write"
+
+
+def test_decide_honours_session_approved(tmp_path):
+    gate = PermissionGate(settings=make_settings(tmp_path), session_approved={"write"})
+    decision = gate.decide(FakeTool(permission=PermissionLevel.WRITE), {})
+
+    assert decision.verdict is Verdict.ALLOW
