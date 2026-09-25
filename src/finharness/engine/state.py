@@ -58,6 +58,7 @@ class ConfirmationState:
     kind: str = "permission"
     category: str = ""
     status: str = "pending"
+    multi_select: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +151,7 @@ class ConfirmationRequested:
     at: str
     kind: str = "permission"
     category: str = ""
+    multi_select: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,6 +467,7 @@ def transition(state: AgentState, event: AgentEvent) -> AgentState:
             kind=event.kind,
             category=event.category,
             status="pending",
+            multi_select=event.multi_select,
         )
         wanted = set(event.call_ids)
         calls = tuple(
@@ -582,6 +585,7 @@ def state_to_dict(state: AgentState) -> dict[str, Any]:
             "kind": state.confirmation.kind,
             "category": state.confirmation.category,
             "status": state.confirmation.status,
+            "multi_select": state.confirmation.multi_select,
         },
         "outcome": None if state.outcome is None else asdict(state.outcome),
         "error": None if state.error is None else asdict(state.error),
@@ -621,6 +625,7 @@ def state_from_dict(payload: Mapping[str, Any]) -> AgentState:
             kind=confirmation_raw.get("kind", "permission"),
             category=confirmation_raw.get("category", ""),
             status=confirmation_raw.get("status", "pending"),
+            multi_select=bool(confirmation_raw.get("multi_select", False)),
         )
     outcome_raw = payload.get("outcome")
     outcome = None if outcome_raw is None else RunOutcome(**outcome_raw)
@@ -680,6 +685,7 @@ def public_state_view(state: AgentState) -> dict[str, Any]:
             "kind": state.confirmation.kind,
             "category": state.confirmation.category,
             "status": state.confirmation.status,
+            "multi_select": state.confirmation.multi_select,
         },
         "outcome": None if state.outcome is None else asdict(state.outcome),
         "error": None if state.error is None else asdict(state.error),

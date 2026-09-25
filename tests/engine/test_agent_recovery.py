@@ -6,6 +6,7 @@ import asyncio
 import json
 from dataclasses import replace
 
+import pytest
 from test_loop import ScriptedProvider, StubRegistry, text_round, tool_round
 
 from finharness.config.settings import ContextSettings, Settings, ToolSettings
@@ -222,14 +223,19 @@ def test_recovery_marks_uncommitted_write_as_uncertain(tmp_path):
 
 
 def seed_and_capture_pending_confirmation(tmp_path) -> str:
-    """Persist awaitingconfirmation after uncertain write; return prior request id.
+    """Drive uncertain write to first live interactive_request; leave awaiting.
 
-    ConfirmBus request_id is ephemeral and must not live in AgentState — the
-    previous id is only a stand-in for "what the client last saw".
+    Returns the minted request_id from that first prompt (ephemeral — not in
+    AgentState). Cancels the run after the prompt so resume must reissue.
     """
-    from finharness.engine.state import ConfirmationState
+    import uuid
 
-    store = seed_tool_state(
+    from finharness.config.settings import PermissionSettings
+    from finharness.permissions.gate import PermissionGate
+    from finharness.types import EngineEvent
+    from tests.conftest import settings_with_cache
+
+    seed_tool_state(
         tmp_path,
         calls=(
             call(
@@ -240,8 +246,12 @@ def seed_and_capture_pending_confirmation(tmp_path) -> str:
             ),
         ),
     )
+    # Promote to awaitingconfirmation the same way recovery would, then prompt once.
+    store = _memory(tmp_path)
     snapshot = SqliteAgentStateStore(store).latest_resumable("conv", "")
     assert snapshot is not None
+    from finharness.engine.state import ConfirmationState
+
     SqliteAgentStateStore(store).save(
         replace(
             snapshot,
@@ -258,7 +268,59 @@ def seed_and_capture_pending_confirmation(tmp_path) -> str:
             updated_at="t2",
         )
     )
-    return "req_previous_ephemeral"
+
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[EngineEvent] = []
+
+        async def emit(self, event: EngineEvent) -> None:
+            self.events.append(event)
+
+    first_ids: list[str] = []
+
+    class CaptureThenHangPort:
+        async def prompt(self, spec) -> str | None:
+            del spec
+            request_id = f"req_{uuid.uuid4().hex[:10]}"
+            first_ids.append(request_id)
+            # Leave the FSM in awaitingconfirmation: never resolve.
+            raise asyncio.CancelledError()
+
+    sink = Sink()
+    port = CaptureThenHangPort()
+    tool = RecordingTool("write", content="wrote")
+    tool.permission = PermissionLevel.WRITE
+    base = _settings()
+    settings = settings_with_cache(
+        tmp_path,
+        permission=PermissionSettings(default_mode="default"),
+        context=base.context,
+        tools=base.tools,
+    )
+    loop = AgentLoop(
+        provider=ScriptedProvider([text_round("recovered")]),
+        registry=StubRegistry({"write": tool}, read_only=set()),
+        settings=settings,
+        system="test",
+        store=store,
+        conversation_id="conv",
+        user_id="",
+        gate=PermissionGate(settings=settings),
+        interactive=port,
+        output=sink,
+    )
+
+    async def drive() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await loop.run("", resume=True)
+
+    asyncio.run(drive())
+    assert first_ids, "first interactive_request must mint a live request_id"
+    # Ensure durable snapshot remains awaitingconfirmation for resume.
+    latest = SqliteAgentStateStore(store).latest_resumable("conv", "")
+    assert latest is not None
+    assert latest.phase is AgentPhase.AWAITING_CONFIRMATION
+    return first_ids[0]
 
 
 async def resume_and_confirm(tmp_path, answer: str):

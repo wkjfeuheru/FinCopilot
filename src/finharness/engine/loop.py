@@ -1539,66 +1539,30 @@ class AgentLoop(PlanProgressMixin):
                 results_by_id[call.call_id] = call.result_json
         if confirm_specs:
             if allow_calls:
-                try:
-                    finished = await asyncio.gather(
-                        *(run_one(call) for call in allow_calls)
-                    )
-                    for call_id, result_json in finished:
-                        results_by_id[call_id] = result_json
-                except LoopDetected as detected:
-                    aborted = await self._persist_aborted_results(machine, state.calls)
-                    for call_id, result_json in aborted:
-                        results_by_id.setdefault(call_id, result_json)
-                    ordered = [
-                        (call.call_id, results_by_id[call.call_id])
-                        for call in state.calls
-                        if call.call_id in results_by_id
-                    ]
-                    tool_msg = Msg(
-                        role="tool_result", content=None, tool_results=ordered
-                    )
-                    self._record_round(
-                        thought="".join(deltas),
-                        actions=tool_uses,
-                        results=ordered,
-                        input_tokens=round_input,
-                        output_tokens=round_output,
-                        llm_first_ms=llm_first_ms,
-                        llm_ms=llm_ms,
-                    )
-                    await self._audit_detection(detected)
-                    self._pending_reason = "loop_detected"
-                    self._pending_fail_kind = "loop_detected"
-                    self._pending_fail_message = str(detected)
-                    self._pending_error = str(detected)
-                    self._pending_answer = self._partial_answer(reason="loop_detected")
-                    return EffectResult(
-                        RunFailed(
-                            kind="loop_detected",
-                            message=str(detected),
-                            at=utc_now_iso(),
-                        ),
-                        messages=(tool_msg,),
-                    )
-                except BaseException:
-                    aborted = await self._persist_aborted_results(machine, state.calls)
-                    for call_id, result_json in aborted:
-                        results_by_id.setdefault(call_id, result_json)
-                    ordered = [
-                        (call.call_id, results_by_id[call.call_id])
-                        for call in state.calls
-                        if call.call_id in results_by_id
-                    ]
-                    tool_msg = Msg(
-                        role="tool_result", content=None, tool_results=ordered
-                    )
-                    await machine.dispatch(
-                        ToolBatchFinished(at=utc_now_iso()), messages=(tool_msg,)
-                    )
-                    self._after_dispatch((tool_msg,))
-                    raise
-            call_ids = tuple(call_id for call_id, _ in confirm_specs)
+                abort = await self._run_allow_calls(
+                    allow_calls,
+                    run_one=run_one,
+                    results_by_id=results_by_id,
+                    machine=machine,
+                    state=state,
+                    tool_uses=tool_uses,
+                    deltas=deltas,
+                    round_input=round_input,
+                    round_output=round_output,
+                    llm_first_ms=llm_first_ms,
+                    llm_ms=llm_ms,
+                )
+                if abort is not None:
+                    return abort
+            # One homogeneous group (same kind+category) per ConfirmationRequested;
+            # leave other pending confirms for the next tooluse pass.
             first_spec = confirm_specs[0][1]
+            group = [
+                (call_id, spec)
+                for call_id, spec in confirm_specs
+                if spec.kind == first_spec.kind and spec.category == first_spec.category
+            ]
+            call_ids = tuple(call_id for call_id, _ in group)
             merged = ConfirmationSpec(
                 kind=first_spec.kind,
                 prompt=first_spec.prompt,
@@ -1616,14 +1580,87 @@ class AgentLoop(PlanProgressMixin):
                     at=utc_now_iso(),
                     kind=merged.kind,
                     category=merged.category,
+                    multi_select=merged.multi_select,
                 )
             )
 
+        abort = await self._run_allow_calls(
+            allow_calls,
+            run_one=run_one,
+            results_by_id=results_by_id,
+            machine=machine,
+            state=state,
+            tool_uses=tool_uses,
+            deltas=deltas,
+            round_input=round_input,
+            round_output=round_output,
+            llm_first_ms=llm_first_ms,
+            llm_ms=llm_ms,
+        )
+        if abort is not None:
+            return abort
+
+        for call in state.calls:
+            if (
+                call.status is CallStatus.FAILED
+                and call.call_id not in results_by_id
+            ):
+                results_by_id[call.call_id] = json.dumps(
+                    {
+                        "ok": False,
+                        "content": "",
+                        "error": "用户已拒绝该工具调用",
+                    },
+                    ensure_ascii=False,
+                )
+
+        ordered = [
+            (call.call_id, results_by_id[call.call_id]) for call in state.calls
+        ]
+        tool_msg = Msg(role="tool_result", content=None, tool_results=ordered)
+        self._record_round(
+            thought="".join(deltas),
+            actions=tool_uses,
+            results=ordered,
+            input_tokens=round_input,
+            output_tokens=round_output,
+            llm_first_ms=llm_first_ms,
+            llm_ms=llm_ms,
+        )
+        if self._stopped():
+            self._pending_reason = "user_stopped"
+            return EffectResult(
+                StopRequested(at=utc_now_iso()), messages=(tool_msg,)
+            )
+        progress = self._plan_progress(tool_uses)
+        if progress is not None:
+            self._plan_hint = self._plan_hint_text(progress)
+            progress["turn"] = self.turn
+            await self._emit("plan_progress", progress)
+        return EffectResult(ToolBatchFinished(at=now), messages=(tool_msg,))
+
+    async def _run_allow_calls(
+        self,
+        allow_calls: list,
+        *,
+        run_one,
+        results_by_id: dict[str, str],
+        machine: AgentStateMachine,
+        state: AgentState,
+        tool_uses: list,
+        deltas: list[str],
+        round_input: int,
+        round_output: int,
+        llm_first_ms: int,
+        llm_ms: int,
+    ) -> EffectResult | None:
+        """Execute allowed calls; return an EffectResult on abort paths, else None."""
+        if not allow_calls:
+            return None
         try:
-            if allow_calls:
-                finished = await asyncio.gather(*(run_one(call) for call in allow_calls))
-                for call_id, result_json in finished:
-                    results_by_id[call_id] = result_json
+            finished = await asyncio.gather(*(run_one(call) for call in allow_calls))
+            for call_id, result_json in finished:
+                results_by_id[call_id] = result_json
         except LoopDetected as detected:
             aborted = await self._persist_aborted_results(machine, state.calls)
             for call_id, result_json in aborted:
@@ -1672,45 +1709,7 @@ class AgentLoop(PlanProgressMixin):
             )
             self._after_dispatch((tool_msg,))
             raise
-
-        for call in state.calls:
-            if (
-                call.status is CallStatus.FAILED
-                and call.call_id not in results_by_id
-            ):
-                results_by_id[call.call_id] = json.dumps(
-                    {
-                        "ok": False,
-                        "content": "",
-                        "error": "用户已拒绝该工具调用",
-                    },
-                    ensure_ascii=False,
-                )
-
-        ordered = [
-            (call.call_id, results_by_id[call.call_id]) for call in state.calls
-        ]
-        tool_msg = Msg(role="tool_result", content=None, tool_results=ordered)
-        self._record_round(
-            thought="".join(deltas),
-            actions=tool_uses,
-            results=ordered,
-            input_tokens=round_input,
-            output_tokens=round_output,
-            llm_first_ms=llm_first_ms,
-            llm_ms=llm_ms,
-        )
-        if self._stopped():
-            self._pending_reason = "user_stopped"
-            return EffectResult(
-                StopRequested(at=utc_now_iso()), messages=(tool_msg,)
-            )
-        progress = self._plan_progress(tool_uses)
-        if progress is not None:
-            self._plan_hint = self._plan_hint_text(progress)
-            progress["turn"] = self.turn
-            await self._emit("plan_progress", progress)
-        return EffectResult(ToolBatchFinished(at=now), messages=(tool_msg,))
+        return None
 
     async def _partition_tool_calls(
         self, to_run: list
@@ -1858,6 +1857,7 @@ class AgentLoop(PlanProgressMixin):
                 options=tuple(conf.options),
                 category=conf.category,
                 call_ids=tuple(conf.call_ids),
+                multi_select=conf.multi_select,
             )
         self._pending_confirm_spec = None
 

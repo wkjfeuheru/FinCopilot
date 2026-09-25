@@ -216,7 +216,7 @@ class _ConfirmBusPort:
 
 
 async def run_confirming_tool(tmp_path, answer: str = "y"):
-    """Drive a write tool that needs confirmation; return engine events."""
+    """Drive a write tool that needs confirmation; return (events, loop)."""
     from test_loop import ScriptedProvider, Sink, StubRegistry, text_round, tool_round
 
     from finharness.config.settings import ContextSettings, PermissionSettings, ToolSettings
@@ -267,11 +267,11 @@ async def run_confirming_tool(tmp_path, answer: str = "y"):
         interactive=port,
     )
     await loop.run("please write")
-    return sink.events
+    return sink.events, loop
 
 
 def test_confirmation_state_precedes_interactive_request(tmp_path):
-    events = asyncio.run(run_confirming_tool(tmp_path, answer="y"))
+    events, _loop = asyncio.run(run_confirming_tool(tmp_path, answer="y"))
     kinds = [event.kind for event in events]
     awaiting = next(
         i
@@ -280,6 +280,133 @@ def test_confirmation_state_precedes_interactive_request(tmp_path):
     )
     request = kinds.index("interactive_request")
     assert awaiting < request
+
+
+class _ScriptedPort:
+    """Answers by kind: question text vs permission y/n."""
+
+    def __init__(self, *, question_answer: str = "近一年", confirm_answer: str = "y") -> None:
+        self.question_answer = question_answer
+        self.confirm_answer = confirm_answer
+        self.specs: list = []
+
+    async def prompt(self, spec) -> str | None:
+        self.specs.append(spec)
+        if getattr(spec, "kind", "") == "question":
+            return self.question_answer
+        return self.confirm_answer
+
+
+async def run_mixed_question_and_write(tmp_path, *, confirm_answer: str = "y"):
+    """One model round requests ask_user then write; return port + write tool + outcome."""
+    from test_loop import ScriptedProvider, Sink, StubRegistry, text_round, tool_round
+
+    from finharness.config.settings import ContextSettings, PermissionSettings, ToolSettings
+    from finharness.context.memory.store import MemoryStore
+    from finharness.engine.loop import AgentLoop
+    from finharness.permissions.gate import PermissionGate
+    from finharness.tools.base import PermissionLevel
+    from finharness.types import ToolResult, ToolUse
+    from tests.conftest import settings_with_cache
+
+    class AskTool:
+        name = "ask_user"
+        permission = PermissionLevel.READ
+        timeout = None
+        needs_interactive = True
+        interactive = None
+
+        async def run(self, **kwargs) -> ToolResult:
+            answer = await self.interactive(
+                "question",
+                kwargs.get("question", ""),
+                list(kwargs.get("options") or []),
+                multi_select=bool(kwargs.get("multi_select", False)),
+            )
+            return ToolResult(content=f"用户回答：{answer}", ok=True)
+
+    class WriteTool:
+        name = "write"
+        permission = PermissionLevel.WRITE
+        timeout = None
+
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def run(self, **kwargs) -> ToolResult:
+            self.calls.append(dict(kwargs))
+            return ToolResult(content="wrote", ok=True)
+
+    settings = settings_with_cache(
+        tmp_path,
+        permission=PermissionSettings(default_mode="default"),
+        context=ContextSettings(max_turns=30, max_result_tokens=1000),
+        tools=ToolSettings(timeout_default_s=30),
+    )
+    ask = AskTool()
+    write = WriteTool()
+    port = _ScriptedPort(confirm_answer=confirm_answer)
+    sink = Sink()
+    loop = AgentLoop(
+        provider=ScriptedProvider(
+            [
+                tool_round(
+                    ToolUse(
+                        "q1",
+                        "ask_user",
+                        {
+                            "question": "时段？",
+                            "options": ["近一年"],
+                            "multi_select": True,
+                        },
+                    ),
+                    ToolUse("w1", "write", {"path": "out.txt"}),
+                ),
+                text_round("done"),
+            ]
+        ),
+        registry=StubRegistry({"ask_user": ask, "write": write}, read_only={"ask_user"}),
+        settings=settings,
+        system="test",
+        output=sink,
+        store=MemoryStore(tmp_path / "memory.db"),
+        conversation_id="conv",
+        user_id="",
+        gate=PermissionGate(settings=settings),
+        interactive=port,
+    )
+    outcome = await loop.run("mix")
+    return port, write, outcome, loop
+
+
+def test_question_and_write_confirm_separately(tmp_path):
+    """Homogeneous groups only: answering a question must not approve a write."""
+    port, write, outcome, _loop = asyncio.run(
+        run_mixed_question_and_write(tmp_path, confirm_answer="y")
+    )
+    assert outcome.succeeded is True
+    assert [getattr(spec, "kind", None) for spec in port.specs] == [
+        "question",
+        "permission",
+    ]
+    assert port.specs[0].category == "question"
+    assert port.specs[0].multi_select is True
+    assert port.specs[0].call_ids == ("q1",)
+    assert port.specs[1].category == "write"
+    assert port.specs[1].call_ids == ("w1",)
+    assert write.calls, "write must run only after its own permission confirm"
+
+
+def test_confirmation_denied_synthesizes_failed_tool_result(tmp_path):
+    """InteractivePort 'n' → ConfirmationResolved(False) → FAILED tool_result content."""
+    import json
+
+    _events, loop = asyncio.run(run_confirming_tool(tmp_path, answer="n"))
+    tool_msgs = [msg for msg in loop.messages if msg.role == "tool_result"]
+    assert tool_msgs, "denied confirmation must still produce a tool_result Msg"
+    payloads = {call_id: json.loads(raw) for call_id, raw in tool_msgs[0].tool_results}
+    assert payloads["c1"]["ok"] is False
+    assert "用户已拒绝" in payloads["c1"]["error"]
 
 
 # -- 网络外发确认（docs 03.7.1）------------------------------------------------

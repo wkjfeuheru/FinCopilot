@@ -367,6 +367,7 @@ def test_confirmation_request_and_resolution():
             kind="permission",
             category="write",
             at="t3",
+            multi_select=False,
         ),
     )
     assert awaiting.phase is AgentPhase.AWAITING_CONFIRMATION
@@ -377,6 +378,7 @@ def test_confirmation_request_and_resolution():
         kind="permission",
         category="write",
         status="pending",
+        multi_select=False,
     )
     assert awaiting.calls[0].status is CallStatus.AWAITING_CONFIRMATION
 
@@ -386,6 +388,41 @@ def test_confirmation_request_and_resolution():
     assert resumed.phase is AgentPhase.TOOL_USE
     assert resumed.confirmation is None
     assert resumed.calls[0].status is CallStatus.PENDING
+
+
+def test_confirmation_multi_select_round_trips_through_state():
+    state = replace(
+        new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0"),
+        phase=AgentPhase.TOOL_USE,
+        revision=2,
+        calls=(
+            PersistedToolCall(
+                call_id="q1",
+                name="ask_user",
+                args={"question": "时段？", "multi_select": True},
+                permission="read",
+                status=CallStatus.PENDING,
+            ),
+        ),
+    )
+    awaiting = transition(
+        state,
+        ConfirmationRequested(
+            prompt="时段？",
+            options=("近一年", "近三年"),
+            call_ids=("q1",),
+            kind="question",
+            category="question",
+            at="t3",
+            multi_select=True,
+        ),
+    )
+    assert awaiting.confirmation is not None
+    assert awaiting.confirmation.multi_select is True
+    restored = state_from_dict(state_to_dict(awaiting))
+    assert restored.confirmation is not None
+    assert restored.confirmation.multi_select is True
+    assert public_state_view(awaiting)["confirmation"]["multi_select"] is True
 
 
 def test_confirmation_denied_returns_to_tooluse_with_failed_call():
@@ -643,4 +680,5 @@ def test_public_view_shape_omits_sensitive_fields():
         "kind": "permission",
         "category": "",
         "status": "pending",
+        "multi_select": False,
     }
