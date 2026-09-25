@@ -466,14 +466,23 @@ def transition(state: AgentState, event: AgentEvent) -> AgentState:
             category=event.category,
             status="pending",
         )
+        wanted = set(event.call_ids)
+        calls = tuple(
+            call
+            if call.call_id not in wanted
+            else (
+                call
+                if call.status is CallStatus.UNCERTAIN
+                else replace(call, status=CallStatus.AWAITING_CONFIRMATION)
+            )
+            for call in state.calls
+        )
         return _advance(
             state,
             event,
             phase=AgentPhase.AWAITING_CONFIRMATION,
             confirmation=confirmation,
-            calls=_mark_calls(
-                state.calls, event.call_ids, CallStatus.AWAITING_CONFIRMATION
-            ),
+            calls=calls,
         )
 
     if isinstance(event, ConfirmationResolved):

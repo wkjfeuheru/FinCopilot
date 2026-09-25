@@ -9,6 +9,8 @@ from finharness.engine.machine import AgentStateMachine
 from finharness.engine.state import AgentEvent, AgentPhase, AgentState
 from finharness.types import AgentTurnOutcome, Msg
 
+AfterDispatch = Callable[[tuple[Msg, ...]], None]
+
 
 @dataclass(frozen=True, slots=True)
 class EffectResult:
@@ -29,9 +31,16 @@ class RunnerEffects:
 class AgentRunner:
     """Drive phase effects until the machine reaches complete or error."""
 
-    def __init__(self, machine: AgentStateMachine, effects: RunnerEffects) -> None:
+    def __init__(
+        self,
+        machine: AgentStateMachine,
+        effects: RunnerEffects,
+        *,
+        after_dispatch: AfterDispatch | None = None,
+    ) -> None:
         self.machine = machine
         self.effects = effects
+        self.after_dispatch = after_dispatch
         self._handlers = {
             AgentPhase.HYDRATE: self._handle_hydrate,
             AgentPhase.COMPACT: self._handle_compact,
@@ -43,9 +52,14 @@ class AgentRunner:
     async def run(self) -> AgentTurnOutcome:
         terminal = {AgentPhase.COMPLETE, AgentPhase.ERROR}
         while self.machine.state.phase not in terminal:
+            if self.machine.state.phase is AgentPhase.AWAITING_CONFIRMATION:
+                # Task 5: pause for recovery helpers; Task 6 wires InteractivePort.
+                return await self.effects.finish(self.machine.state)
             handler = self._handlers[self.machine.state.phase]
             event, messages = await handler(self.machine.state)
             await self.machine.dispatch(event, messages=messages)
+            if self.after_dispatch is not None and messages:
+                self.after_dispatch(messages)
         return await self.effects.finish(self.machine.state)
 
     async def _handle_hydrate(

@@ -31,13 +31,17 @@ from finharness.engine.runner import AgentRunner, EffectResult, RunnerEffects
 from finharness.engine.state import (
     AgentPhase,
     AgentState,
+    CallStatus,
     CompactionFinished,
+    ConfirmationRequested,
     HydrationFinished,
     ModelFinished,
     ResumeRequested,
     RunFailed,
     StopRequested,
     ToolBatchFinished,
+    ToolCallFinished,
+    ToolCallStarted,
     UsageDelta,
     new_agent_state,
 )
@@ -246,18 +250,21 @@ class AgentLoop(PlanProgressMixin):
         # 协作式停止信号（docs 03.3）。默认 None，使 eval、脚本与子代理等
         # 不经过服务层的调用方行为完全不变：没有信号就永远不检查。
         self.stop_signal: StopSignal | None = None
-        # FSM 运行期暂存：答案不在 AgentState 上；工具批次仍走内存路径（Task 5）。
+        # FSM 运行期暂存：答案不在 AgentState 上。
         self._pending_answer: str = ""
         self._pending_error: str | None = None
         self._pending_reason: str | None = None
         self._pending_fail_kind: str = ""
         self._pending_fail_message: str = ""
-        self._tool_uses_batch: list[ToolUse] = []
         self._think_deltas: list[str] = []
         self._think_round_input: int = 0
         self._think_round_output: int = 0
         self._think_llm_first_ms: int = 0
         self._think_llm_ms: int = 0
+        self._machine: AgentStateMachine | None = None
+        self._is_resume: bool = False
+        self._resume_phase: AgentPhase | None = None
+        self._finished_call_ids: set[str] = set()
 
     def _stopped(self) -> bool:
         """是否已收到停止请求；无信号时恒为 False。"""
@@ -1004,12 +1011,12 @@ class AgentLoop(PlanProgressMixin):
         self._pending_reason = None
         self._pending_fail_kind = ""
         self._pending_fail_message = ""
-        self._tool_uses_batch = []
         self._think_deltas = []
         self._think_round_input = 0
         self._think_round_output = 0
         self._think_llm_first_ms = 0
         self._think_llm_ms = 0
+        self._finished_call_ids = set()
 
     def _failed_resume_outcome(self) -> AgentTurnOutcome:
         reason = "no_resumable_state"
@@ -1028,21 +1035,43 @@ class AgentLoop(PlanProgressMixin):
             rounds=self.rounds,
         )
 
+    def _after_dispatch(self, messages: tuple[Msg, ...]) -> None:
+        """Apply committed Msgs to in-process WorkingMemory (already in SQLite)."""
+        known = {id(message) for message in self.memory.raw}
+        for message in messages:
+            if id(message) not in known:
+                self.memory.append(message, track=False)
+
+    def _tool_permission(self, name: str) -> str:
+        resolve = getattr(self.registry, "resolve", None)
+        tool = resolve(name) if callable(resolve) else None
+        if tool is None:
+            return "unknown"
+        is_read_only = getattr(self.registry, "is_read_only", None)
+        if callable(is_read_only) and is_read_only(name):
+            return "read"
+        return "write"
+
     async def _run_once(self, user_msg: str, *, resume: bool = False) -> AgentTurnOutcome:
         """``run`` 的实际执行体；根 Span 由调用方持有。"""
         # 记住该问题：scope/偏离信号从它读取任务自身的 symbol 与 capability，
         # 这才是事实依据，而非计划可能不完整的重述。
         self._last_user_msg = user_msg or ""
         state_store = self._make_state_store()
+        self._is_resume = False
+        self._resume_phase = None
 
         if resume:
             snapshot = state_store.latest_resumable(self.conversation_id, self.user_id)
             if snapshot is None:
                 return self._failed_resume_outcome()
             self._reset_run_locals()
+            self._is_resume = True
+            self._resume_phase = snapshot.phase
             machine = AgentStateMachine(
                 snapshot, store=state_store, output=self.output
             )
+            self._machine = machine
             await machine.dispatch(ResumeRequested(at=utc_now_iso()))
         else:
             self._reset_run_locals()
@@ -1061,6 +1090,7 @@ class AgentLoop(PlanProgressMixin):
             machine = AgentStateMachine(
                 initial, store=state_store, output=self.output
             )
+            self._machine = machine
             await machine.start()
 
         effects = RunnerEffects(
@@ -1071,7 +1101,9 @@ class AgentLoop(PlanProgressMixin):
             await_confirmation=self._effect_await_confirmation,
             finish=self._finish_run,
         )
-        runner = AgentRunner(machine, effects)
+        runner = AgentRunner(
+            machine, effects, after_dispatch=self._after_dispatch
+        )
         try:
             outcome = await runner.run()
         except BaseException:
@@ -1084,6 +1116,8 @@ class AgentLoop(PlanProgressMixin):
             self._persist_turn()
             self._save_checkpoint(status="stopped", reason="interrupted")
             raise
+        finally:
+            self._machine = None
         self._persist_turn()
         # 断点是"可继续"状态的载体：正常交付记 completed，运行失败（含用户停止）
         # 记 stopped。判据取自引擎结论而非异常与否——停止本就不抛异常。
@@ -1108,18 +1142,32 @@ class AgentLoop(PlanProgressMixin):
         # 在追加之前打开本轮的写缓冲区，这样用户消息会被缓存以供持久化，
         # 而不会被重置操作丢弃。
         self.memory.pending = []
-        if self._last_user_msg:
+        # Resume must not duplicate the user frame already in durable history.
+        if not self._is_resume and self._last_user_msg:
             self.memory.append_user(self._last_user_msg)
 
         # 路由：从问题本身推断需要哪些方法论，并注入其正文。放在轮次循环之前，因此
         # 第一次模型调用就已经看得到方法，而不是等到某一轮才补上——简单提问没有计划，
         # 这是它唯一能拿到方法论的时机。
-        if self.route_skills:
+        if self.route_skills and not self._is_resume:
             await self._route_methodology()
 
-        needs_compaction = self._build_compactor().needs_compaction()
-        # New runs typically resume_phase=None; recovery may carry a pending phase.
-        resume_phase = state.resume_phase
+        mid_tool_round = self._resume_phase in {
+            AgentPhase.TOOL_USE,
+            AgentPhase.AWAITING_CONFIRMATION,
+        }
+        if mid_tool_round:
+            needs_compaction = False
+            resume_phase = self._resume_phase
+        else:
+            needs_compaction = self._build_compactor().needs_compaction()
+            allowed = {
+                AgentPhase.THINKING,
+                AgentPhase.TOOL_USE,
+                AgentPhase.AWAITING_CONFIRMATION,
+            }
+            candidate = self._resume_phase or state.resume_phase
+            resume_phase = candidate if candidate in allowed else None
         return EffectResult(
             HydrationFinished(
                 needs_compaction=needs_compaction,
@@ -1320,17 +1368,22 @@ class AgentLoop(PlanProgressMixin):
         if tool_uses:
             if deltas:
                 await self._emit("text_reset", {})
-            self.memory.append_assistant(
-                Msg(role="assistant", content=None, tool_uses=tool_uses)
-            )
-            self._tool_uses_batch = list(tool_uses)
+            permissions = {
+                tool_use.call_id: self._tool_permission(tool_use.name)
+                for tool_use in tool_uses
+            }
+            assistant = Msg(role="assistant", content=None, tool_uses=list(tool_uses))
+            pending = tuple(self.memory.pending)
+            self.memory.pending = []
             return EffectResult(
                 ModelFinished(
                     answer="",
                     tool_uses=tuple(tool_uses),
                     usage=usage,
                     at=utc_now_iso(),
-                )
+                    permissions=permissions,
+                ),
+                messages=pending + (assistant,),
             )
 
         answer = "".join(deltas)
@@ -1356,29 +1409,129 @@ class AgentLoop(PlanProgressMixin):
         )
 
     async def _effect_tooluse(self, state: AgentState) -> EffectResult:
-        """Execute the in-memory tool batch (Task 5 owns snapshot replay)."""
-        del state
-        tool_uses = list(self._tool_uses_batch)
+        """Execute/recover persisted tool calls; finalize one tool-result Msg."""
+        machine = self._machine
+        if machine is None:
+            raise RuntimeError("tooluse effect requires an active state machine")
+
+        now = utc_now_iso()
         deltas = self._think_deltas
         round_input = self._think_round_input
         round_output = self._think_round_output
         llm_first_ms = self._think_llm_first_ms
         llm_ms = self._think_llm_ms
-        try:
-            results = list(
-                await asyncio.gather(
-                    *(self._execute_one(tool_use) for tool_use in tool_uses)
+        self._finished_call_ids = {
+            call.call_id
+            for call in state.calls
+            if call.status in {CallStatus.COMPLETED, CallStatus.FAILED}
+            and call.result_json is not None
+        }
+
+        if self._is_resume:
+            uncertain_ids: list[str] = []
+            for call in state.calls:
+                if call.status in {CallStatus.COMPLETED, CallStatus.FAILED}:
+                    continue
+                if call.status is CallStatus.UNCERTAIN:
+                    uncertain_ids.append(call.call_id)
+                    continue
+                if call.status in {CallStatus.PENDING, CallStatus.RUNNING}:
+                    if call.permission == "read":
+                        continue
+                    uncertain_ids.append(call.call_id)
+
+            if uncertain_ids:
+                for call_id in uncertain_ids:
+                    current = next(
+                        c for c in machine.state.calls if c.call_id == call_id
+                    )
+                    if current.status is not CallStatus.UNCERTAIN:
+                        await machine.dispatch(
+                            ToolCallFinished(
+                                call_id=call_id,
+                                status=CallStatus.UNCERTAIN,
+                                result_json=None,
+                                at=utc_now_iso(),
+                            )
+                        )
+                return EffectResult(
+                    ConfirmationRequested(
+                        prompt="上次执行结果未知，是否重试该写操作？",
+                        options=("y", "n"),
+                        call_ids=tuple(uncertain_ids),
+                        at=utc_now_iso(),
+                        kind="permission",
+                        category="write",
+                    )
+                )
+
+        tool_uses = [
+            ToolUse(call_id=call.call_id, name=call.name, args=dict(call.args))
+            for call in state.calls
+        ]
+        results_by_id: dict[str, str] = {
+            call.call_id: call.result_json
+            for call in state.calls
+            if call.status in {CallStatus.COMPLETED, CallStatus.FAILED}
+            and call.result_json is not None
+        }
+
+        async def run_one(call) -> tuple[str, str]:
+            tool_use = ToolUse(
+                call_id=call.call_id, name=call.name, args=dict(call.args)
+            )
+            await machine.dispatch(
+                ToolCallStarted(call_id=call.call_id, at=utc_now_iso())
+            )
+            call_id, result_json = await self._execute_one(tool_use)
+            status = CallStatus.COMPLETED
+            try:
+                payload = json.loads(result_json)
+                if isinstance(payload, dict) and not payload.get("ok", True):
+                    status = CallStatus.FAILED
+            except (TypeError, ValueError):
+                pass
+            await machine.dispatch(
+                ToolCallFinished(
+                    call_id=call_id,
+                    status=status,
+                    result_json=result_json,
+                    at=utc_now_iso(),
                 )
             )
+            self._finished_call_ids.add(call_id)
+            return call_id, result_json
+
+        to_run = [
+            call
+            for call in state.calls
+            if call.call_id not in results_by_id
+            and call.status
+            in {
+                CallStatus.PENDING,
+                CallStatus.RUNNING,
+            }
+        ]
+
+        try:
+            if to_run:
+                finished = await asyncio.gather(*(run_one(call) for call in to_run))
+                for call_id, result_json in finished:
+                    results_by_id[call_id] = result_json
         except LoopDetected as detected:
-            aborted = self._aborted_results(tool_uses)
-            self.memory.append(
-                Msg(role="tool_result", content=None, tool_results=aborted)
-            )
+            aborted = await self._persist_aborted_results(machine, state.calls)
+            for call_id, result_json in aborted:
+                results_by_id.setdefault(call_id, result_json)
+            ordered = [
+                (call.call_id, results_by_id[call.call_id])
+                for call in state.calls
+                if call.call_id in results_by_id
+            ]
+            tool_msg = Msg(role="tool_result", content=None, tool_results=ordered)
             self._record_round(
                 thought="".join(deltas),
                 actions=tool_uses,
-                results=aborted,
+                results=ordered,
                 input_tokens=round_input,
                 output_tokens=round_output,
                 llm_first_ms=llm_first_ms,
@@ -1395,22 +1548,33 @@ class AgentLoop(PlanProgressMixin):
                     kind="loop_detected",
                     message=str(detected),
                     at=utc_now_iso(),
-                )
+                ),
+                messages=(tool_msg,),
             )
         except BaseException:
-            self.memory.append(
-                Msg(
-                    role="tool_result",
-                    content=None,
-                    tool_results=self._aborted_results(tool_uses),
-                )
+            aborted = await self._persist_aborted_results(machine, state.calls)
+            for call_id, result_json in aborted:
+                results_by_id.setdefault(call_id, result_json)
+            ordered = [
+                (call.call_id, results_by_id[call.call_id])
+                for call in state.calls
+                if call.call_id in results_by_id
+            ]
+            tool_msg = Msg(role="tool_result", content=None, tool_results=ordered)
+            await machine.dispatch(
+                ToolBatchFinished(at=utc_now_iso()), messages=(tool_msg,)
             )
+            self._after_dispatch((tool_msg,))
             raise
-        self.memory.append(Msg(role="tool_result", content=None, tool_results=results))
+
+        ordered = [
+            (call.call_id, results_by_id[call.call_id]) for call in state.calls
+        ]
+        tool_msg = Msg(role="tool_result", content=None, tool_results=ordered)
         self._record_round(
             thought="".join(deltas),
             actions=tool_uses,
-            results=results,
+            results=ordered,
             input_tokens=round_input,
             output_tokens=round_output,
             llm_first_ms=llm_first_ms,
@@ -1418,18 +1582,64 @@ class AgentLoop(PlanProgressMixin):
         )
         if self._stopped():
             self._pending_reason = "user_stopped"
-            return EffectResult(StopRequested(at=utc_now_iso()))
+            return EffectResult(
+                StopRequested(at=utc_now_iso()), messages=(tool_msg,)
+            )
         progress = self._plan_progress(tool_uses)
         if progress is not None:
             self._plan_hint = self._plan_hint_text(progress)
             progress["turn"] = self.turn
             await self._emit("plan_progress", progress)
-        self._tool_uses_batch = []
-        return EffectResult(ToolBatchFinished(at=utc_now_iso()))
+        return EffectResult(ToolBatchFinished(at=now), messages=(tool_msg,))
+
+    async def _persist_aborted_results(
+        self, machine: AgentStateMachine, calls: tuple
+    ) -> list[tuple[str, str]]:
+        """Persist FAILED/aborted results for every call still lacking a result."""
+        aborted: list[tuple[str, str]] = []
+        for call in calls:
+            if call.call_id in self._finished_call_ids:
+                current = next(
+                    (c for c in machine.state.calls if c.call_id == call.call_id),
+                    None,
+                )
+                if current is not None and current.result_json is not None:
+                    aborted.append((call.call_id, current.result_json))
+                    continue
+            result_json = json.dumps(
+                {
+                    "ok": False,
+                    "content": "",
+                    "error": f"tool call cancelled: {call.name}",
+                },
+                ensure_ascii=False,
+            )
+            if call.call_id not in self._finished_call_ids:
+                await machine.dispatch(
+                    ToolCallFinished(
+                        call_id=call.call_id,
+                        status=CallStatus.FAILED,
+                        result_json=result_json,
+                        at=utc_now_iso(),
+                    )
+                )
+                self._finished_call_ids.add(call.call_id)
+            aborted.append((call.call_id, result_json))
+        return aborted
 
     async def _effect_await_confirmation(self, state: AgentState) -> EffectResult:
-        """Placeholder: interactive confirmation remains inside tool execution."""
+        """Pause without spinning when no interactive port is wired (Task 6)."""
         del state
+        if self.interactive is not None:
+            # Task 6 owns InteractivePort prompting.
+            return EffectResult(
+                RunFailed(
+                    kind="awaiting_confirmation_unsupported",
+                    message="awaiting confirmation interactive path is Task 6",
+                    at=utc_now_iso(),
+                )
+            )
+        # No interactive: leave phase unchanged by not being invoked (runner pauses).
         return EffectResult(
             RunFailed(
                 kind="awaiting_confirmation_unsupported",
@@ -1441,6 +1651,21 @@ class AgentLoop(PlanProgressMixin):
     async def _finish_run(self, state: AgentState) -> AgentTurnOutcome:
         """Emit answer/error/done and build AgentTurnOutcome from loop + counters."""
         tool_calls = state.tool_calls
+        if state.phase is AgentPhase.AWAITING_CONFIRMATION:
+            return AgentTurnOutcome(
+                answer="",
+                succeeded=False,
+                usage=self.usage,
+                error=None,
+                reason="awaiting_confirmation",
+                tool_calls=tool_calls,
+                retry_count=self.stats.retry_count,
+                tool_duration_ms=self.stats.snapshot().tool_duration_ms,
+                citations=self._citation_ids(),
+                trace=list(self.trace),
+                rounds=self.rounds,
+            )
+
         if state.phase is AgentPhase.COMPLETE and state.outcome is not None:
             if state.outcome.kind == "stopped":
                 return await self._stop_turn(tool_calls=tool_calls)
