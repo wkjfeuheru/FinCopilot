@@ -34,14 +34,19 @@ class StateStore(Protocol):
     ) -> AgentState | None: ...
 
 
-def _abandon_complete_stopped(state: AgentState, *, now: str) -> AgentState:
-    """Mark a resumable complete (user-stop) snapshot abandoned without an illegal event."""
-    return replace(
-        state,
-        revision=state.revision + 1,
-        updated_at=now,
-        outcome=RunOutcome(kind="abandoned", reason=None, resumable=False),
-        confirmation=None,
+def _next_abandoned(current: AgentState, now: str) -> AgentState:
+    """Next abandoned revision: RunCompleted for nonterminal, replace for user-stop."""
+    if current.phase is AgentPhase.COMPLETE:
+        return replace(
+            current,
+            revision=current.revision + 1,
+            updated_at=now,
+            outcome=RunOutcome(kind="abandoned", reason=None, resumable=False),
+            confirmation=None,
+        )
+    return transition(
+        current,
+        RunCompleted(kind="abandoned", reason=None, resumable=False, at=now),
     )
 
 
@@ -92,13 +97,7 @@ class MemoryStateStore:
         current = self.latest_resumable(conversation_id, user_id)
         if current is None:
             return None
-        if current.phase is AgentPhase.COMPLETE:
-            abandoned = _abandon_complete_stopped(current, now=now)
-        else:
-            abandoned = transition(
-                current,
-                RunCompleted(kind="abandoned", reason=None, resumable=False, at=now),
-            )
+        abandoned = _next_abandoned(current, now)
         self.save(abandoned)
         return abandoned
 
@@ -147,12 +146,6 @@ class SqliteAgentStateStore:
         current = self.latest_resumable(conversation_id, user_id)
         if current is None:
             return None
-        if current.phase is AgentPhase.COMPLETE:
-            abandoned = _abandon_complete_stopped(current, now=now)
-        else:
-            abandoned = transition(
-                current,
-                RunCompleted(kind="abandoned", reason=None, resumable=False, at=now),
-            )
+        abandoned = _next_abandoned(current, now)
         self.save(abandoned)
         return abandoned

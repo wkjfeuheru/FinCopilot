@@ -475,16 +475,22 @@ class MemoryStore(SqliteStore):
     def commit_agent_transition(
         self, state: AgentState, *, messages: tuple[Msg, ...] = ()
     ) -> None:
-        """Atomically append optional messages and one FSM snapshot revision."""
+        """Atomically append optional messages and one FSM snapshot revision.
+
+        Uses an explicit ``BEGIN IMMEDIATE`` on this connection only
+        (``isolation_level=None``) so lock failures propagate and the write
+        is not subject to deferred auto-begin.
+        """
         with self._connect() as connection:
+            connection.isolation_level = None
+            connection.execute("BEGIN IMMEDIATE")
             try:
-                connection.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError:
-                # Default sqlite3 isolation may already have an open transaction;
-                # the with-block commit still keeps message + snapshot atomic.
-                pass
-            self._append_messages(connection, state.conversation_id, messages)
-            insert_agent_state(connection, state)
+                self._append_messages(connection, state.conversation_id, messages)
+                insert_agent_state(connection, state)
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
 
     def message_seq_range(self, conversation_id: str) -> tuple[int, int]:
         with self._connect() as connection:
