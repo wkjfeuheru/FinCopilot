@@ -15,6 +15,7 @@ import {
   asPublicAgentState,
   presentAgentPhase,
   reduceAgentState,
+  resolveHighLevelTraceStatus,
   type PublicAgentState,
 } from "../lib/agentState";
 import { Interaction, InteractionPrompt } from "./InteractionPrompt";
@@ -700,17 +701,21 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           }));
           const agentRuns = Object.values(perAgent).reduce((sum, value) => sum + Number(value.runs ?? 0), 0);
           const succeeded = event.data.succeeded !== false;
+          const doneStatus = succeeded ? ("done" as const) : stopped ? ("stopped" as const) : ("error" as const);
+          // High-level status: state is primary when present; done only for
+          // metrics / plan / step close-out (and legacy servers with no state).
+          const highLevelStatus = resolveHighLevelTraceStatus(agentStateRef.current, doneStatus);
           updateTrace((trace) => {
             const withoutAgents = trace.steps.filter((step) => step.kind !== "agent");
             const hasFinal = withoutAgents.some((step) => step.key === "final");
-            const resting = succeeded ? "done" as const : stopped ? "stopped" as const : "error" as const;
+            const resting = doneStatus;
             const closedSteps = withoutAgents.map((step) => ({
               ...step,
               status: step.status === "running" ? resting : step.status,
             }));
             return {
               ...trace,
-              status: succeeded ? "done" : stopped ? "stopped" : "error",
+              status: highLevelStatus,
               plan: planFromEvent((event.data.plan as Record<string, unknown> | undefined) ?? {}) ?? trace.plan,
               steps: [
                 ...closedSteps,

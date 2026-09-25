@@ -66,6 +66,20 @@ export function presentAgentPhase(state: PublicAgentState): PresentedAgentPhase 
   return { status: "running", label: PHASE_LABELS[state.phase] };
 }
 
+export type DoneTraceStatus = "done" | "error" | "stopped";
+
+/**
+ * Live/high-level trace status: `state` is primary when present.
+ * Old servers with no `state` events fall back to the `done`-derived status.
+ */
+export function resolveHighLevelTraceStatus(
+  agentState: PublicAgentState | null,
+  doneFallback: DoneTraceStatus,
+): PresentedAgentPhase["status"] {
+  if (agentState !== null) return presentAgentPhase(agentState).status;
+  return doneFallback;
+}
+
 /** Narrow an SSE/history payload to the typed public subset; return null if unusable. */
 export function asPublicAgentState(
   data: Record<string, unknown>,

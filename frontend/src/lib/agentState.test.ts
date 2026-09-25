@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   presentAgentPhase,
   reduceAgentState,
+  resolveHighLevelTraceStatus,
   type AgentPhase,
   type PublicAgentState,
 } from "./agentState";
@@ -77,5 +78,42 @@ describe("presentAgentPhase", () => {
         }),
       ),
     ).toEqual({ status: "error", label: "模型调用失败" });
+  });
+});
+
+describe("resolveHighLevelTraceStatus", () => {
+  it("prefers state-derived status when done disagrees (live path)", () => {
+    // Mirrors stored-turn: done says user_stopped, last state says error → error.
+    const agentState = state({
+      revision: 2,
+      phase: "error",
+      error: { kind: "provider", message: "模型调用失败" },
+    });
+    expect(resolveHighLevelTraceStatus(agentState, "stopped")).toBe("error");
+  });
+
+  it("falls back to done status when no state events exist (legacy servers)", () => {
+    expect(resolveHighLevelTraceStatus(null, "stopped")).toBe("stopped");
+    expect(resolveHighLevelTraceStatus(null, "done")).toBe("done");
+    expect(resolveHighLevelTraceStatus(null, "error")).toBe("error");
+  });
+
+  it("keeps state preference when a later state revises the phase after done", () => {
+    const before = state({
+      revision: 1,
+      phase: "complete",
+      outcome: { kind: "stopped", reason: "user_stopped", resumable: true },
+    });
+    expect(resolveHighLevelTraceStatus(before, "stopped")).toBe("stopped");
+
+    const afterDone = reduceAgentState(
+      before,
+      state({
+        revision: 2,
+        phase: "error",
+        error: { kind: "provider", message: "late failure" },
+      }),
+    );
+    expect(resolveHighLevelTraceStatus(afterDone, "stopped")).toBe("error");
   });
 });
