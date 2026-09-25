@@ -271,6 +271,8 @@ class AgentLoop(PlanProgressMixin):
         self._confirmation_approved_ids: set[str] = set()
         self._interaction_answer: str | None = None
         self._skip_permission_ids: set[str] = set()
+        # Queued by InteractivePort; emitted in _after_dispatch after ConfirmationResolved.
+        self._pending_interaction_resolved: dict[str, Any] | None = None
 
     def _stopped(self) -> bool:
         """是否已收到停止请求；无信号时恒为 False。"""
@@ -1027,6 +1029,11 @@ class AgentLoop(PlanProgressMixin):
         self._confirmation_approved_ids = set()
         self._interaction_answer = None
         self._skip_permission_ids = set()
+        self._pending_interaction_resolved = None
+
+    def queue_interaction_resolved(self, payload: dict[str, Any]) -> None:
+        """InteractivePort stashes resolved metadata; emit after ConfirmationResolved."""
+        self._pending_interaction_resolved = payload
 
     def _failed_resume_outcome(self) -> AgentTurnOutcome:
         reason = "no_resumable_state"
@@ -1045,8 +1052,8 @@ class AgentLoop(PlanProgressMixin):
             rounds=self.rounds,
         )
 
-    def _after_dispatch(self, messages: tuple[Msg, ...]) -> None:
-        """Apply committed Msgs to WorkingMemory; drop them from pending."""
+    async def _after_dispatch(self, messages: tuple[Msg, ...]) -> None:
+        """Apply committed Msgs; emit queued interaction_resolved after persist."""
         known = {id(message) for message in self.memory.raw}
         for message in messages:
             if id(message) not in known:
@@ -1058,6 +1065,10 @@ class AgentLoop(PlanProgressMixin):
                 for message in self.memory.pending
                 if id(message) not in committed
             ]
+        pending = self._pending_interaction_resolved
+        if pending is not None:
+            self._pending_interaction_resolved = None
+            await self._emit("interaction_resolved", pending)
 
     def _tool_permission(self, name: str) -> str:
         resolve = getattr(self.registry, "resolve", None)
@@ -1736,7 +1747,7 @@ class AgentLoop(PlanProgressMixin):
             await machine.dispatch(
                 ToolBatchFinished(at=utc_now_iso()), messages=(tool_msg,)
             )
-            self._after_dispatch((tool_msg,))
+            await self._after_dispatch((tool_msg,))
             raise
         return None
 

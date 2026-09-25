@@ -472,6 +472,7 @@ def test_stop_from_awaiting_confirmation_is_resumable_complete():
     assert next_state.outcome == RunOutcome(
         kind="stopped", reason="user_stopped", resumable=True
     )
+    assert next_state.confirmation is None
 
 
 def test_stop_maps_to_complete_stopped_resumable():

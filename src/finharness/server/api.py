@@ -651,13 +651,14 @@ def create_app(
                     announce=lambda item: loop._emit("interactive_request", item),
                     dedupe_key=dedupe_key,
                 )
-                await loop._emit(
-                    "interaction_resolved",
+                # Do not emit interaction_resolved here: ConfirmationResolved must
+                # persist first. Loop emits from _after_dispatch after that revision.
+                loop.queue_interaction_resolved(
                     {
                         "request_id": payload.get("request_id"),
                         "answer": answer,
                         "timeout": answer is None,
-                    },
+                    }
                 )
                 return answer
 

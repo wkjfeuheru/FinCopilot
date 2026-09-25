@@ -9,7 +9,7 @@ from finharness.engine.machine import AgentStateMachine
 from finharness.engine.state import AgentEvent, AgentPhase, AgentState
 from finharness.types import AgentTurnOutcome, Msg
 
-AfterDispatch = Callable[[tuple[Msg, ...]], None]
+AfterDispatch = Callable[[tuple[Msg, ...]], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,8 +55,10 @@ class AgentRunner:
             handler = self._handlers[self.machine.state.phase]
             event, messages = await handler(self.machine.state)
             await self.machine.dispatch(event, messages=messages)
-            if self.after_dispatch is not None and messages:
-                self.after_dispatch(messages)
+            # Always run after_dispatch (even with empty messages) so hooks such
+            # as interaction_resolved can fire after ConfirmationResolved persists.
+            if self.after_dispatch is not None:
+                await self.after_dispatch(messages)
         return await self.effects.finish(self.machine.state)
 
     async def _handle_hydrate(

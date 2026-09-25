@@ -45,6 +45,9 @@ class InteractionChannel:
 
     Implements ``InteractivePort.prompt`` so AgentLoop FSM confirmation can
     use the same channel object passed as ``loop.interactive``.
+
+    Does not emit ``interaction_resolved``: that edge is owned by the loop
+    after ``ConfirmationResolved`` is persisted.
     """
 
     def __init__(self, policy: str = "answer", answer: str = "综合") -> None:

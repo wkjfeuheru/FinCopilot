@@ -179,10 +179,11 @@ def test_respond_endpoint_resolves_the_apps_pending_request(tmp_path):
 class _ConfirmBusPort:
     """InteractivePort wrapping ConfirmBus; emits interactive_request via sink."""
 
-    def __init__(self, bus: ConfirmBus, sink, *, answer: str = "y") -> None:
+    def __init__(self, bus: ConfirmBus, sink, *, answer: str = "y", loop=None) -> None:
         self.bus = bus
         self.sink = sink
         self.answer = answer
+        self.loop = loop
         self.request_ids: list[str] = []
 
     async def prompt(self, spec) -> str | None:
@@ -202,15 +203,14 @@ class _ConfirmBusPort:
             multi_select=bool(getattr(spec, "multi_select", False)),
             announce=announce,
         )
-        await self.sink.emit(
-            EngineEvent(
-                "interaction_resolved",
-                {
-                    "request_id": payload.get("request_id"),
-                    "answer": answer,
-                    "timeout": answer is None,
-                },
-            )
+        # Queue for post-ConfirmationResolved emit (same contract as server api).
+        assert self.loop is not None
+        self.loop.queue_interaction_resolved(
+            {
+                "request_id": payload.get("request_id"),
+                "answer": answer,
+                "timeout": answer is None,
+            }
         )
         return answer
 
@@ -266,6 +266,7 @@ async def run_confirming_tool(tmp_path, answer: str = "y"):
         gate=gate,
         interactive=port,
     )
+    port.loop = loop
     await loop.run("please write")
     return sink.events, loop
 
@@ -280,6 +281,29 @@ def test_confirmation_state_precedes_interactive_request(tmp_path):
     )
     request = kinds.index("interactive_request")
     assert awaiting < request
+
+
+def test_confirmation_resolved_persists_before_interaction_resolved(tmp_path):
+    """ConfirmationResolved state/revision must precede interaction_resolved."""
+    events, _loop = asyncio.run(run_confirming_tool(tmp_path, answer="y"))
+    awaiting = next(
+        i
+        for i, event in enumerate(events)
+        if event.kind == "state" and event.data["phase"] == "awaitingconfirmation"
+    )
+    # ConfirmationResolved leaves awaitingconfirmation → tooluse (confirmation cleared).
+    resolved_state = next(
+        i
+        for i, event in enumerate(events)
+        if i > awaiting
+        and event.kind == "state"
+        and event.data["phase"] == "tooluse"
+        and event.data.get("confirmation") is None
+    )
+    interaction_resolved = next(
+        i for i, event in enumerate(events) if event.kind == "interaction_resolved"
+    )
+    assert resolved_state < interaction_resolved
 
 
 class _ScriptedPort:

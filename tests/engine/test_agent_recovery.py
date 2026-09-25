@@ -180,12 +180,16 @@ async def resume_until_confirmation(tmp_path):
     await machine.dispatch(hydrate.event, messages=hydrate.messages)
     apply = getattr(loop, "_after_dispatch", None)
     if callable(apply):
-        apply(hydrate.messages)
+        maybe = apply(hydrate.messages)
+        if hasattr(maybe, "__await__"):
+            await maybe
     assert machine.state.phase is AgentPhase.TOOL_USE
     result = await loop._effect_tooluse(machine.state)
     await machine.dispatch(result.event, messages=result.messages)
     if callable(apply):
-        apply(result.messages)
+        maybe = apply(result.messages)
+        if hasattr(maybe, "__await__"):
+            await maybe
     return machine.state
 
 
@@ -342,9 +346,10 @@ async def resume_and_confirm(tmp_path, answer: str):
     class AnsweringPort:
         """InteractivePort that mints a fresh request_id (ConfirmBus-ephemeral)."""
 
-        def __init__(self, sink: Sink, answer: str) -> None:
+        def __init__(self, sink: Sink, answer: str, loop) -> None:
             self.sink = sink
             self.answer = answer
+            self.loop = loop
             self.request_ids: list[str] = []
 
         async def prompt(self, spec) -> str | None:
@@ -362,20 +367,17 @@ async def resume_and_confirm(tmp_path, answer: str):
                     },
                 )
             )
-            await self.sink.emit(
-                EngineEvent(
-                    "interaction_resolved",
-                    {
-                        "request_id": request_id,
-                        "answer": self.answer,
-                        "timeout": False,
-                    },
-                )
+            # Queue for post-ConfirmationResolved emit (same as ConfirmBus port).
+            self.loop.queue_interaction_resolved(
+                {
+                    "request_id": request_id,
+                    "answer": self.answer,
+                    "timeout": False,
+                }
             )
             return self.answer
 
     sink = Sink()
-    port = AnsweringPort(sink, answer)
     tool = RecordingTool("write", content="wrote")
     tool.permission = PermissionLevel.WRITE
     base = _settings()
@@ -394,9 +396,11 @@ async def resume_and_confirm(tmp_path, answer: str):
         conversation_id="conv",
         user_id="",
         gate=PermissionGate(settings=settings),
-        interactive=port,
+        interactive=None,
         output=sink,
     )
+    port = AnsweringPort(sink, answer, loop)
+    loop.interactive = port
     outcome = await loop.run("", resume=True)
     assert port.request_ids, "resume must reissue interactive_request"
     return port.request_ids[0], outcome
@@ -484,7 +488,7 @@ def test_pending_survives_until_model_finished_after_dispatch(tmp_path):
         loop._last_user_msg = "quote"
         hydrate = await loop._effect_hydrate(machine.state)
         await machine.dispatch(hydrate.event, messages=hydrate.messages)
-        loop._after_dispatch(hydrate.messages)
+        await loop._after_dispatch(hydrate.messages)
         assert any(m.role == "user" for m in loop.memory.pending)
         thinking = machine.state
         assert thinking.phase is AgentPhase.THINKING

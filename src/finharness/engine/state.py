@@ -519,6 +519,7 @@ def transition(state: AgentState, event: AgentEvent) -> AgentState:
                 resumable=True,
             ),
             error=None,
+            confirmation=None,
         )
 
     if isinstance(event, RunCompleted):
