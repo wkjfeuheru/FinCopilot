@@ -43,11 +43,15 @@ from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
 from finharness.engine.loop import AgentLoop
 from finharness.engine.prompt import system_prompt
-from finharness.hooks.audit import AuditHook, AuditLogWriter, summarize_args
+from finharness.hooks.audit import AuditHook, AuditLogWriter
 from finharness.hooks.base import HookChain
 from finharness.observability import build_observer, get_logger, setup_logging
 from finharness.observability.usage_store import UsageStore
-from finharness.permissions.gate import EGRESS_CATEGORY, PermissionGate
+from finharness.permissions.gate import (
+    EGRESS_CATEGORY,
+    ConfirmationSpec,
+    PermissionGate,
+)
 from finharness.provider.resolver import NotConfigured, ProviderResolver
 from finharness.server.admin_api import create_admin_router
 from finharness.server.auth_api import create_auth_router
@@ -539,6 +543,10 @@ def create_app(
     confirmed_categories: BoundedMap[str, set[str]] = BoundedMap(
         max_size=settings.context.retention_conversations
     )
+    # 会话级写类免问（y_session）：与对话级 confirmed_categories 并列持有。
+    session_approved_categories: BoundedMap[str, set[str]] = BoundedMap(
+        max_size=settings.context.retention_conversations
+    )
 
     def loop_factory(
         session_id: str | None = None,
@@ -577,36 +585,16 @@ def create_app(
         if confirmed is None:
             confirmed = set()
             confirmed_categories[conversation_id or "local"] = confirmed
-
-        async def _confirm_write(name: str, args: dict) -> bool:
-            answer = await _ask(
-                "confirm",
-                f"工具 {name} 将执行，入参：{summarize_args(args)}",
-                ["y", "n"],
-            )
-            return answer == "y"
-
-        async def _confirm_egress(name: str, args: dict) -> bool:
-            answer = await _ask(
-                "confirm",
-                f"工具 {name} 将访问外部网络并引入第三方内容，入参：{summarize_args(args)}",
-                ["y", "y_remember", "n"],
-                # 同一轮并发的多个外发调用是同一个决定，合并成一次提问：
-                # 分开问既重复打断用户，又会因前端一次只呈现一个提示而让
-                # 其余请求等满 TTL 被判拒绝（docs 03.7.1）。
-                dedupe_key=f"egress:{session_id or 'local'}:{conversation_id or 'local'}",
-            )
-            if answer == "y_remember":
-                confirmed.add(EGRESS_CATEGORY)
-                return True
-            return answer == "y"
+        approved = session_approved_categories.get(conversation_id or "local")
+        if approved is None:
+            approved = set()
+            session_approved_categories[conversation_id or "local"] = approved
 
         gate = PermissionGate(
             settings=getattr(session_data, "settings", None) or settings,
-            confirm=_confirm_write,
             conversation_id=conversation_id or "local",
             confirmed_categories=confirmed,
-            confirm_egress=_confirm_egress,
+            session_approved=approved,
         )
         loop = AgentLoop(
             provider=selected,
@@ -635,44 +623,38 @@ def create_app(
             ),
         )
 
-        async def _ask(
-            kind: str,
-            prompt: str,
-            options: list[str],
-            *,
-            multi_select: bool = False,
-            dedupe_key: str | None = None,
-        ):
-            """经由 SSE 宣告请求，然后 await 客户端的应答。
+        class _ConfirmBusPort:
+            """InteractivePort：ConfirmBus 持有 ephemeral request_id。"""
 
-            ``multi_select`` 仅对 ``ask_user`` 提问有意义，随 payload 下发前端以
-            决定选项是单选还是多选。``dedupe_key`` 让同类别并发请求共用一次提问；
-            此时多个调用者会各自收到同一条 resolution，前端按 request_id 幂等收尾即可。
-            """
-            payload, answer = await confirm_bus.request(
-                session_id=session_id or "local",
-                kind=kind,
-                prompt=prompt,
-                options=options,
-                multi_select=multi_select,
-                user_id=user_id,
-                announce=lambda item: loop._emit("interactive_request", item),
-                dedupe_key=dedupe_key,
-            )
-            # 明确告知前端该提示已落定（批准/拒绝/超时），否则"等待操作确认"
-            # 步骤会永远停在"进行中"——它此前只有发起、没有收尾。
-            await loop._emit(
-                "interaction_resolved",
-                {
-                    "request_id": payload.get("request_id"),
-                    "answer": answer,
-                    "timeout": answer is None,
-                },
-            )
-            return answer
+            async def prompt(self, spec: ConfirmationSpec) -> str | None:
+                kind = "question" if spec.kind == "question" else "confirm"
+                dedupe_key = None
+                if spec.category == EGRESS_CATEGORY:
+                    dedupe_key = (
+                        f"egress:{session_id or 'local'}:{conversation_id or 'local'}"
+                    )
+                payload, answer = await confirm_bus.request(
+                    session_id=session_id or "local",
+                    kind=kind,
+                    prompt=spec.prompt,
+                    options=list(spec.options),
+                    multi_select=spec.multi_select,
+                    user_id=user_id,
+                    announce=lambda item: loop._emit("interactive_request", item),
+                    dedupe_key=dedupe_key,
+                )
+                await loop._emit(
+                    "interaction_resolved",
+                    {
+                        "request_id": payload.get("request_id"),
+                        "answer": answer,
+                        "timeout": answer is None,
+                    },
+                )
+                return answer
 
         # 构造之后注入，使回调可以通过此 loop 发送事件。
-        loop.interactive = _ask
+        loop.interactive = _ConfirmBusPort()
         loop.audit = audit
         # LTM 懒蒸馏的兜底翼（docs 03.6.4）：用户开新对话时补蒸馏其闲置的
         # 未处理对话。SSE 断线与 TTL 回收都跳不出这条路径——只要用户还在

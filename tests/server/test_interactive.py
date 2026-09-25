@@ -173,6 +173,115 @@ def test_respond_endpoint_resolves_the_apps_pending_request(tmp_path):
     assert asyncio.run(scenario()) == "y"
 
 
+# -- FSM-owned confirmation ordering (Task 6) ---------------------------------
+
+
+class _ConfirmBusPort:
+    """InteractivePort wrapping ConfirmBus; emits interactive_request via sink."""
+
+    def __init__(self, bus: ConfirmBus, sink, *, answer: str = "y") -> None:
+        self.bus = bus
+        self.sink = sink
+        self.answer = answer
+        self.request_ids: list[str] = []
+
+    async def prompt(self, spec) -> str | None:
+        from finharness.types import EngineEvent
+
+        async def announce(payload: dict) -> None:
+            self.request_ids.append(payload["request_id"])
+            await self.sink.emit(EngineEvent("interactive_request", payload))
+            await _answer_latest(self.bus, self.answer)
+
+        kind = "question" if getattr(spec, "kind", "") == "question" else "confirm"
+        payload, answer = await self.bus.request(
+            session_id="s",
+            kind=kind,
+            prompt=spec.prompt,
+            options=list(spec.options),
+            multi_select=bool(getattr(spec, "multi_select", False)),
+            announce=announce,
+        )
+        await self.sink.emit(
+            EngineEvent(
+                "interaction_resolved",
+                {
+                    "request_id": payload.get("request_id"),
+                    "answer": answer,
+                    "timeout": answer is None,
+                },
+            )
+        )
+        return answer
+
+
+async def run_confirming_tool(tmp_path, answer: str = "y"):
+    """Drive a write tool that needs confirmation; return engine events."""
+    from test_loop import ScriptedProvider, Sink, StubRegistry, text_round, tool_round
+
+    from finharness.config.settings import ContextSettings, PermissionSettings, ToolSettings
+    from finharness.context.memory.store import MemoryStore
+    from finharness.engine.loop import AgentLoop
+    from finharness.permissions.gate import PermissionGate
+    from finharness.tools.base import PermissionLevel
+    from finharness.types import ToolResult, ToolUse
+    from tests.conftest import settings_with_cache
+
+    class WriteTool:
+        name = "write"
+        permission = PermissionLevel.WRITE
+        timeout = None
+
+        async def run(self, **kwargs) -> ToolResult:
+            return ToolResult(content="wrote", ok=True)
+
+    settings = settings_with_cache(
+        tmp_path,
+        permission=PermissionSettings(default_mode="default"),
+        context=ContextSettings(max_turns=30, max_result_tokens=1000),
+        tools=ToolSettings(timeout_default_s=30),
+    )
+    store = MemoryStore(tmp_path / "memory.db")
+    sink = Sink()
+    bus = ConfirmBus(ttl_s=2.0)
+    port = _ConfirmBusPort(bus, sink, answer=answer)
+    gate = PermissionGate(settings=settings)
+    tool = WriteTool()
+    registry = StubRegistry({"write": tool}, read_only=set())
+    provider = ScriptedProvider(
+        [
+            tool_round(ToolUse("c1", "write", {"path": "out.txt"})),
+            text_round("done"),
+        ]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        registry=registry,
+        settings=settings,
+        system="test",
+        output=sink,
+        store=store,
+        conversation_id="conv",
+        user_id="",
+        gate=gate,
+        interactive=port,
+    )
+    await loop.run("please write")
+    return sink.events
+
+
+def test_confirmation_state_precedes_interactive_request(tmp_path):
+    events = asyncio.run(run_confirming_tool(tmp_path, answer="y"))
+    kinds = [event.kind for event in events]
+    awaiting = next(
+        i
+        for i, event in enumerate(events)
+        if event.kind == "state" and event.data["phase"] == "awaitingconfirmation"
+    )
+    request = kinds.index("interactive_request")
+    assert awaiting < request
+
+
 # -- 网络外发确认（docs 03.7.1）------------------------------------------------
 
 

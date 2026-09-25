@@ -53,10 +53,21 @@ class InteractionChannel:
         self.answer = answer
         self.log = []
 
+    async def prompt(self, spec: Any) -> str | None:
+        """InteractivePort adapter used by the agent FSM confirmation phase."""
+        kind = "question" if getattr(spec, "kind", "") == "question" else "confirm"
+        return await self.ask(
+            kind,
+            getattr(spec, "prompt", ""),
+            list(getattr(spec, "options", ()) or []),
+            multi_select=bool(getattr(spec, "multi_select", False)),
+        )
+
     async def ask(
         self, kind: str, prompt: str, options: list[str], *, multi_select: bool = False
     ) -> str | None:
         """引擎循环的 ``interactive`` 回调（也是权限门禁的确认来源）。"""
+        del multi_select
         if kind == "confirm":
             approved = self.policy == "confirm"
             response: str | None = "y" if approved else "n"
@@ -71,6 +82,7 @@ class InteractionChannel:
 
     async def confirm(self, name: str, args: dict) -> bool:
         """权限门禁的 ``confirm`` 回调：返回写操作是否获批。"""
+        del args
         return await self.ask("confirm", name, []) == "y"
 
 

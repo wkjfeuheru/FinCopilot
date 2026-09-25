@@ -34,6 +34,7 @@ from finharness.engine.state import (
     CallStatus,
     CompactionFinished,
     ConfirmationRequested,
+    ConfirmationResolved,
     HydrationFinished,
     ModelFinished,
     ResumeRequested,
@@ -49,7 +50,7 @@ from finharness.hooks.base import HookChain
 from finharness.observability import NullObserver
 from finharness.observability.context import update_turn
 from finharness.observability.logs import get_logger
-from finharness.permissions.gate import ReadOnlyGate
+from finharness.permissions.gate import ConfirmationSpec, GateDecision, ReadOnlyGate
 from finharness.permissions.modes import Verdict
 from finharness.provider.base import Provider
 from finharness.shared.budget import resolve_result_budget
@@ -265,6 +266,11 @@ class AgentLoop(PlanProgressMixin):
         self._is_resume: bool = False
         self._resume_phase: AgentPhase | None = None
         self._finished_call_ids: set[str] = set()
+        # FSM confirmation: ephemeral prompt payload + one-shot answers (not persisted).
+        self._pending_confirm_spec: ConfirmationSpec | None = None
+        self._confirmation_approved_ids: set[str] = set()
+        self._interaction_answer: str | None = None
+        self._skip_permission_ids: set[str] = set()
 
     def _stopped(self) -> bool:
         """是否已收到停止请求；无信号时恒为 False。"""
@@ -1017,6 +1023,10 @@ class AgentLoop(PlanProgressMixin):
         self._think_llm_first_ms = 0
         self._think_llm_ms = 0
         self._finished_call_ids = set()
+        self._pending_confirm_spec = None
+        self._confirmation_approved_ids = set()
+        self._interaction_answer = None
+        self._skip_permission_ids = set()
 
     def _failed_resume_outcome(self) -> AgentTurnOutcome:
         reason = "no_resumable_state"
@@ -1435,6 +1445,9 @@ class AgentLoop(PlanProgressMixin):
         }
 
         if self._is_resume:
+            # Consume resume classification once: after confirmation resolves,
+            # re-entering tooluse must execute (not re-prompt uncertain writes).
+            self._is_resume = False
             uncertain_ids: list[str] = []
             for call in state.calls:
                 if call.status in {CallStatus.COMPLETED, CallStatus.FAILED}:
@@ -1520,9 +1533,95 @@ class AgentLoop(PlanProgressMixin):
             }
         ]
 
+        allow_calls, confirm_specs = await self._partition_tool_calls(to_run)
+        for call in machine.state.calls:
+            if call.result_json is not None:
+                results_by_id[call.call_id] = call.result_json
+        if confirm_specs:
+            if allow_calls:
+                try:
+                    finished = await asyncio.gather(
+                        *(run_one(call) for call in allow_calls)
+                    )
+                    for call_id, result_json in finished:
+                        results_by_id[call_id] = result_json
+                except LoopDetected as detected:
+                    aborted = await self._persist_aborted_results(machine, state.calls)
+                    for call_id, result_json in aborted:
+                        results_by_id.setdefault(call_id, result_json)
+                    ordered = [
+                        (call.call_id, results_by_id[call.call_id])
+                        for call in state.calls
+                        if call.call_id in results_by_id
+                    ]
+                    tool_msg = Msg(
+                        role="tool_result", content=None, tool_results=ordered
+                    )
+                    self._record_round(
+                        thought="".join(deltas),
+                        actions=tool_uses,
+                        results=ordered,
+                        input_tokens=round_input,
+                        output_tokens=round_output,
+                        llm_first_ms=llm_first_ms,
+                        llm_ms=llm_ms,
+                    )
+                    await self._audit_detection(detected)
+                    self._pending_reason = "loop_detected"
+                    self._pending_fail_kind = "loop_detected"
+                    self._pending_fail_message = str(detected)
+                    self._pending_error = str(detected)
+                    self._pending_answer = self._partial_answer(reason="loop_detected")
+                    return EffectResult(
+                        RunFailed(
+                            kind="loop_detected",
+                            message=str(detected),
+                            at=utc_now_iso(),
+                        ),
+                        messages=(tool_msg,),
+                    )
+                except BaseException:
+                    aborted = await self._persist_aborted_results(machine, state.calls)
+                    for call_id, result_json in aborted:
+                        results_by_id.setdefault(call_id, result_json)
+                    ordered = [
+                        (call.call_id, results_by_id[call.call_id])
+                        for call in state.calls
+                        if call.call_id in results_by_id
+                    ]
+                    tool_msg = Msg(
+                        role="tool_result", content=None, tool_results=ordered
+                    )
+                    await machine.dispatch(
+                        ToolBatchFinished(at=utc_now_iso()), messages=(tool_msg,)
+                    )
+                    self._after_dispatch((tool_msg,))
+                    raise
+            call_ids = tuple(call_id for call_id, _ in confirm_specs)
+            first_spec = confirm_specs[0][1]
+            merged = ConfirmationSpec(
+                kind=first_spec.kind,
+                prompt=first_spec.prompt,
+                options=first_spec.options,
+                category=first_spec.category,
+                call_ids=call_ids,
+                multi_select=first_spec.multi_select,
+            )
+            self._pending_confirm_spec = merged
+            return EffectResult(
+                ConfirmationRequested(
+                    prompt=merged.prompt,
+                    options=merged.options,
+                    call_ids=call_ids,
+                    at=utc_now_iso(),
+                    kind=merged.kind,
+                    category=merged.category,
+                )
+            )
+
         try:
-            if to_run:
-                finished = await asyncio.gather(*(run_one(call) for call in to_run))
+            if allow_calls:
+                finished = await asyncio.gather(*(run_one(call) for call in allow_calls))
                 for call_id, result_json in finished:
                     results_by_id[call_id] = result_json
         except LoopDetected as detected:
@@ -1574,6 +1673,20 @@ class AgentLoop(PlanProgressMixin):
             self._after_dispatch((tool_msg,))
             raise
 
+        for call in state.calls:
+            if (
+                call.status is CallStatus.FAILED
+                and call.call_id not in results_by_id
+            ):
+                results_by_id[call.call_id] = json.dumps(
+                    {
+                        "ok": False,
+                        "content": "",
+                        "error": "用户已拒绝该工具调用",
+                    },
+                    ensure_ascii=False,
+                )
+
         ordered = [
             (call.call_id, results_by_id[call.call_id]) for call in state.calls
         ]
@@ -1598,6 +1711,84 @@ class AgentLoop(PlanProgressMixin):
             progress["turn"] = self.turn
             await self._emit("plan_progress", progress)
         return EffectResult(ToolBatchFinished(at=now), messages=(tool_msg,))
+
+    async def _partition_tool_calls(
+        self, to_run: list
+    ) -> tuple[list, list[tuple[str, ConfirmationSpec]]]:
+        """Split pending calls into immediately executable vs confirmation-needed.
+
+        Immediate DENY results are persisted here. CONFIRM / ask_user leave
+        tooluse via ``ConfirmationRequested`` (no await inside gather).
+        """
+        allow_calls: list = []
+        confirm_specs: list[tuple[str, ConfirmationSpec]] = []
+        machine = self._machine
+        if machine is None:
+            return list(to_run), []
+
+        for call in to_run:
+            if call.call_id in self._confirmation_approved_ids:
+                self._confirmation_approved_ids.discard(call.call_id)
+                self._skip_permission_ids.add(call.call_id)
+                allow_calls.append(call)
+                continue
+
+            tool = self.registry.resolve(call.name)
+            if tool is None:
+                allow_calls.append(call)
+                continue
+
+            if getattr(tool, "needs_interactive", False):
+                options = call.args.get("options") or []
+                if not isinstance(options, list):
+                    options = list(options) if options else []
+                spec = ConfirmationSpec(
+                    kind="question",
+                    prompt=str(call.args.get("question") or ""),
+                    options=tuple(str(item) for item in options),
+                    category="question",
+                    call_ids=(call.call_id,),
+                    multi_select=bool(call.args.get("multi_select", False)),
+                )
+                confirm_specs.append((call.call_id, spec))
+                continue
+
+            decide = getattr(self.gate, "decide", None)
+            if callable(decide):
+                decision = decide(tool, dict(call.args))
+            else:
+                decision = await self.gate.check(tool, dict(call.args))
+
+            if decision.verdict is Verdict.DENY:
+                tool_use = ToolUse(
+                    call_id=call.call_id, name=call.name, args=dict(call.args)
+                )
+                await machine.dispatch(
+                    ToolCallStarted(call_id=call.call_id, at=utc_now_iso())
+                )
+                call_id, result_json = await self._reject(
+                    tool_use,
+                    decision.reason or f"tool denied: {call.name}",
+                    verdict="denied",
+                )
+                await machine.dispatch(
+                    ToolCallFinished(
+                        call_id=call_id,
+                        status=CallStatus.FAILED,
+                        result_json=result_json,
+                        at=utc_now_iso(),
+                    )
+                )
+                self._finished_call_ids.add(call_id)
+                continue
+
+            if decision.verdict is Verdict.CONFIRM and decision.confirmation is not None:
+                confirm_specs.append((call.call_id, decision.confirmation))
+                continue
+
+            allow_calls.append(call)
+
+        return allow_calls, confirm_specs
 
     async def _persist_aborted_results(
         self, machine: AgentStateMachine, calls: tuple
@@ -1646,44 +1837,64 @@ class AgentLoop(PlanProgressMixin):
         return aborted
 
     async def _effect_await_confirmation(self, state: AgentState) -> EffectResult:
-        """Pause without spinning when no interactive port is wired (Task 6)."""
-        del state
-        if self.interactive is not None:
-            # Task 6 owns InteractivePort prompting.
-            return EffectResult(
-                RunFailed(
-                    kind="awaiting_confirmation_unsupported",
-                    message="awaiting confirmation interactive path is Task 6",
-                    at=utc_now_iso(),
-                )
+        """Prompt via InteractivePort; resolve; return ConfirmationResolved.
+
+        ``state`` has already been persisted as awaitingconfirmation before this
+        effect runs, so public ``state`` precedes ``interactive_request``.
+        """
+        # Confirmation already encodes the resume decision; do not re-classify
+        # writes as uncertain when tooluse runs after resolve.
+        self._is_resume = False
+        conf = state.confirmation
+        now = utc_now_iso()
+        if conf is None:
+            return EffectResult(ConfirmationResolved(approved=False, at=now))
+
+        spec = self._pending_confirm_spec
+        if spec is None:
+            spec = ConfirmationSpec(
+                kind=conf.kind,
+                prompt=conf.prompt,
+                options=tuple(conf.options),
+                category=conf.category,
+                call_ids=tuple(conf.call_ids),
             )
-        # No interactive: leave phase unchanged by not being invoked (runner pauses).
+        self._pending_confirm_spec = None
+
+        answer: str | None = None
+        port = self.interactive
+        if port is not None and hasattr(port, "prompt"):
+            answer = await port.prompt(spec)
+        elif callable(port):
+            kind = "question" if spec.kind == "question" else "confirm"
+            answer = await port(
+                kind,
+                spec.prompt,
+                list(spec.options),
+                multi_select=spec.multi_select,
+            )
+
+        if spec.kind == "question":
+            self._interaction_answer = answer
+            approved = True
+        else:
+            resolve = getattr(self.gate, "resolve", None)
+            if callable(resolve):
+                decision = resolve(spec, answer)
+                approved = decision.verdict is Verdict.ALLOW
+            else:
+                approved = answer in {"y", "y_remember", "y_session"}
+
+        if approved:
+            self._confirmation_approved_ids.update(spec.call_ids or conf.call_ids)
+
         return EffectResult(
-            RunFailed(
-                kind="awaiting_confirmation_unsupported",
-                message="awaiting confirmation phase is not wired in this task",
-                at=utc_now_iso(),
-            )
+            ConfirmationResolved(approved=approved, answer=answer, at=now)
         )
 
     async def _finish_run(self, state: AgentState) -> AgentTurnOutcome:
         """Emit answer/error/done and build AgentTurnOutcome from loop + counters."""
         tool_calls = state.tool_calls
-        if state.phase is AgentPhase.AWAITING_CONFIRMATION:
-            return AgentTurnOutcome(
-                answer="",
-                succeeded=False,
-                usage=self.usage,
-                error=None,
-                reason="awaiting_confirmation",
-                tool_calls=tool_calls,
-                retry_count=self.stats.retry_count,
-                tool_duration_ms=self.stats.snapshot().tool_duration_ms,
-                citations=self._citation_ids(),
-                trace=list(self.trace),
-                rounds=self.rounds,
-            )
-
         if state.phase is AgentPhase.COMPLETE and state.outcome is not None:
             if state.outcome.kind == "stopped":
                 return await self._stop_turn(tool_calls=tool_calls)
@@ -2054,7 +2265,24 @@ class AgentLoop(PlanProgressMixin):
             )
 
         # 治理链（docs 03.3.3）：先做权限判定，再执行 pre-hooks。
-        decision = await self.gate.check(tool, tool_use.args)
+        # 已经过 FSM 确认的调用跳过闸门，避免 plain "y" 再次变成 CONFIRM。
+        if tool_use.call_id in self._skip_permission_ids:
+            self._skip_permission_ids.discard(tool_use.call_id)
+            decision = GateDecision(Verdict.ALLOW, "用户已确认")
+        else:
+            decide = getattr(self.gate, "decide", None)
+            if callable(decide):
+                decision = decide(tool, tool_use.args)
+                if decision.verdict is Verdict.CONFIRM:
+                    # 不应在 execute 路径上再 await 用户；当作拒绝以免卡死。
+                    decision = GateDecision(
+                        Verdict.DENY,
+                        decision.reason
+                        or f"写类工具需确认，但当前无交互通道：{tool.name}",
+                        confirmation=None,
+                    )
+            else:
+                decision = await self.gate.check(tool, tool_use.args)
         if decision.verdict is Verdict.DENY:
             await self._audit(tool, tool_use.args, action="denied", verdict="deny")
             span.set_attribute("status", "denied")
@@ -2081,8 +2309,17 @@ class AgentLoop(PlanProgressMixin):
             tool_use.name, tool.timeout or default_timeout
         )
         started_at = self.stats.now()
-        if getattr(tool, "needs_interactive", False) and self.interactive is not None:
-            tool.interactive = self.interactive
+        if getattr(tool, "needs_interactive", False):
+            captured = self._interaction_answer
+            self._interaction_answer = None
+
+            async def _oneshot(
+                kind, prompt, options, *, multi_select: bool = False
+            ):
+                del kind, prompt, options, multi_select
+                return captured
+
+            tool.interactive = _oneshot
         # 对派发 sub-agent 的工具采用同样的模式（docs 03.10）：工具自身无法
         # 构建协调器，因此由循环把会话的协调器交给它。
         if getattr(tool, "needs_coordinator", False) and self.coordinator is not None:

@@ -52,9 +52,6 @@ class AgentRunner:
     async def run(self) -> AgentTurnOutcome:
         terminal = {AgentPhase.COMPLETE, AgentPhase.ERROR}
         while self.machine.state.phase not in terminal:
-            if self.machine.state.phase is AgentPhase.AWAITING_CONFIRMATION:
-                # Task 5: pause for recovery helpers; Task 6 wires InteractivePort.
-                return await self.effects.finish(self.machine.state)
             handler = self._handlers[self.machine.state.phase]
             event, messages = await handler(self.machine.state)
             await self.machine.dispatch(event, messages=messages)

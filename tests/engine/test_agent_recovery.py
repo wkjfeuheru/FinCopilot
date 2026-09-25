@@ -221,6 +221,132 @@ def test_recovery_marks_uncommitted_write_as_uncertain(tmp_path):
     assert "上次执行结果未知" in state.confirmation.prompt
 
 
+def seed_and_capture_pending_confirmation(tmp_path) -> str:
+    """Persist awaitingconfirmation after uncertain write; return prior request id.
+
+    ConfirmBus request_id is ephemeral and must not live in AgentState — the
+    previous id is only a stand-in for "what the client last saw".
+    """
+    from finharness.engine.state import ConfirmationState
+
+    store = seed_tool_state(
+        tmp_path,
+        calls=(
+            call(
+                "write",
+                permission="write",
+                status="uncertain",
+                name="write",
+            ),
+        ),
+    )
+    snapshot = SqliteAgentStateStore(store).latest_resumable("conv", "")
+    assert snapshot is not None
+    SqliteAgentStateStore(store).save(
+        replace(
+            snapshot,
+            revision=snapshot.revision + 1,
+            phase=AgentPhase.AWAITING_CONFIRMATION,
+            confirmation=ConfirmationState(
+                prompt="上次执行结果未知，是否重试该写操作？",
+                options=("y", "n"),
+                call_ids=("write",),
+                kind="permission",
+                category="write",
+                status="pending",
+            ),
+            updated_at="t2",
+        )
+    )
+    return "req_previous_ephemeral"
+
+
+async def resume_and_confirm(tmp_path, answer: str):
+    """Resume pending confirmation; return (new_request_id, outcome)."""
+    import uuid
+
+    from finharness.config.settings import PermissionSettings
+    from finharness.permissions.gate import PermissionGate
+    from finharness.types import EngineEvent
+    from tests.conftest import settings_with_cache
+
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[EngineEvent] = []
+
+        async def emit(self, event: EngineEvent) -> None:
+            self.events.append(event)
+
+    class AnsweringPort:
+        """InteractivePort that mints a fresh request_id (ConfirmBus-ephemeral)."""
+
+        def __init__(self, sink: Sink, answer: str) -> None:
+            self.sink = sink
+            self.answer = answer
+            self.request_ids: list[str] = []
+
+        async def prompt(self, spec) -> str | None:
+            request_id = f"req_{uuid.uuid4().hex[:10]}"
+            self.request_ids.append(request_id)
+            await self.sink.emit(
+                EngineEvent(
+                    "interactive_request",
+                    {
+                        "request_id": request_id,
+                        "kind": "confirm",
+                        "prompt": spec.prompt,
+                        "options": list(spec.options),
+                        "multi_select": bool(getattr(spec, "multi_select", False)),
+                    },
+                )
+            )
+            await self.sink.emit(
+                EngineEvent(
+                    "interaction_resolved",
+                    {
+                        "request_id": request_id,
+                        "answer": self.answer,
+                        "timeout": False,
+                    },
+                )
+            )
+            return self.answer
+
+    sink = Sink()
+    port = AnsweringPort(sink, answer)
+    tool = RecordingTool("write", content="wrote")
+    tool.permission = PermissionLevel.WRITE
+    base = _settings()
+    settings = settings_with_cache(
+        tmp_path,
+        permission=PermissionSettings(default_mode="default"),
+        context=base.context,
+        tools=base.tools,
+    )
+    loop = AgentLoop(
+        provider=ScriptedProvider([text_round("recovered")]),
+        registry=StubRegistry({"write": tool}, read_only=set()),
+        settings=settings,
+        system="test",
+        store=_memory(tmp_path),
+        conversation_id="conv",
+        user_id="",
+        gate=PermissionGate(settings=settings),
+        interactive=port,
+        output=sink,
+    )
+    outcome = await loop.run("", resume=True)
+    assert port.request_ids, "resume must reissue interactive_request"
+    return port.request_ids[0], outcome
+
+
+def test_restart_reissues_confirmation_with_new_request_id(tmp_path):
+    first_id = seed_and_capture_pending_confirmation(tmp_path)
+    second_id, outcome = asyncio.run(resume_and_confirm(tmp_path, "y"))
+    assert second_id != first_id
+    assert outcome.succeeded is True
+
+
 def test_cancel_abort_does_not_clobber_durable_finished_call(tmp_path):
     """Durable ToolCallFinished must win even if _finished_call_ids missed the id."""
     from finharness.engine.machine import AgentStateMachine
