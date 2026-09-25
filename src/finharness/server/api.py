@@ -33,7 +33,7 @@ from finharness.config.crypto import SecretCipher
 from finharness.config.settings import Settings
 from finharness.config.store import ConfigStore
 from finharness.context.memory.state_store import SqliteAgentStateStore
-from finharness.context.memory.store import MemoryStore
+from finharness.context.memory.store import MemoryStore, _snapshot_resumable
 from finharness.context.session import ResearchContext
 from finharness.data.access import DataAccess
 from finharness.data.adapters.akshare_adapter import AkShareAdapter
@@ -1183,20 +1183,21 @@ def create_app(
                 rendered.append(item)
         # 上一轮被停止时报告可继续（docs 03.3）：客户端据此在刷新后仍能显示
         # "继续研究"入口，而不是把一次中断当成一次普通的失败。
-        # FSM snapshot is authoritative when present; TurnCheckpoint is the
-        # legacy fallback until the first explicit resume creates a snapshot.
+        # FSM snapshot is authoritative when any row exists; TurnCheckpoint is
+        # the legacy fallback only when this conversation has never been snapshotted.
         state_store = SqliteAgentStateStore(memory_store)
-        snapshot = state_store.latest_resumable(conversation_id, user.id)
+        snapshot = state_store.latest(conversation_id, user.id)
         checkpoint = memory_store.load_latest_checkpoint(conversation_id)
         resumable = None
         if snapshot is not None:
-            outcome = snapshot.outcome
-            resumable = {
-                "reason": (outcome.reason if outcome is not None else None) or "",
-                "rounds": snapshot.turn,
-                "updated_at": snapshot.updated_at,
-                "state": public_state_view(snapshot),
-            }
+            if _snapshot_resumable(snapshot):
+                outcome = snapshot.outcome
+                resumable = {
+                    "reason": (outcome.reason if outcome is not None else None) or "",
+                    "rounds": snapshot.turn,
+                    "updated_at": snapshot.updated_at,
+                    "state": public_state_view(snapshot),
+                }
         elif checkpoint is not None and checkpoint.recoverable:
             resumable = {
                 "reason": checkpoint.reason,
@@ -1333,25 +1334,33 @@ def create_app(
                 headers={"Retry-After": str(turn_decision.retry_after_s)},
             )
 
-        # Explicit resume routing (before mark_busy): 409 when nothing to
-        # resume; FSM snapshot resumes in-place; recoverable TurnCheckpoint
-        # alone starts a new FSM run so hydrate can restore the old plan.
+        # Explicit resume routing (before mark_busy): FSM rows are authoritative.
+        # Resumable snapshot → resume in place; no rows + recoverable checkpoint
+        # → new FSM hydrate; any non-resumable FSM row → 409 (no checkpoint fallback).
         loop_resume = False
         run_message = request.message
         if request.resume:
             agent_states = SqliteAgentStateStore(memory_store)
-            snapshot = agent_states.latest_resumable(
-                session.conversation_id, user.id
-            )
-            checkpoint = memory_store.load_latest_checkpoint(session.conversation_id)
-            has_legacy = checkpoint is not None and checkpoint.recoverable
-            if snapshot is None and not has_legacy:
-                raise HTTPException(
-                    status_code=409,
-                    detail="no resumable agent state for this conversation",
+            latest = agent_states.latest(session.conversation_id, user.id)
+            if latest is not None:
+                if not _snapshot_resumable(latest):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="no resumable agent state for this conversation",
+                    )
+                run_message = request.message or ""
+                loop_resume = True
+            else:
+                checkpoint = memory_store.load_latest_checkpoint(
+                    session.conversation_id
                 )
-            run_message = request.message or ""
-            loop_resume = snapshot is not None
+                if checkpoint is None or not checkpoint.recoverable:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="no resumable agent state for this conversation",
+                    )
+                run_message = request.message or ""
+                loop_resume = False
 
         sink = QueueSink()
         session.loop.output = sink

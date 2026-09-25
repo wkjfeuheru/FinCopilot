@@ -23,6 +23,8 @@ class StateStore(Protocol):
 
     def save(self, state: AgentState, messages: tuple[Msg, ...] = ()) -> None: ...
 
+    def latest(self, conversation_id: str, user_id: str) -> AgentState | None: ...
+
     def latest_resumable(
         self, conversation_id: str, user_id: str
     ) -> AgentState | None: ...
@@ -74,9 +76,8 @@ class MemoryStateStore:
                     latest = state
         return latest
 
-    def latest_resumable(
-        self, conversation_id: str, user_id: str
-    ) -> AgentState | None:
+    def latest(self, conversation_id: str, user_id: str) -> AgentState | None:
+        """Newest snapshot for the conversation, regardless of resumable."""
         newest: AgentState | None = None
         newest_index = -1
         for index, state in enumerate(self._snapshots):
@@ -87,6 +88,12 @@ class MemoryStateStore:
             ):
                 newest = state
                 newest_index = index
+        return newest
+
+    def latest_resumable(
+        self, conversation_id: str, user_id: str
+    ) -> AgentState | None:
+        newest = self.latest(conversation_id, user_id)
         if newest is None or not _snapshot_resumable(newest):
             return None
         return newest
@@ -123,22 +130,26 @@ class SqliteAgentStateStore:
             return None
         return state_from_dict(json.loads(row["state_json"]))
 
-    def latest_resumable(
-        self, conversation_id: str, user_id: str
-    ) -> AgentState | None:
+    def latest(self, conversation_id: str, user_id: str) -> AgentState | None:
+        """Newest snapshot for the conversation, regardless of resumable."""
         with self._memory._connect() as connection:
             row = connection.execute(
-                "SELECT resumable, state_json FROM agent_state_snapshots"
+                "SELECT state_json FROM agent_state_snapshots"
                 " WHERE user_id = ? AND conversation_id = ?"
                 " ORDER BY id DESC LIMIT 1",
                 (user_id, conversation_id),
             ).fetchone()
-        if row is None or not int(row["resumable"]):
+        if row is None:
             return None
-        state = state_from_dict(json.loads(row["state_json"]))
-        if not _snapshot_resumable(state):
+        return state_from_dict(json.loads(row["state_json"]))
+
+    def latest_resumable(
+        self, conversation_id: str, user_id: str
+    ) -> AgentState | None:
+        newest = self.latest(conversation_id, user_id)
+        if newest is None or not _snapshot_resumable(newest):
             return None
-        return state
+        return newest
 
     def abandon_latest(
         self, conversation_id: str, user_id: str, *, now: str

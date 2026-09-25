@@ -122,6 +122,32 @@ def test_latest_resumable_ignores_older_when_newest_is_terminal(tmp_path):
     assert states.latest_resumable("conv", "u") is None
 
 
+def test_latest_returns_newest_even_when_non_resumable(tmp_path):
+    """latest() distinguishes no rows from newest non-resumable terminal."""
+    memory, states = stores(tmp_path)
+    assert states.latest("conv", "u") is None
+
+    thinking = transition(sample_state(), HydrationFinished(False, None, at="t1"))
+    states.save(thinking)
+    assert states.latest("conv", "u") == thinking
+    assert states.latest_resumable("conv", "u") == thinking
+
+    succeeded = transition(
+        thinking,
+        ModelFinished(answer="done", tool_uses=(), usage=UsageDelta(), at="t2"),
+    )
+    states.save(succeeded)
+    assert states.latest("conv", "u") == succeeded
+    assert states.latest_resumable("conv", "u") is None
+
+    mem = MemoryStateStore()
+    assert mem.latest("conv", "u") is None
+    mem.save(thinking)
+    mem.save(succeeded)
+    assert mem.latest("conv", "u") == succeeded
+    assert mem.latest_resumable("conv", "u") is None
+
+
 def test_abandon_latest_nonterminal_persists_abandoned_revision(tmp_path):
     memory, states = stores(tmp_path)
     thinking = transition(sample_state(), HydrationFinished(False, None, at="t1"))

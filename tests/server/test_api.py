@@ -1101,7 +1101,47 @@ def test_resume_with_legacy_checkpoint_starts_new_fsm_run(client):
 
     store = SqliteAgentStateStore(memory)
     assert store.latest_for_run(states[0]["run_id"], user_id) is not None
+    # Completed FSM is authoritative — no checkpoint-shaped resumable.
     body = client.get("/v1/conversations/c_ckpt/messages").json()
-    if body["resumable"] is not None and "state" in body["resumable"]:
-        assert "plan" not in body["resumable"]
-        assert body["resumable"]["state"]["run_id"] == states[0]["run_id"]
+    assert body["resumable"] is None
+
+
+def test_non_resumable_fsm_blocks_checkpoint_fallback(client):
+    """Once any FSM snapshot exists and is non-resumable, ignore leftover checkpoint.
+
+    History must not surface legacy plan/resumable; resume=true must 409.
+    """
+    from finharness.engine.state import HydrationFinished, ModelFinished, UsageDelta
+
+    memory = client.app.state.memory_store
+    user_id = client.finharness_user["id"]
+    memory.ensure_conversation("c_auth", user_id=user_id, title="t")
+    memory.append_messages("c_auth", [Msg.user("prior")])
+    memory.save_checkpoint(
+        "c_auth",
+        status="stopped",
+        reason="user_stopped",
+        rounds=2,
+        plan={"plan_id": "stale", "goal": "g", "steps": [{"seq": 1, "action": "a"}]},
+    )
+    store = SqliteAgentStateStore(memory)
+    hydrate = new_agent_state(
+        run_id="done_run", conversation_id="c_auth", user_id=user_id, now="t0"
+    )
+    thinking = transition(hydrate, HydrationFinished(False, None, at="t1"))
+    succeeded = transition(
+        thinking,
+        ModelFinished(answer="done", tool_uses=(), usage=UsageDelta(), at="t2"),
+    )
+    store.save(succeeded)
+
+    body = client.get("/v1/conversations/c_auth/messages").json()
+    assert body["resumable"] is None
+
+    response = client.post(
+        "/v1/chat/stream",
+        json={"conversation_id": "c_auth", "message": "", "resume": True},
+    )
+    assert response.status_code == 409
+    detail = str(response.json().get("detail", "")).lower()
+    assert "resumable" in detail
