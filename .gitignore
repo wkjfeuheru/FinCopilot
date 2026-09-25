@@ -47,5 +47,6 @@ evals/runs/
 .zcode/
 # Workflow-tool scratch output (task reports, cached runs); not project content.
 .superpowers/
+.worktrees/
 .superdesign/tmp/
 .workbuddy/
