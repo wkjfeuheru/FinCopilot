@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from finharness.permissions.gate import ConfirmationSpec
 from finharness.types import EngineEvent
 
 
@@ -41,6 +42,9 @@ class InteractionChannel:
       confirm — 批准写操作确认；
       deny    — 拒绝写操作确认；
       answer  — ask_user 以 ``answer`` 作答。
+
+    Implements ``InteractivePort.prompt`` so AgentLoop FSM confirmation can
+    use the same channel object passed as ``loop.interactive``.
     """
 
     def __init__(self, policy: str = "answer", answer: str = "综合") -> None:
@@ -53,7 +57,7 @@ class InteractionChannel:
         self.answer = answer
         self.log = []
 
-    async def prompt(self, spec: Any) -> str | None:
+    async def prompt(self, spec: ConfirmationSpec) -> str | None:
         """InteractivePort adapter used by the agent FSM confirmation phase."""
         kind = "question" if getattr(spec, "kind", "") == "question" else "confirm"
         return await self.ask(

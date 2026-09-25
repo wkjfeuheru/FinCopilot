@@ -1610,6 +1610,16 @@ class AgentLoop(PlanProgressMixin):
                 call.status is CallStatus.FAILED
                 and call.call_id not in results_by_id
             ):
+                tool_use = ToolUse(
+                    call_id=call.call_id, name=call.name, args=dict(call.args)
+                )
+                # Populate _call_meta so refused_tools / eval scorers see the name.
+                self._note_call(
+                    tool_use,
+                    ok=False,
+                    error="用户已拒绝该工具调用",
+                    duration_ms=0,
+                )
                 results_by_id[call.call_id] = json.dumps(
                     {
                         "ok": False,
@@ -1763,33 +1773,13 @@ class AgentLoop(PlanProgressMixin):
             else:
                 decision = await self.gate.check(tool, dict(call.args))
 
-            if decision.verdict is Verdict.DENY:
-                tool_use = ToolUse(
-                    call_id=call.call_id, name=call.name, args=dict(call.args)
-                )
-                await machine.dispatch(
-                    ToolCallStarted(call_id=call.call_id, at=utc_now_iso())
-                )
-                call_id, result_json = await self._reject(
-                    tool_use,
-                    decision.reason or f"tool denied: {call.name}",
-                    verdict="denied",
-                )
-                await machine.dispatch(
-                    ToolCallFinished(
-                        call_id=call_id,
-                        status=CallStatus.FAILED,
-                        result_json=result_json,
-                        at=utc_now_iso(),
-                    )
-                )
-                self._finished_call_ids.add(call_id)
-                continue
-
             if decision.verdict is Verdict.CONFIRM and decision.confirmation is not None:
                 confirm_specs.append((call.call_id, decision.confirmation))
                 continue
 
+            # DENY and ALLOW both execute via run_one → _execute_one so observer
+            # spans, SessionStats requests, and tool_status ordering stay unified.
+            # (Immediate partition-side _reject skipped those bookkeeping paths.)
             allow_calls.append(call)
 
         return allow_calls, confirm_specs
@@ -1878,6 +1868,16 @@ class AgentLoop(PlanProgressMixin):
                 list(spec.options),
                 multi_select=spec.multi_select,
             )
+        elif spec.kind != "question":
+            # Legacy PermissionGate(confirm=...) without InteractivePort.
+            callback = getattr(self.gate, "confirm", None)
+            if callable(callback):
+                for call in state.calls:
+                    if call.call_id not in (spec.call_ids or conf.call_ids):
+                        continue
+                    approved_bool = await callback(call.name, dict(call.args))
+                    answer = "y" if approved_bool else "n"
+                    break
 
         if spec.kind == "question":
             self._interaction_answer = answer
@@ -2092,8 +2092,16 @@ class AgentLoop(PlanProgressMixin):
             meta = self._call_meta.get(call_id)
             if meta is None:
                 ok, error, preview = self._decode_observation(rendered)
+                action_name = next(
+                    (action.name for action in actions if action.call_id == call_id),
+                    "",
+                )
                 meta = ObservedCall(
-                    call_id=call_id, name="", ok=ok, error=error, preview=preview
+                    call_id=call_id,
+                    name=action_name,
+                    ok=ok,
+                    error=error,
+                    preview=preview,
                 )
             observations.append(meta)
         self.trace.append(

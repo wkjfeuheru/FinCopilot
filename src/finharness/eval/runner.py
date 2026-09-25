@@ -376,8 +376,11 @@ class EvalRunner:
                     hooks=HookChain([audit]),
                     conversation_id=conversation_id,
                     store=store,
+                    output=sink,
                 )
-                loop.interactive = channel.ask
+                # InteractivePort: FSM confirmation uses channel.prompt(spec).
+                # PermissionGate still receives confirm=channel.confirm above.
+                loop.interactive = channel
                 for turn in turns:
                     channel.reset(turn.interactive, turn.interactive_answer)
                     sink.events = []
