@@ -334,7 +334,7 @@ def test_confirmation_request_and_resolution():
     assert resumed.calls[0].status is CallStatus.PENDING
 
 
-def test_confirmation_denied_completes_run():
+def test_confirmation_denied_returns_to_tooluse_with_failed_call():
     state = replace(
         new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0"),
         phase=AgentPhase.AWAITING_CONFIRMATION,
@@ -358,12 +358,29 @@ def test_confirmation_denied_completes_run():
     next_state = transition(
         state, ConfirmationResolved(approved=False, answer="n", at="t4")
     )
-    assert next_state.phase is AgentPhase.COMPLETE
-    assert next_state.outcome == RunOutcome(
-        kind="succeeded", reason="confirmation_denied", resumable=False
-    )
+    assert next_state.phase is AgentPhase.TOOL_USE
+    assert next_state.outcome is None
     assert next_state.confirmation is None
     assert next_state.calls[0].status is CallStatus.FAILED
+
+
+def test_stop_from_awaiting_confirmation_is_resumable_complete():
+    state = replace(
+        new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0"),
+        phase=AgentPhase.AWAITING_CONFIRMATION,
+        revision=3,
+        confirmation=ConfirmationState(
+            prompt="允许？",
+            options=("y", "n"),
+            call_ids=("w1",),
+            status="pending",
+        ),
+    )
+    next_state = transition(state, StopRequested(at="t4"))
+    assert next_state.phase is AgentPhase.COMPLETE
+    assert next_state.outcome == RunOutcome(
+        kind="stopped", reason="user_stopped", resumable=True
+    )
 
 
 def test_stop_maps_to_complete_stopped_resumable():

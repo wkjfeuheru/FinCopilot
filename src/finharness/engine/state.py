@@ -468,13 +468,9 @@ def transition(state: AgentState, event: AgentEvent) -> AgentState:
         return _advance(
             state,
             event,
-            phase=AgentPhase.COMPLETE,
+            phase=AgentPhase.TOOL_USE,
             confirmation=None,
             calls=_mark_calls(state.calls, call_ids, CallStatus.FAILED),
-            outcome=RunOutcome(
-                kind="succeeded", reason="confirmation_denied", resumable=False
-            ),
-            error=None,
         )
 
     if isinstance(event, StopRequested):
