@@ -56,6 +56,22 @@ def build_loop(tmp_path, provider, *, registry=None, output=None, settings=None,
     )
 
 
+def test_compaction_is_an_explicit_phase_before_thinking(tmp_path):
+    async def run_forced_compaction():
+        provider = ScriptedProvider([text_round("摘要"), text_round("答案")])
+        sink = Sink()
+        loop = build_loop(tmp_path, provider, output=sink)
+        for index in range(20):
+            loop.memory.append_user("撑满窗口的历史" * 5)
+            loop.memory.append_assistant(Msg(role="assistant", content="阶段回答" * 5))
+        await loop.run("问题")
+        return sink.events
+
+    events = asyncio.run(run_forced_compaction())
+    phases = [e.data["phase"] for e in events if e.kind == "state"]
+    assert phases[:3] == ["hydrate", "compact", "thinking"]
+
+
 def test_compaction_fires_when_the_window_is_exceeded(tmp_path):
     """较长的 transcript 应在请求发出前被折叠。"""
     provider = ScriptedProvider([text_round("ok")])

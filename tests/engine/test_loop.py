@@ -290,8 +290,33 @@ def make_loop(
     )
 
 
+def legacy_events(events: list[EngineEvent]) -> list[EngineEvent]:
+    """Filter out additive FSM ``state`` events for legacy assertions."""
+    return [event for event in events if event.kind != "state"]
+
+
 def kinds(events: list[EngineEvent]) -> list[str]:
-    return [event.kind for event in events]
+    return [event.kind for event in legacy_events(events)]
+
+
+def legacy_kinds(events: list[EngineEvent]) -> list[str]:
+    return kinds(events)
+
+
+async def run_text_loop(answer: str) -> tuple[AgentTurnOutcome, list[EngineEvent]]:
+    sink = Sink()
+    provider = ScriptedProvider([text_round(answer)])
+    loop = make_loop(provider, output=sink)
+    outcome = await loop.run("question")
+    return outcome, sink.events
+
+
+def test_text_only_run_emits_explicit_fsm_states():
+    outcome, events = asyncio.run(run_text_loop("answer"))
+    phases = [e.data["phase"] for e in events if e.kind == "state"]
+    assert phases == ["hydrate", "thinking", "complete"]
+    assert outcome.answer == "answer"
+    assert legacy_kinds(events)[-3:] == ["text_delta", "answer", "done"]
 
 
 def test_agent_turn_outcome_has_reason_and_tool_call_defaults():
@@ -334,6 +359,7 @@ def test_final_turn_emits_deltas_then_answer_then_done():
         return outcome, sink.events, loop.messages, provider
 
     outcome, events, messages, provider = asyncio.run(run())
+    events = legacy_events(events)
 
     assert kinds(events) == ["text_delta", "text_delta", "answer", "done"]
     assert [event.data["text"] for event in events[:2]] == ["hello", " world"]
@@ -408,6 +434,7 @@ def test_tool_round_streams_draft_then_resets_it_before_the_final_answer():
         return outcome, sink.events, loop.messages, provider, tool
 
     outcome, events, messages, provider, tool = asyncio.run(run())
+    events = legacy_events(events)
 
     # 文本在生成时即流式输出，因此草稿会一直可见，直到该 round
     # 被判定为 tool call；此时 text_reset 会清除它，只有最终
@@ -758,6 +785,7 @@ def test_provider_error_reports_reason_and_emits_one_error_and_one_done():
         return outcome, sink.events
 
     outcome, events = asyncio.run(run())
+    events = legacy_events(events)
 
     assert outcome.succeeded is False
     assert outcome.reason == "provider_error"
@@ -821,6 +849,7 @@ def test_cancelling_run_cancels_running_tools_and_never_emits_done():
         return sink.events, tool
 
     events, tool = asyncio.run(run())
+    events = legacy_events(events)
 
     assert tool.cancelled is True
     assert kinds(events) == ["tool_status"]
