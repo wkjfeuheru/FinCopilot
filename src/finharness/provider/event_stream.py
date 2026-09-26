@@ -7,7 +7,12 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from finharness.provider.errors import NetworkError
+from finharness.provider.errors import (
+    MalformedStreamError,
+    NetworkError,
+    OutputTruncatedError,
+    ToolArgumentsError,
+)
 from finharness.types import ToolUse, ToolUseDelta
 
 
@@ -44,17 +49,40 @@ class ToolUseAccumulator:
         tool_uses: list[ToolUse] = []
         for _, buffer in sorted(self._buffers.items()):
             if not buffer.call_id or not buffer.name:
-                raise NetworkError("Provider returned incomplete tool call")
+                raise ToolArgumentsError("Provider returned incomplete tool call")
             try:
                 arguments = json.loads(buffer.arguments or "{}")
             except json.JSONDecodeError as error:
-                raise NetworkError("Provider returned invalid tool arguments") from error
+                raise ToolArgumentsError("Provider returned invalid tool arguments") from error
             if not isinstance(arguments, dict):
-                raise NetworkError("Provider returned invalid tool arguments")
+                raise ToolArgumentsError("Provider returned invalid tool arguments")
             tool_uses.append(
                 ToolUse(call_id=buffer.call_id, name=buffer.name, args=arguments)
             )
         return tool_uses
+
+
+def finalize_tool_uses(
+    accumulator: ToolUseAccumulator, *, finish_reason: str | None = None
+) -> list[ToolUse]:
+    """构建工具调用；并用 ``finish_reason`` 区分"被截断"与"坏 JSON"。
+
+    参数解析失败有两类成因，处理方式不同：模型吐了坏 JSON（概率性，重试可解），
+    或输出触到 ``max_tokens`` 被服务端截断（预算不足，重试大概率仍截断，但值得
+    一次机会并应报出 ``OutputTruncatedError`` 让运维看到该调大预算）。
+
+    没有这个区分时，截断会被贴上 ``NetworkError`` 标签，看起来像网络故障，
+    真正的"输出不够长"信号就此丢失。
+    """
+    try:
+        return accumulator.build()
+    except MalformedStreamError as error:
+        if finish_reason == "length":
+            raise OutputTruncatedError(
+                "Provider output was truncated at max_tokens; "
+                "tool arguments are incomplete. Raise model.max_tokens."
+            ) from error
+        raise
 
 
 async def iter_sse_data(

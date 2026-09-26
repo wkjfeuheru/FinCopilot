@@ -44,7 +44,11 @@ class ModelSettings(FrozenModel):
     provider: str = "deepseek"
     model_name: str = "deepseek-chat"
     temperature: Annotated[float, Field(ge=0, le=2)] = 0.1
-    max_tokens: PositiveInt = 4096
+    # 单次回复的输出上限。4096 曾不够用：`write_report` 这类工具的参数本身就是
+    # 一份完整研报的正文，一旦触顶，工具参数会被截在半句 JSON 上，整轮以
+    # "invalid tool arguments" 失败（见 provider.errors.OutputTruncatedError）。
+    # 8192 是 deepseek 系列的默认输出上限，给最重的调用留出余量。
+    max_tokens: PositiveInt = 8192
     thinking: ThinkingSettings = Field(default_factory=ThinkingSettings)
 
 

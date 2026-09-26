@@ -6,8 +6,17 @@ import {
   reduceAgentState,
   type PublicAgentState,
 } from "../lib/agentState";
-import { planFromEvent, presentToolAction, presentToolProgress } from "../lib/researchPresentation";
+import {
+  asToolSummary,
+  planFromEvent,
+  presentLiveAction,
+  presentSkillAction,
+  presentToolAction,
+  presentToolProgress,
+  type ToolSummary,
+} from "../lib/researchPresentation";
 import type { ResearchPlan } from "../lib/researchPresentation";
+import type { SpawnTaskProgress } from "../lib/liveStatus";
 import { ResearchPlanLedger } from "./ResearchPlanLedger";
 
 /** 一步/一轮的执行状态。``stopped`` 是用户主动停止，刻意区别于 ``error``：
@@ -24,6 +33,10 @@ export type AgentStep = {
   tokens?: number;
   /** 该步产出的文件（图表、研报）。持久化在轮次事件中，使刷新后仍可还原。 */
   attachments?: string[];
+  /** 工具的线名，覆盖条与侧栏按它分组。 */
+  toolName?: string;
+  summary?: ToolSummary;
+  spawnTasks?: SpawnTaskProgress[];
 };
 
 export type TurnMetrics = {
@@ -59,8 +72,19 @@ function storedKind(name: string): AgentStep["kind"] {
   return "tool";
 }
 
-function storedLabel(name: string): string {
-  return presentToolAction(name);
+function storedLabel(name: string, summary: ToolSummary | undefined, started: boolean): string {
+  return presentLiveAction(name, summary, started ? "running" : "done");
+}
+
+function storedSpawnTasks(
+  name: string,
+  summary: ToolSummary | undefined,
+  started: boolean,
+  ok: boolean,
+): SpawnTaskProgress[] | undefined {
+  if (name !== "spawn_agent" || !summary?.tasks?.length) return undefined;
+  const status: SpawnTaskProgress["status"] = started ? "running" : ok ? "done" : "error";
+  return summary.tasks.map((task, index) => ({ index, task, status }));
 }
 
 function storedAgentLabel(name: string): string {
@@ -94,14 +118,18 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
       const name = String(data.name ?? "tool");
       const callId = String(data.call_id ?? name);
       const started = data.status === "started";
+      const summary = asToolSummary(data.summary);
       planned ||= name === "research_plan";
       upsert({
         key: callId,
         kind: storedKind(name),
-        label: storedLabel(name),
+        toolName: name,
+        label: storedLabel(name, summary, started),
         status: started ? "running" : data.ok === false ? "error" : "done",
         durationMs: started ? undefined : Number(data.duration_ms ?? 0) || undefined,
         detail: data.ok === false ? String(data.error ?? "执行失败") : undefined,
+        summary,
+        spawnTasks: storedSpawnTasks(name, summary, started, data.ok !== false),
         // 工具产出的文件随事件持久化，重建 trace 时一并还原，
         // 否则刷新后产出文件一栏会消失。只在完成事件上写入，
         // 避免覆盖已记录的文件。
@@ -121,7 +149,14 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
           steps = steps.map((step) => (step.key === callId ? { ...step, detail } : step));
         } else {
           const name = String(data.name ?? "tool");
-          upsert({ key: callId, kind: storedKind(name), label: storedLabel(name), status: "running", detail });
+          upsert({
+            key: callId,
+            kind: storedKind(name),
+            toolName: name,
+            label: storedLabel(name, undefined, true),
+            status: "running",
+            detail,
+          });
         }
       }
     }
@@ -144,7 +179,8 @@ export function traceFromStoredTurn(turn: StoredTurn): TurnTrace {
         upsert({
           key: `routed-${skills.join(",")}`,
           kind: "skill",
-          label: "注入研究方法",
+          toolName: "skill",
+          label: presentSkillAction(skills, "done"),
           status: "done",
           detail: skills.join("、"),
         });
@@ -318,7 +354,15 @@ export function AgentTrace({ trace }: { trace: TurnTrace }) {
               <StepMark status={step.status} />
               <span className="trace-step-kind">{KIND_LABELS[step.kind]}</span>
               <span className="trace-step-body">
-                <strong>{step.label}</strong>
+                <strong>
+                  {step.toolName
+                    ? presentLiveAction(
+                        step.toolName,
+                        step.summary,
+                        step.status === "running" ? "running" : "done",
+                      )
+                    : step.label}
+                </strong>
                 {step.detail && <small>{step.detail}</small>}
               </span>
               <span className="trace-step-tail">

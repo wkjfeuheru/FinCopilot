@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from finharness.eval.runner import CaseRun
 from finharness.eval.schema import EvalCase
@@ -68,6 +69,34 @@ def _contains_refusal(text: str, extra: list[str] | None = None) -> bool:
     return any(marker in text for marker in markers)
 
 
+# 排行工具的观测里，结论行把前几名写成「第 1 名 煤炭 +0.63%；第 2 名 …」，
+# 表格行则写成「| 1 | 801950 | 煤炭 | +0.63% | …」。两种都要能解析，因为观测
+# 只保留定长前缀（200 字），结论行通常是唯一完整落在其中的部分。
+_RANK_HEADLINE_RE = re.compile(r"第\s*(\d+)\s*名\s*([^\s%；;|\-]+)")
+_RANK_TABLE_RE = re.compile(r"\|\s*(\d+)\s*\|\s*[^|]*\|\s*([^|]+?)\s*\|")
+
+
+def _top_names_from_observations(turn: Any, top_n: int) -> list[str]:
+    """从该轮的工具观测里取「排行前 N 名」的实体名（按排名去重、保序）。
+
+    用来把「有没有真的告诉用户是哪几个」变成确定性断言：判据是**观测到的事实**
+    （工具返回的排行），而不是写死某个日期的名次，因此与运行日期无关。
+    """
+    ranked: dict[int, str] = {}
+    for round_trace in getattr(turn, "trace", []) or []:
+        for observation in getattr(round_trace, "observations", []) or []:
+            preview = getattr(observation, "preview", "") or ""
+            if not preview:
+                continue
+            for pattern in (_RANK_HEADLINE_RE, _RANK_TABLE_RE):
+                for match in pattern.finditer(preview):
+                    rank = int(match.group(1))
+                    name = match.group(2).strip()
+                    if rank and rank not in ranked and name:
+                        ranked[rank] = name
+    return [ranked[rank] for rank in sorted(ranked)[:top_n]]
+
+
 def score_task(case: EvalCase, run: CaseRun) -> DimensionScore:
     """对任务完成率打分：逐轮校验答案、引用与产物等验收标准。"""
     score = DimensionScore(dimension="task")
@@ -125,6 +154,16 @@ def score_task(case: EvalCase, run: CaseRun) -> DimensionScore:
                 f"turn{index + 1}_matches_any",
                 bool(matched),
                 f"需命中其一正则 {expect.matches_any}；命中 {matched}",
+            )
+        if expect.top_names_from_observations:
+            names = _top_names_from_observations(run.turns[index], expect.top_names_from_observations)
+            missing = [name for name in names if name not in answer]
+            score.add(
+                f"turn{index + 1}_top_names_in_answer",
+                bool(names) and not missing,
+                f"排行前 {expect.top_names_from_observations} 名未在答案中点名：{missing}"
+                if missing
+                else f"点名了排行前 {expect.top_names_from_observations} 名：{names}",
             )
         if expect.min_chars is not None:
             score.add(

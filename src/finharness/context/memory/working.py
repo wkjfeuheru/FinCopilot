@@ -84,6 +84,23 @@ class WorkingMemory:
                 self.used_tokens += counted.tokens
                 self._exact = self._exact and counted.exact
 
+    def fixed_tokens(self, *, system: str, tools: list[dict], extra_text: str = "") -> int:
+        """窗口中压缩无法触及的部分：system prompt + 工具 schema + 状态块。
+
+        压缩只删除 ``raw`` 里的消息，因此这是窗口的下界。理解它有实际后果：
+        当压缩阈值低于这个地板时，"把窗口拉回预算内"在数学上不可达——即便折叠
+        掉全部历史，窗口仍是地板那么大，于是每轮都触发压缩却什么也解决不了。
+        调用方据此判断阈值是否可满足（``threshold_is_reachable``）。
+        """
+        total = self.counter.count(system).tokens
+        if extra_text:
+            total += self.counter.count(extra_text).tokens
+        for schema in tools:
+            function = schema.get("function", {})
+            total += self.counter.count(str(function.get("description", ""))).tokens
+            total += self.counter.count(str(function.get("parameters", ""))).tokens
+        return total
+
     def request_tokens(self, *, system: str, tools: list[dict], extra_text: str = "") -> int:
         """下一次请求的估算大小（压缩所针对的数值）。
 
@@ -94,17 +111,29 @@ class WorkingMemory:
         块，它在每次迭代中追加到待发送消息上（docs 3.3）。遗漏它会低估窗口大小，
         让请求在压缩察觉之前就已溢出。
         """
-        total = self.counter.count(system).tokens
+        total = self.fixed_tokens(system=system, tools=tools, extra_text=extra_text)
         # _message_texts 对每条消息都返回一个生成器，因此先展平再计数。
         for message in self.raw:
             total += self.counter.count_many(_message_texts(message))
-        if extra_text:
-            total += self.counter.count(extra_text).tokens
-        for schema in tools:
-            function = schema.get("function", {})
-            total += self.counter.count(str(function.get("description", ""))).tokens
-            total += self.counter.count(str(function.get("parameters", ""))).tokens
         return total
+
+    def compaction_threshold(self) -> int:
+        """触发压缩的窗口水位：``compaction_ratio × context_window_tokens``。"""
+        return int(
+            self.settings.context.compaction_ratio
+            * self.settings.context.context_window_tokens
+        )
+
+    def threshold_is_reachable(
+        self, *, system: str, tools: list[dict], extra_text: str = ""
+    ) -> bool:
+        """压缩能否真的把窗口降到阈值以下。
+
+        需要 ``floor + 至少一轮`` 才能成立：只比地板大一点点（或干脆小于地板）
+        的阈值意味着压缩达标无望，此时应当告警而非静默地每轮空转。
+        """
+        floor = self.fixed_tokens(system=system, tools=tools, extra_text=extra_text)
+        return floor < self.compaction_threshold()
 
     def usage(self, *, system: str, tools: list[dict], extra_text: str = "") -> WindowUsage:
         return WindowUsage(
@@ -119,10 +148,9 @@ class WorkingMemory:
         window = self.settings.context.context_window_tokens
         if window <= 0:
             return False
-        threshold = window * self.settings.context.compaction_ratio
         return (
             self.request_tokens(system=system, tools=tools, extra_text=extra_text)
-            >= threshold
+            >= self.compaction_threshold()
         )
 
     # -- 窗口维护 --------------------------------------------------------------

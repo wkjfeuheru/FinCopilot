@@ -160,6 +160,7 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 @media (prefers-reduced-motion: reduce) {
   .turn-trace-running .trace-pulse { animation: none; }
   .inline-running-dot { animation: none; }
+  .live-status-pulse-running { animation: none; }
   .plan-progress-track span { transition: none; }
 }
 .trace-content { padding: 2px 14px 14px; border-top: 1px solid #e3e9ed; }
@@ -199,6 +200,70 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
 .trace-step-tail em { padding: 2px 6px; border: 1px solid #d5dfe5; border-radius: 3px; background: #fff; color: #667989; font-family: "Segoe UI", "PingFang SC", sans-serif; font-style: normal; white-space: nowrap; }
 .trace-step-running .trace-step-tail em { border-color: #a8cfc7; background: #ebf6f3; color: #176b63; }
 .trace-step-error .trace-step-tail em { border-color: #e6c5c5; background: #fff1f0; color: #a53c3c; }
+
+/* Cursor-style live overlay: one blotter of what the agent is doing now. */
+.live-status { margin: 0 0 18px; }
+.live-status-rows { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.live-status-row {
+  display: grid;
+  grid-template-columns: 14px 44px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  width: 100%;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid #d4e0d9;
+  border-left: 3px solid #176b63;
+  border-radius: 2px;
+  background: #f4f8f6;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.live-status-row:hover { background: #eef5f2; }
+.live-status-row:focus-visible { outline: 2px solid #299b8d; outline-offset: 2px; }
+.live-status-done .live-status-row { border-color: #d5dde3; border-left-color: #247552; background: #f7f9fa; }
+.live-status-error .live-status-row { border-color: #e6c5c5; border-left-color: #b64444; background: #fff8f7; }
+.live-status-stopped .live-status-row { border-color: #d5dde3; border-left-color: #5b6b7a; background: #f6f7f8; }
+.live-status-pulse {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border: 2px solid #176b63;
+  border-radius: 50%;
+  background: #d9eee9;
+}
+.live-status-pulse-running { animation: trace-pulse 1.6s ease-out infinite; }
+.live-status-pulse-done { border-color: #247552; background: #247552; }
+.live-status-pulse-error { border-color: #b64444; background: #b64444; }
+.live-status-pulse-stopped { border-color: #5b6b7a; background: #dfe5ea; }
+.live-status-kind { padding-top: 2px; color: #718394; font-family: var(--mono); font-size: 10px; letter-spacing: .04em; }
+.live-status-body { display: grid; gap: 2px; min-width: 0; }
+.live-status-body strong { color: #1f3a4a; font-size: 13px; font-weight: 650; line-height: 1.5; overflow-wrap: anywhere; }
+.live-status-body small { color: #718394; font-size: 11px; line-height: 1.5; }
+.live-status-hint { padding-top: 2px; color: #8aa0a8; font-size: 10px; letter-spacing: .06em; white-space: nowrap; }
+.activity-group { padding: 0; border-bottom: 1px solid #eef1f4; }
+.activity-group:last-child { border-bottom: 0; }
+.activity-group-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.activity-group-summary::-webkit-details-marker { display: none; }
+.activity-group-summary::after {
+  content: "+";
+  margin-left: auto;
+  color: #718394;
+  font-family: var(--mono);
+  font-size: 14px;
+}
+.activity-group details[open] > .activity-group-summary::after { content: "−"; }
+.activity-children { margin: 0 0 8px 30px; padding: 0; list-style: none; border-left: 1px dashed #d5e0e6; }
+.activity-children .activity-item { padding: 7px 0 7px 12px; }
 
 .plan-progress { margin: 12px 0 5px; padding: 13px 14px 11px; border-left: 3px solid #aa7c24; background: #fbf8ef; }
 .plan-progress-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: #665021; font-size: 11px; }
@@ -389,6 +454,8 @@ h1 { margin-bottom: 0; font-size: 25px; font-weight: 650; letter-spacing: -.7px;
   .trace-step { grid-template-columns: 20px 44px minmax(0, 1fr); gap: 7px; }
   .trace-step-tail { grid-column: 3; justify-content: flex-start; padding-top: 0; }
   .turn-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 18px -14px -14px; }
+  .live-status-hint { display: none; }
+  .live-status-row { grid-template-columns: 14px 44px minmax(0, 1fr); }
   .turn-metric:nth-child(2) { border-right: 0; }
   .turn-metric:nth-child(-n+2) { border-bottom: 1px solid #dde5ea; }
   .source-sidebar { grid-template-columns: minmax(0, 1fr); }

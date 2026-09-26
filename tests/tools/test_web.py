@@ -141,6 +141,8 @@ def test_web_search_is_lazy_and_read_only():
 
 def test_reviewer_cannot_reach_the_web():
     """web tool 选择退出 review：reviewer 检查的是报告，而非网络。"""
+    from finharness.tools.registry import general_tool_names, review_tool_names
+
     names = review_tool_names()
 
     assert "web_search" not in names
@@ -148,6 +150,7 @@ def test_reviewer_cannot_reach_the_web():
     # 而非对整个 GENERIC 组的一刀切移除。
     assert "read_file" in names
     assert "get_financials" in names
+    assert "web_search" in general_tool_names()
 
 
 def test_missing_key_surfaces_as_a_structured_error(tmp_path):

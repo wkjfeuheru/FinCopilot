@@ -197,16 +197,18 @@ def test_complex_task_nudge_mentions_replanning(tmp_path):
     asyncio.run(loop.run("复杂任务"))
     refused = loop.messages[-1] if loop.messages else None
 
-    # 在各 tool result 中找出拒绝 payload。
     payloads = [
         json.loads(raw)
         for m in loop.messages
         if m.role == "tool_result"
         for _, raw in m.tool_results
     ]
-    refusals = [p for p in payloads if p["ok"] is False and "重复" in (p["error"] or "")]
-    assert refusals, "expected a refusal payload"
-    assert "research_plan" in refusals[0]["error"]
+    replays = [
+        payload
+        for payload in payloads
+        if payload["ok"] is True and "research_plan" in (payload.get("content") or "")
+    ]
+    assert replays, "expected a replayed result that mentions research_plan"
     assert refused is not None
 
 
@@ -222,10 +224,36 @@ def test_simple_task_nudge_does_not_mention_replanning(tmp_path):
         if m.role == "tool_result"
         for _, raw in m.tool_results
     ]
-    refusals = [p for p in payloads if p["ok"] is False and "重复" in (p["error"] or "")]
+    replays = [
+        payload
+        for payload in payloads
+        if payload["ok"] is True and "spawn_agent" in (payload.get("content") or "")
+    ]
 
-    assert refusals
-    assert "research_plan" not in refusals[0]["error"]
+    assert replays
+    assert "research_plan" not in replays[0]["content"]
+
+
+def test_first_offence_replays_the_prior_successful_result(tmp_path):
+    """第一次违规不打工具：把上次成功结果以 ok=true 回放，并提示 spawn。"""
+    tool = RecordingTool("get_quote", content="报价 100")
+    provider = ScriptedProvider(repeated_rounds(3))
+    loop = build_loop(tmp_path, provider, registry=StubRegistry({"get_quote": tool}))
+
+    asyncio.run(loop.run("查报价"))
+    payloads = [
+        json.loads(raw)
+        for message in loop.messages
+        if message.role == "tool_result"
+        for _, raw in message.tool_results
+    ]
+
+    assert len(tool.calls) == 2
+    replay = payloads[-1]
+    assert replay["ok"] is True
+    assert "报价 100" in replay["content"]
+    assert "spawn_agent" in replay["content"]
+    assert replay.get("error") in (None, "")
 
 
 def test_counts_reset_between_runs(tmp_path):
@@ -309,3 +337,75 @@ def test_threshold_is_configurable(tmp_path):
     # 阈值为 2：第二次相同调用即为第一次违规。
     assert len(tool.calls) == 1
     assert outcome.succeeded is False
+
+
+def test_failed_repeat_abort_includes_the_original_error(tmp_path):
+    """先前已经失败的相同调用被掐断时，中止信息必须带上那次错误。"""
+    tool = RecordingTool("run_backtest", ok=False, error="未知变量：pe_ttm")
+    provider = ScriptedProvider(
+        [
+            tool_round(ToolUse(f"call_{index}", "run_backtest", {"factor_expr": "rank(-1*pe_ttm)"}))
+            for index in range(5)
+        ]
+    )
+    sink = Sink()
+    loop = build_loop(
+        tmp_path, provider, registry=StubRegistry({"run_backtest": tool}), output=sink
+    )
+
+    outcome = asyncio.run(loop.run("回测低市盈率"))
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "loop_detected"
+    assert "未知变量：pe_ttm" in outcome.answer
+    assert "不要原样重试" in outcome.answer
+    error = next(event for event in sink.events if event.kind == "error")
+    assert "未知变量：pe_ttm" in error.data["message"]
+    assert "不要原样重试" in error.data["message"]
+    # 前两次真正执行，第三次提醒，第四次中止；工具不应再被调用。
+    assert len(tool.calls) == 2
+
+
+def test_second_offence_with_findings_wraps_up_without_error(tmp_path):
+    """有成果时第二次违规改为无工具收尾：成功结束，不发 error。"""
+    tool = RecordingTool("get_quote", content="报价")
+    provider = ScriptedProvider(
+        [
+            tool_round(ToolUse(f"call_{index}", "get_quote", {"symbol": "600519"}))
+            for index in range(4)
+        ]
+        + [text_round("产能过剩是结构性的，价格已接近现金成本。")]
+    )
+    sink = Sink()
+    loop = build_loop(tmp_path, provider, registry=StubRegistry({"get_quote": tool}), output=sink)
+    loop.ctx.add_conclusion("已确认报价为 100 元", ["cit_000001"])
+
+    outcome = asyncio.run(loop.run("交叉印证产能过剩"))
+
+    assert outcome.succeeded is True
+    assert "结构性" in outcome.answer
+    assert not any(event.kind == "error" for event in sink.events)
+    assert [event.kind for event in sink.events].count("done") == 1
+    assert len(tool.calls) == 2
+    assert provider.requests[-1]["tools"] == []
+
+
+def test_empty_wrap_up_falls_back_to_loop_detected(tmp_path):
+    """有成果但收尾空答时，仍按 loop_detected 失败。"""
+    tool = RecordingTool("get_quote", content="报价")
+    provider = ScriptedProvider(
+        [
+            tool_round(ToolUse(f"call_{index}", "get_quote", {"symbol": "600519"}))
+            for index in range(4)
+        ]
+        + [text_round("")]
+    )
+    sink = Sink()
+    loop = build_loop(tmp_path, provider, registry=StubRegistry({"get_quote": tool}), output=sink)
+    loop.ctx.add_conclusion("已确认报价为 100 元", ["cit_000001"])
+
+    outcome = asyncio.run(loop.run("查报价"))
+
+    assert outcome.succeeded is False
+    assert outcome.reason == "loop_detected"
+    assert any(event.kind == "error" and event.data.get("reason") == "loop_detected" for event in sink.events)

@@ -8,7 +8,7 @@ from finharness.engine.cost import SessionStats
 from finharness.engine.loop import AgentLoop
 from finharness.engine.retry import RetryPolicy
 from finharness.provider.base import Provider
-from finharness.provider.errors import RateLimitError
+from finharness.provider.errors import OutputTruncatedError, RateLimitError
 from finharness.provider.fake import FakeProvider
 from finharness.tools.base import PermissionLevel
 from finharness.tools.registry import ToolRegistry
@@ -122,6 +122,27 @@ class ChunkThenErrorProvider(Provider):
         self.calls += 1
         yield StreamChunk(StreamEvent.TEXT_DELTA, "partial")
         raise self.error
+
+
+class TruncatedThenGoodProvider(Provider):
+    """首次尝试流出半份内容后被截断，第二次才成功。
+
+    用来验证"作废并重放"：截断错误发生在流结束处，重试层先发 RESTART，
+    loop 必须丢弃第一次的草稿，最终答案只含第二次的正文。
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    async def stream(
+        self, *, system: str, messages: list, tools: list[dict], usage: ModelUsage
+    ):
+        self.calls += 1
+        if self.calls == 1:
+            yield StreamChunk(StreamEvent.TEXT_DELTA, "半份草稿")
+            raise OutputTruncatedError("truncated at max_tokens")
+        yield StreamChunk(StreamEvent.TEXT_DELTA, "完整答案")
+        yield message_end()
 
 
 class RecordingTool:
@@ -317,6 +338,49 @@ def test_text_only_run_emits_explicit_fsm_states():
     assert phases == ["hydrate", "thinking", "complete"]
     assert outcome.answer == "answer"
     assert legacy_kinds(events)[-3:] == ["text_delta", "answer", "done"]
+
+
+def test_multi_entity_analysis_injects_a_mandatory_fanout_ordering():
+    """引擎判定"多实体逐实体分析"后，必须下发强制编排指令并激活 spawn_agent。
+
+    这是确定性触发：仅靠提示词劝导，模型会走串行取数（实测隐式触发率很低），
+    因此引擎把"必须扇出"这一要求放到 state 块末尾（注意力最强处）。
+    """
+    class ActivatingRegistry(StubRegistry):
+        def __init__(self):
+            super().__init__()
+            self.activated: list[str] = []
+
+        def activate(self, name):  # noqa: D102
+            self.activated.append(name)
+            return True
+
+    async def run_capture(prompt):
+        sink = Sink()
+        registry = ActivatingRegistry()
+        provider = ScriptedProvider([text_round("ok")])
+        loop = make_loop(provider, registry=registry, output=sink)
+        await loop.run(prompt)
+        # 捕获每次请求实际发给模型的 system/messages，找到 state 块。
+        return registry, provider, sink
+
+    # 命中：两家公司的逐实体分析。
+    registry, provider, sink = asyncio.run(run_capture("对比茅台(600519)与五粮液(000858)的盈利能力"))
+    assert "spawn_agent" in registry.activated
+    kinds_seen = [e.kind for e in sink.events]
+    assert "fanout_routed" in kinds_seen
+    sent = "\n".join(
+        str(getattr(m, "content", "") or "")
+        for m in provider.requests[0]["messages"]
+    )
+    assert "本轮编排要求" in sent and "spawn_agent" in sent
+    # 提示是"本轮强制编排要求"，而非仅静态提示词里的泛泛描述。
+    assert "不要" in sent and "拆" in sent
+
+    # 不命中：单实体，不应触发。
+    registry2, _p2, sink2 = asyncio.run(run_capture("分析贵州茅台(600519)近三年 ROE 趋势"))
+    assert "spawn_agent" not in registry2.activated
+    assert "fanout_routed" not in [e.kind for e in sink2.events]
 
 
 def test_agent_turn_outcome_has_reason_and_tool_call_defaults():
@@ -978,6 +1042,9 @@ def test_provider_retry_recovers_before_the_first_chunk_and_counts_retries():
     assert done["retry_count"] == 2
     assert done["tool_duration_ms"] == 0
     assert kinds(events) == ["text_delta", "answer", "done"]
+    # 每步 state 也反映重试压力：终态公共视图的 retry_count 已累加。
+    state_events = [e for e in events if e.kind == "state"]
+    assert state_events[-1].data["retry_count"] == 2
 
 
 def test_provider_retry_exhaustion_fails_with_retry_count_in_done():
@@ -1032,6 +1099,39 @@ def test_provider_failure_after_a_chunk_is_not_retried():
     assert events[-1].data["retry_count"] == 0
 
 
+def test_truncated_output_is_retried_and_the_draft_discarded():
+    """输出被截断时重放：丢弃第一次的草稿，答案只含第二次的正文。
+
+    这是线上那次研报失败的回归：截断过去统一报 NetworkError 且不重试，
+    于是整轮失败；现在它可重试，且重试前必须清掉已流出的半份内容。
+    """
+
+    async def run():
+        sink = Sink()
+        provider = TruncatedThenGoodProvider()
+        loop = make_loop(
+            provider,
+            output=sink,
+            retry_policy=RetryPolicy(max_retries=4, base_delay_s=0.0, cap_delay_s=0.0),
+        )
+        outcome = await loop.run("写一份研报")
+        return outcome, sink.events, provider
+
+    outcome, events, provider = asyncio.run(run())
+
+    assert provider.calls == 2, "the truncated attempt must be replayed"
+    assert outcome.succeeded is True
+    assert outcome.answer == "完整答案"
+    # 草稿被 text_reset 作废：它既不在最终答案里，也不该留在 transcript 中。
+    assert "半份草稿" not in outcome.answer
+    kinds_ = kinds(events)
+    assert "text_reset" in kinds_, "the client must be told to clear the stale draft"
+    assert [e.data["text"] for e in events if e.kind == "text_delta"] == [
+        "半份草稿",
+        "完整答案",
+    ]
+
+
 def test_tool_timing_and_accumulated_stats_reach_the_done_event():
     async def run():
         sink = Sink()
@@ -1063,6 +1163,33 @@ def test_tool_timing_and_accumulated_stats_reach_the_done_event():
     assert done["tool_calls"] == 1
     assert done["retry_count"] == 0
     assert done["tool_duration_ms"] == 250
+
+
+def test_tool_status_carries_allowlisted_summary():
+    """前端覆盖条需要在 started 时就知道标的，不能等工具跑完。"""
+
+    async def run():
+        sink = Sink()
+        tool = RecordingTool("get_industry_perf", content="行业")
+        registry = StubRegistry({"get_industry_perf": tool})
+        provider = ScriptedProvider(
+            [
+                tool_round(
+                    ToolUse("call_1", "get_industry_perf", {"industry": "白酒", "years": 1})
+                ),
+                text_round("ok"),
+            ]
+        )
+        loop = make_loop(provider, registry=registry, output=sink)
+        await loop.run("白酒行业表现")
+        return sink.events
+
+    events = asyncio.run(run())
+    statuses = [event.data for event in events if event.kind == "tool_status"]
+    assert statuses[0]["status"] == "started"
+    assert statuses[0]["summary"]["industry"] == "白酒"
+    assert statuses[1]["summary"]["industry"] == "白酒"
+    assert "years" in statuses[0]["summary"]
 
 
 def test_unknown_and_denied_tools_count_as_requests_without_duration():

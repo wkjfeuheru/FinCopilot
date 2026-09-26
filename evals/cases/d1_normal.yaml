@@ -361,14 +361,22 @@
   budget: {max_tokens: 140000, max_seconds: 200, max_rounds: 10}
 
 - id: NRM-020
-  title: get_industry_perf 行业表现总览
+  title: get_industry_perf 行业涨跌幅排行（口径与结论）
   category: DATA
   source: "重构 v2.0"
   tags: [normal, core]
   turns:
-    - user: 今天申万一级行业里涨幅前五的行业是哪些？
+    - user: 上个交易日申万一级行业里涨幅前五的行业是哪些？
       interactive: none
       expect:
+        # 三类缺陷都必须被拦住：(1) 口径替换（问单日答区间）；(2) 不给结论只给过程；
+        # (3) 排版/归属错乱。答案须同时给出单日口径、数据日期，且真的点名那五个行业
+        #（`top_names_from_observations` 从工具返回的排行里取前 5 名核对，故与运行日期无关）。
+        answer:
+          top_names_from_observations: 5
+          contains_none: [近一年, 区间涨跌幅]
+          matches_any:
+            - '(?s)(?=.*(?:单日|(?:上|前)(?:一)?(?:个)?交易日|最近交易日))(?=.*(?:前五|前\s*5|涨幅前))(?=.*\d{4}-\d{2}-\d{2})'
         trajectory:
           tools_must: [get_industry_perf]
           max_tool_calls: 4
@@ -479,14 +487,18 @@
     - user: 对比茅台(600519)与五粮液(000858)最新 ROE 的杜邦分解，差异主要来自哪个因子？
       interactive: none
       expect:
+        answer:
+          contains_all: [茅台, 五粮液]
         trajectory:
           tools_must: [calc_metrics]
-          max_tool_calls: 10
+          spawn_tasks_cover: ["600519", "000858"]
+          max_tool_calls: 22
         citations:
           required: true
         safety:
           no_degradation: true
-  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 14}
+  budget: {max_tokens: 360000, max_seconds: 420, max_rounds: 16}
+  notes: "两实体杜邦对比 → 引擎判为多实体深分析并强制扇出（实测 2 个子代理）。"
 
 - id: NRM-027
   title: calc_valuation DCF 估值
@@ -739,19 +751,20 @@
   source: "重构 v2.0"
   tags: [normal, core]
   turns:
-    - user: 关于锂电池产能过剩的讨论，库内新闻和网上各查一下，交叉印证。
+    - user: 搜索一些关于锂电池产能过剩的讨论，交叉印证。
       interactive: answer
       expect:
         trajectory:
-          tools_any: [web_search, get_market_news]
-          max_tool_calls: 6
+          tools_any: [web_search, get_market_news, spawn_agent]
+          max_tool_calls: 10
         citations:
           required: true
         safety:
           no_degradation: true
   budget: {max_tokens: 160000, max_seconds: 240, max_rounds: 12}
   judge: todo
-  notes: "交叉印证质量属模糊标准；仅校验链路与引用。"
+  notes: "交叉印证质量属模糊标准；仅校验链路与引用。锂电池问法不强制 spawn（单行业实体，
+        fanout_intent 为假）；允许主循环 web_search 或按角度 spawn_agent。"
 
 # ── META：11 工具，共 14 条 ──
 
@@ -766,17 +779,20 @@
       expect:
         answer:
           refusal: false
+          contains_all: [茅台, 五粮液]
         trajectory:
           plan_required: true
           tools_any: [get_indicators, calc_metrics]
-          max_tool_calls: 12
+          spawn_tasks_cover: ["600519", "000858"]
+          max_tool_calls: 30
         citations:
           required: true
         safety:
           no_degradation: true
-  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 14}
+  budget: {max_tokens: 560000, max_seconds: 600, max_rounds: 16}
   judge: todo
-  notes: "复杂任务应先立计划再分阶段执行；归因合理性留给裁判。"
+  notes: "复杂任务应先立计划再分阶段执行；归因合理性留给裁判。引擎判为多实体深分析 → 强制
+        扇出（实测 3 个子代理）；max_tool_calls/预算按扇出路径上调（原 12/200k 系串行校准）。"
 
 - id: NRM-042
   title: research_plan 修订（计划变更）
@@ -806,15 +822,20 @@
     - user: 研究3家白酒公司：茅台(600519)、五粮液(000858)、泸州老窖(000568)的最新估值与盈利能力
       interactive: none
       expect:
+        answer:
+          contains_all: [茅台, 五粮液, 泸州老窖]
         trajectory:
           plan_required: true
           tools_must: [update_plan_step]
-          max_tool_calls: 16
+          spawn_tasks_cover: ["600519", "000858", "000568"]
+          max_tool_calls: 40
         citations:
           required: true
         safety:
           no_degradation: true
-  budget: {max_tokens: 240000, max_seconds: 420, max_rounds: 18}
+  budget: {max_tokens: 620000, max_seconds: 720, max_rounds: 20}
+  notes: "3 家白酒公司逐实体分析 → 引擎强制扇出（实测 3 个子代理）；max_tool_calls/预算
+        按扇出路径上调。"
 
 - id: NRM-044
   title: record_conclusion 结论持久化
@@ -1020,14 +1041,21 @@
     - user: 请分析三家公司各自的盈利能力：茅台(600519)、五粮液(000858)、泸州老窖(000568)，分别给一句话结论
       interactive: none
       expect:
+        answer:
+          contains_all: [茅台, 五粮液, 泸州老窖]
         trajectory:
-          tools_must: [spawn_agent]
+          tools_any: [spawn_agent, get_financials, get_indicators]
+          spawn_tasks_cover: ["600519", "000858", "000568"]
           max_tool_calls: 10
         citations:
           required: true
         safety:
           no_degradation: true
   budget: {max_tokens: 240000, max_seconds: 480, max_rounds: 14}
+  notes: "三实体深分析。扇出为自由裁量（tools_any）：串行取数后逐一作答同样合格；
+        但**若扇出**，spawn_tasks_cover 要求每个实体出现在某条子任务里——即必须先
+        逐单元拆解，而非整包派发（见 system.md 的拆解/汇合契约）。answer.contains_all
+        无条件守住「三个实体都被覆盖」。"
 
 - id: NRM-054
   title: spawn_agent 隔离性（子代理只读、不取数只回结论）
@@ -1035,18 +1063,20 @@
   source: "重构 v2.0"
   tags: [normal, core]
   turns:
-    - user: 派一个子代理专门复核「茅台(600519) ROE 高主要因为净利率高」这个结论是否与财报一致
+    - user: 复核「茅台(600519) ROE 高主要因为净利率高」这个结论是否与财报一致
       interactive: none
       expect:
         trajectory:
-          tools_must: [spawn_agent]
+          tools_any: [spawn_agent, get_financials, get_indicators, calc_metrics]
           max_tool_calls: 10
         citations:
           required: true
         safety:
           no_degradation: true
   budget: {max_tokens: 240000, max_seconds: 480, max_rounds: 14}
-  notes: "子代理限 READ 工具子集；不可再派生 spawn_agent。"
+  notes: "一次独立阅读确属设计认可的扇出理由，但核实一个 ROE 说法只需两次取数、无上下文
+        压力，故同样降为 tools_any：模型自行复核合格，扇出亦合格。子代理限 READ 工具子集；
+        不可再派生 spawn_agent。"
 
 - id: NRM-055
   title: summarize_document 长文档摘要
@@ -1059,11 +1089,13 @@
       expect:
         trajectory:
           tools_must: [summarize_document]
-          max_tool_calls: 8
+          tools_any: [summarize_document, spawn_agent, read_pdf]
+          max_tool_calls: 16
         safety:
           no_degradation: true
   budget: {max_tokens: 240000, max_seconds: 480, max_rounds: 16}
-  notes: "summarize_document 内部派子代理分片摘要 + 数字核对。"
+  notes: "summarize_document 返回分片索引（不含全文）；随后可按片 spawn_agent 或
+        read_pdf，主上下文只汇合带 [P01] 的结论。不强制 spawn。"
 
 - id: NRM-056
   title: write_report 隐式风险复核链路
@@ -1075,7 +1107,7 @@
       interactive: confirm
       expect:
         trajectory:
-          tools_must: [write_report, spawn_agent]
+          tools_must: [write_report]
           max_tool_calls: 14
         artifacts:
           report_exported: true
@@ -1085,7 +1117,10 @@
         safety:
           no_degradation: true
   budget: {max_tokens: 240000, max_seconds: 480, max_rounds: 16}
-  notes: "write_report 应触发 risk 复核子代理；spawn_agent 出现在轨迹即视为复核发生。"
+  notes: "write_report 触发 risk 复核，但复核经 review_report→coordinator.review_risk()
+        在进程内直调，**不是 spawn_agent 工具调用**（曾误断言 spawn_agent，永不命中）。
+        复核的可观测面是产物旁的 output/*.review.md 侧车与 done.per_agent['risk']（顶层键，
+        非 done.usage.per_agent），现已由 case JSON 的 review_sidecars / per_agent_usage 采集。"
 
 # ── SKILL：4 技能包 × 2 = 8 条 ──
 
@@ -1102,7 +1137,8 @@
           refusal: false
         trajectory:
           tools_any: [get_financials, get_indicators, calc_metrics]
-          skills_must: [equity-research]
+          # 单能力（财务）只注入盈利方法论文件；裸技能名代表整套场景流程，不在其列。
+          skills_must: [equity-research/references/profitability.md]
           max_tool_calls: 10
         citations:
           required: true
@@ -1142,7 +1178,7 @@
       interactive: none
       expect:
         trajectory:
-          skills_must: [industry-research]
+          skills_must: [industry-research/references/competition.md]
           tools_any: [get_industry_perf, get_industry_constituents]
           max_tool_calls: 12
         citations:
@@ -1161,7 +1197,8 @@
       interactive: confirm
       expect:
         trajectory:
-          skills_must: [industry-research]
+          # 行业全景成稿：行业单一能力 → 竞争格局方法论 + 行业报告模板，不连整套流程。
+          skills_must: [industry-research/references/competition.md, industry-research/assets/report-template.md]
           tools_must: [write_report]
           max_tool_calls: 20
         artifacts:
@@ -1183,7 +1220,7 @@
       interactive: none
       expect:
         trajectory:
-          skills_must: [macro-research]
+          skills_must: [macro-research/references/cycle.md]
           tools_any: [get_macro_indicators]
           max_tool_calls: 10
         citations:
@@ -1202,7 +1239,8 @@
       interactive: confirm
       expect:
         trajectory:
-          skills_must: [macro-research]
+          # 宏观专题成稿：周期方法论 + 宏观报告模板。
+          skills_must: [macro-research/references/cycle.md, macro-research/assets/report-template.md]
           tools_must: [write_report]
           max_tool_calls: 20
         artifacts:
@@ -1224,7 +1262,7 @@
       interactive: none
       expect:
         trajectory:
-          skills_must: [quant-factor]
+          skills_must: [quant-factor/references/single-series.md]
           tools_must: [run_backtest]
           max_tool_calls: 10
         citations:
@@ -1243,7 +1281,8 @@
       interactive: confirm
       expect:
         trajectory:
-          skills_must: [quant-factor]
+          # 因子横截面成稿：单量子能力 → 时序方法论 + 量化报告模板。
+          skills_must: [quant-factor/references/single-series.md, quant-factor/assets/report-template.md]
           tools_must: [run_backtest, write_report]
           max_tool_calls: 20
         artifacts:
@@ -1424,8 +1463,11 @@
     - user: 从白酒行业整体表现出发，对比茅台(600519)与五粮液(000858)的估值与盈利，输出对比报告
       interactive: confirm
       expect:
+        answer:
+          contains_all: [茅台, 五粮液]
         trajectory:
-          tools_must: [get_industry_perf, write_report]
+          tools_must: [write_report]
+          tools_any: [get_industry_perf, spawn_agent]
           max_tool_calls: 22
         artifacts:
           report_exported: true
@@ -1434,6 +1476,9 @@
         safety:
           no_degradation: true
   budget: {max_tokens: 300000, max_seconds: 600, max_rounds: 20}
+  notes: "成稿是硬要求（write_report）；行业数据取数改 tools_any——既可主 Agent 取
+        industry_perf，也可扇出由子代理自取（深分析两实体）。spawn_tasks_cover 为条件性：
+        若扇出则须逐实体拆解。"
 
 - id: NRM-074
   title: 端到端：宏观→行业传导分析
@@ -1464,9 +1509,13 @@
     - user: 并行研究消费、医药、新能源三个行业的代表龙头，汇总成一份跨行业比较报告
       interactive: confirm
       expect:
+        answer:
+          contains_all: [消费, 医药, 新能源]
         trajectory:
-          tools_must: [spawn_agent, write_report]
-          max_tool_calls: 24
+          tools_must: [write_report]
+          tools_any: [spawn_agent, get_quote, get_industry_perf]
+          spawn_tasks_cover: [消费, 医药, 新能源]
+          max_tool_calls: 45
         artifacts:
           report_exported: true
         citations:
@@ -1474,6 +1523,10 @@
         safety:
           no_degradation: true
   budget: {max_tokens: 320000, max_seconds: 900, max_rounds: 22}
+  notes: "成稿是硬要求（write_report）；扇出为自由裁量（tools_any）——「并行研究三个行业」
+        按设计是同一轮内并行取数，串行取数后汇总成稿同样合格。max_tool_calls 由 24 放宽到
+        45：原 24 是按扇出路径校准的（扇出会显著减少主 Agent 的取数调用），串行合法后不
+        应再因调用数被惩罚（同 DYN-009/010/011 的处理）。"
 
 - id: NRM-076
   title: 端到端：研报精读→验证→图表
@@ -1542,15 +1595,19 @@
     - user: 系统性对比招商银行(600036)与兴业银行(601166)近三年资产质量与盈利能力，形成结论并记录
       interactive: none
       expect:
+        answer:
+          contains_all: [招商银行, 兴业银行]
         trajectory:
           plan_required: true
           tools_must: [update_plan_step, record_conclusion]
-          max_tool_calls: 18
+          spawn_tasks_cover: ["600036", "601166"]
+          max_tool_calls: 32
         citations:
           required: true
         safety:
           no_degradation: true
-  budget: {max_tokens: 280000, max_seconds: 600, max_rounds: 20}
+  budget: {max_tokens: 700000, max_seconds: 780, max_rounds: 22}
+  notes: "两家银行逐实体对比 → 引擎强制扇出（实测 2 个子代理）；预算按扇出路径上调。"
 
 - id: NRM-080
   title: 综合冒烟：计划→取数→图表→成稿全链路

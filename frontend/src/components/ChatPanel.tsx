@@ -23,7 +23,9 @@ import { enqueue, resolve } from "../lib/interactionQueue";
 import { Message, MessageList } from "./MessageList";
 import type { Activity } from "./SourceSidebar";
 import type { AgentStep, TurnTrace } from "./AgentTrace";
-import { planFromEvent, presentToolAction, presentToolProgress } from "../lib/researchPresentation";
+import { planFromEvent, presentLiveAction, presentSkillAction, presentToolAction, presentToolProgress, asToolSummary } from "../lib/researchPresentation";
+import type { ToolSummary } from "../lib/researchPresentation";
+import type { SpawnTaskProgress } from "../lib/liveStatus";
 import { ResearchWelcome } from "./ResearchWelcome";
 
 type Props = {
@@ -38,6 +40,7 @@ type Props = {
   onCitations: (citations: Citation[]) => void;
   activities: Activity[];
   onActivities: (update: (current: Activity[]) => Activity[]) => void;
+  onFocusActivity?: (tool?: string) => void;
   /**
    * 父组件为这个对话保存的快照。服务端只持久化
    * 可读轮次，因此执行 trace 由客户端内存快照保留；
@@ -120,17 +123,28 @@ function artifactsFromMessages(messages: Message[]): Artifact[] {
 }
 
 /** 所有可见执行记录都使用同一份用户语言词典。 */
-function activityLabel(name: string): string {
-  return presentToolAction(name);
-}
-
 function traceKind(name: string): AgentStep["kind"] {
   if (name === "research_plan") return "plan";
   return "tool";
 }
 
-function traceLabel(name: string): string {
-  return presentToolAction(name);
+function traceLabel(name: string, summary: ToolSummary | undefined, running: boolean): string {
+  return presentLiveAction(name, summary, running ? "running" : "done");
+}
+
+function spawnTasksFromSummary(
+  name: string,
+  summary: ToolSummary | undefined,
+  status: SpawnTaskProgress["status"],
+): SpawnTaskProgress[] | undefined {
+  if (name !== "spawn_agent" || !summary?.tasks?.length) return undefined;
+  return summary.tasks.map((task, index) => ({ index, task, status }));
+}
+
+function closeRunningSkills(steps: AgentStep[]): AgentStep[] {
+  return steps.map((step) =>
+    step.kind === "skill" && step.status === "running" ? { ...step, status: "done" as const } : step,
+  );
 }
 
 function agentLabel(name: string): string {
@@ -150,6 +164,7 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
     onCitations,
     activities,
     onActivities,
+    onFocusActivity,
     cachedView,
     resumable,
     onResume,
@@ -172,9 +187,6 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
   // 最近一次提交的提问，供错误气泡的重试按钮复用。
   const lastPromptRef = useRef<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  // 正在执行的工具/步骤。它进到正在生成的消息内部（而非只出现在
-  // composer 上方）：视线停在消息区时也能看到"还在推进"。
-  const [activeTool, setActiveTool] = useState<string | null>(null);
   // 待用户作答的提示（引擎暂停）。用队列而非单值：同一轮里并发的多个
   // 工具确认或提问会先后到达，单值覆盖会让先到的提示连同它的 request_id
   // 一起消失，那个请求便再也无法被应答，只能等满服务端 TTL 被判拒绝。
@@ -396,6 +408,7 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
       },
     ]);
     setBusy(true);
+    setStatus("理解问题并确定研究路径");
     settledRef.current = false;
     // 记住这轮的提问：错误气泡用它提供一键重试。resume 无用户提问可重试。
     lastPromptRef.current = resume ? null : message;
@@ -429,26 +442,76 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
             }
           }
         }
+        if (event.event === "context_routed") {
+          const skills = (event.data.skills as string[] | undefined) ?? [];
+          if (skills.length) {
+            const label = presentSkillAction(skills, "running");
+            setStatus(label);
+            updateTrace((trace) => ({
+              ...trace,
+              steps: [
+                ...closeRunningSkills(trace.steps).map((step) =>
+                  step.key === "analysis" ? { ...step, status: "done" as const } : step,
+                ),
+                {
+                  key: `routed-${skills.join(",")}`,
+                  kind: "skill",
+                  toolName: "skill",
+                  label,
+                  status: "running",
+                  detail: skills.join("、"),
+                },
+              ],
+            }));
+            emitActivities((current) => [
+              ...current.filter((item) => item.tool !== "skill"),
+              {
+                key: `routed-${skills.join(",")}`,
+                tool: "skill",
+                label,
+                status: "running",
+                detail: skills.join("、"),
+              },
+            ]);
+          }
+        }
         if (event.event === "tool_status") {
           const name = String(event.data.name ?? "tool");
           const callId = String(event.data.call_id ?? name);
           const state = String(event.data.status ?? "");
-          setStatus(`${presentToolAction(name)}${state === "started" ? "中" : state === "completed" ? "已完成" : "未完成"}`);
-          setActiveTool(state === "started" ? presentToolAction(name) : null);
+          const summary = asToolSummary(event.data.summary);
+          const liveLabel = traceLabel(name, summary, state === "started");
+          setStatus(state === "started" ? liveLabel : `${presentToolAction(name)}${state === "completed" ? "已完成" : "未完成"}`);
           if (state === "started") {
             updateTrace((trace) => ({
               ...trace,
               planned: trace.planned || name === "research_plan",
               steps: [
-                ...trace.steps
+                ...closeRunningSkills(trace.steps)
                   .map((step) => step.key === "analysis" ? { ...step, status: "done" as const } : step)
                   .filter((step) => step.key !== callId),
-                { key: callId, kind: traceKind(name), label: traceLabel(name), status: "running" },
+                {
+                  key: callId,
+                  kind: traceKind(name),
+                  toolName: name,
+                  label: liveLabel,
+                  status: "running",
+                  summary,
+                  spawnTasks: spawnTasksFromSummary(name, summary, "running"),
+                },
               ],
             }));
+            const spawnActivities = summary?.tasks?.length
+              ? summary.tasks.map((task, index) => ({
+                  key: `${callId}-${index}`,
+                  tool: name,
+                  label: `正在研究：${task}`,
+                  status: "running" as const,
+                }))
+              : [{ key: callId, tool: name, label: liveLabel, status: "running" as const }];
             emitActivities((current) => [
-              ...current.filter((item) => item.key !== callId),
-              { key: callId, label: activityLabel(name), status: "running" },
+              ...current.filter((item) => item.key !== callId && !item.key.startsWith(`${callId}-`)),
+              ...spawnActivities,
             ]);
           } else {
             const attachments = (event.data.attachments as string[] | undefined) ?? [];
@@ -459,36 +522,71 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
               const completed: AgentStep = {
                 key: callId,
                 kind: traceKind(name),
-                label: traceLabel(name),
+                toolName: name,
+                label: liveLabel,
                 status: stepStatus,
                 durationMs: duration > 0 ? duration : undefined,
                 detail: event.data.ok === false ? String(event.data.error ?? "执行失败") : undefined,
-                // 文件随步骤保存，使其与刷新后还原的历史走同一渲染路径。
+                summary,
+                spawnTasks: spawnTasksFromSummary(
+                  name,
+                  summary,
+                  event.data.ok === false ? "error" : "done",
+                ),
                 attachments: attachments.length ? attachments : undefined,
               };
               return {
                 ...trace,
                 planned: trace.planned || name === "research_plan",
                 steps: existing
-                  ? trace.steps.map((step) => step.key === callId ? { ...step, ...completed } : step)
+                  ? trace.steps.map((step) => step.key === callId
+                    ? {
+                        ...step,
+                        ...completed,
+                        spawnTasks: completed.spawnTasks ?? step.spawnTasks?.map((task) => ({
+                          ...task,
+                          status: event.data.ok === false ? "error" as const : "done" as const,
+                        })),
+                      }
+                    : step)
                   : [...trace.steps, completed],
               };
             });
-            emitActivities((current) => [
-              ...current.filter((item) => item.key !== callId),
-              {
-                key: callId,
-                label: activityLabel(name),
-                status: event.data.ok === false ? "error" : "done",
-                detail:
-                  event.data.ok === false
-                    ? String(event.data.error ?? "执行失败")
-                    : duration > 0
-                      ? `耗时 ${duration} ms`
-                      : undefined,
-                attachments,
-              },
-            ]);
+            emitActivities((current) => {
+              const related = current.filter((item) => item.key === callId || item.key.startsWith(`${callId}-`));
+              if (related.length > 1) {
+                return current.map((item) =>
+                  item.key === callId || item.key.startsWith(`${callId}-`)
+                    ? {
+                        ...item,
+                        status: event.data.ok === false ? "error" as const : "done" as const,
+                        detail:
+                          event.data.ok === false
+                            ? String(event.data.error ?? "执行失败")
+                            : duration > 0
+                              ? `耗时 ${duration} ms`
+                              : item.detail,
+                      }
+                    : item,
+                );
+              }
+              return [
+                ...current.filter((item) => item.key !== callId),
+                {
+                  key: callId,
+                  tool: name,
+                  label: liveLabel,
+                  status: event.data.ok === false ? "error" : "done",
+                  detail:
+                    event.data.ok === false
+                      ? String(event.data.error ?? "执行失败")
+                      : duration > 0
+                        ? `耗时 ${duration} ms`
+                        : undefined,
+                  attachments,
+                },
+              ];
+            });
             if ((event.data.citations as string[] | undefined)?.length) refreshCitations();
           }
         }
@@ -498,19 +596,55 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
         if (event.event === "tool_progress") {
           const callId = String(event.data.call_id ?? "");
           const detail = presentToolProgress(event.data);
-          if (callId && detail) {
-            setStatus(detail);
-            setActiveTool((current) => current ?? "正在推进");
+          const phase = String(event.data.phase ?? "");
+          if (callId && (detail || phase === "spawn")) {
+            if (detail) {
+              setStatus(detail);
+            }
             updateTrace((trace) => ({
               ...trace,
-              steps: trace.steps.map((step) =>
-                step.key === callId && step.status === "running" ? { ...step, detail } : step,
-              ),
+              steps: trace.steps.map((step) => {
+                if (step.key !== callId || step.status !== "running") return step;
+                if (phase === "spawn") {
+                  const index = Number(event.data.index ?? 0);
+                  const task = String(event.data.task ?? "");
+                  const spawnStatus = String(event.data.status ?? "started");
+                  const mapped: SpawnTaskProgress["status"] =
+                    spawnStatus === "failed" ? "error" : spawnStatus === "completed" ? "done" : "running";
+                  const current = step.spawnTasks ?? [];
+                  const next = current.some((item) => item.index === index)
+                    ? current.map((item) =>
+                        item.index === index ? { ...item, task: task || item.task, status: mapped } : item,
+                      )
+                    : [...current, { index, task, status: mapped }];
+                  return { ...step, detail: detail ?? step.detail, spawnTasks: next };
+                }
+                return detail ? { ...step, detail } : step;
+              }),
             }));
             emitActivities((current) =>
-              current.map((item) =>
-                item.key === callId && item.status === "running" ? { ...item, detail } : item,
-              ),
+              current.map((item) => {
+                if (phase === "spawn") {
+                  const index = Number(event.data.index ?? 0);
+                  if (item.key === `${callId}-${index}`) {
+                    const spawnStatus = String(event.data.status ?? "started");
+                    return {
+                      ...item,
+                      status:
+                        spawnStatus === "failed"
+                          ? "error"
+                          : spawnStatus === "completed"
+                            ? "done"
+                            : "running",
+                      label: detail ?? item.label,
+                    };
+                  }
+                  return item;
+                }
+                return item.key === callId && item.status === "running" && detail
+                  ? { ...item, detail }
+                  : item;
+              }),
             );
           }
         }
@@ -537,6 +671,7 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
             ...current,
             {
               key: `compact-${current.length}`,
+              tool: "compact",
               label: "压缩上下文",
               status: "info",
               detail: `${before} → ${after} tokens${degraded ? "（摘要降级）" : ""}`,
@@ -589,6 +724,7 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
             ...current,
             {
               key: `ask-${current.length}`,
+              tool: "ask",
               label: event.data.kind === "confirm" ? "等待写入确认" : "等待用户回答",
               status: "running",
               detail: prompt,
@@ -658,18 +794,20 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
             status: "error",
             steps: trace.steps.map((step) => step.status === "running" ? { ...step, status: "error" as const } : step),
           }));
-          // 优先使用通俗易懂的提示，而非引擎原始消息；``reason``
-          // 用于区分预算耗尽与供应商失败。
+          // 预算耗尽与供应商失败用固定说明。重复调用则展示引擎带上的
+          // 具体原因（例如上次工具错误），避免一律写成「重复取数」。
           const reasonText: Record<string, string> = {
-            loop_detected: "检测到重复取数，已提前结束本轮",
             max_turns_exhausted: "达到轮次上限，已提前结束本轮",
             provider_error: "模型调用失败，本轮未能完成",
           };
           const reason = String(event.data.reason ?? "");
-          const message = String(event.data.message ?? "Unknown error");
+          const message = String(event.data.message ?? "");
+          const text = reason === "loop_detected"
+            ? (message || "检测到重复调用，已提前结束本轮")
+            : (reasonText[reason] ?? (message || "Unknown error"));
           setMessages((current) => [
             ...current,
-            { role: "error", text: reasonText[reason] ?? message, retryPrompt: lastPromptRef.current ?? undefined },
+            { role: "error", text, retryPrompt: lastPromptRef.current ?? undefined },
           ]);
         }
         if (event.event === "answer") {
@@ -737,7 +875,6 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
             setNotice("已停止本轮生成，已获取的数据与结论已保留，可继续研究。");
           }
           setStatus(null);
-          setActiveTool(null);
           updateInteractions([]);
           refreshCitations();
           // 本轮结束（无论是停止还是正常完成），可继续状态由服务端说了算。
@@ -780,7 +917,6 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           ),
         }));
         setStatus(null);
-        setActiveTool(null);
         updateInteractions([]);
         if (stopped) {
           setNotice("已停止本轮生成，已获取的数据与结论已保留，可继续研究。");
@@ -855,14 +991,9 @@ export const ChatPanel = forwardRef<ChatPanelHandle, Props>(function ChatPanel(
           )}
           <ResearchWelcome onUsePrompt={sendPrompt} />
         </>
-      ) : <MessageList messages={messages} citations={citations} onRetry={retryPrompt} />}
+      ) : <MessageList messages={messages} citations={citations} onRetry={retryPrompt} onOpenProcess={onFocusActivity} />}
+      <div className="sr-only" aria-live="polite">{status ?? ""}</div>
       {notice && <div className="engine-notice">{notice}</div>}
-      {busy && activeTool && (
-        <div className="inline-running-status">
-          <span className="inline-running-dot" aria-hidden="true" />
-          {activeTool === "正在推进" ? status : activeTool}
-        </div>
-      )}
       {artifacts.length > 0 && (
         <div className="artifact-list" aria-label="产出文件">
           <span className="artifact-title">产出文件</span>

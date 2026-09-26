@@ -20,8 +20,13 @@ class StubCoordinator:
         self.results = results
         self.calls: list[dict] = []
 
-    async def spawn(self, *, tasks, focus, context=None):
+    async def spawn(self, *, tasks, focus, context=None, on_task=None):
         self.calls.append({"tasks": tasks, "focus": focus, "context": context})
+        if on_task is not None:
+            total = len(tasks)
+            for index, task in enumerate(tasks):
+                await on_task(index, total, task, "started")
+                await on_task(index, total, task, "completed")
         return self.results
 
 
@@ -112,8 +117,71 @@ def test_an_empty_task_list_is_a_validation_error():
     assert "tasks" in result.error
 
 
+def test_a_single_task_naming_multiple_symbols_is_rejected():
+    """窄范围拆解校验：一条任务里塞多个标的 → 派生不出隔离单元，要求拆解。"""
+    tool, _ = make_tool([])
+
+    result = run(tool.run(tasks=["分析茅台(600519)与五粮液(000858)的盈利能力"]))
+
+    assert result.ok is False
+    assert "拆解" in result.error
+
+
+def test_the_same_symbols_across_separate_tasks_are_allowed():
+    """逐实体拆解后放行（这才是扇出的正确形态）。"""
+    tool, coordinator = make_tool(
+        [
+            SubAgentResult(focus="general", task="分析茅台", summary="甲"),
+            SubAgentResult(focus="general", task="分析五粮液", summary="乙"),
+        ]
+    )
+
+    result = run(
+        tool.run(tasks=["分析茅台(600519)的盈利能力", "分析五粮液(000858)的盈利能力"])
+    )
+
+    assert result.ok is True, result.error
+    assert len(coordinator.calls[0]["tasks"]) == 2
+
+
+def test_a_single_entity_task_is_not_rejected():
+    """单标的深分析（不可拆）合法——它本就该由主 Agent 直接处理或单派。"""
+    tool, coordinator = make_tool(
+        [SubAgentResult(focus="general", task="分析茅台", summary="甲")]
+    )
+
+    result = run(tool.run(tasks=["分析茅台(600519)近三年 ROE 趋势"]))
+
+    assert result.ok is True, result.error
+
+
 def test_the_tool_is_lazy_read_only_meta():
     assert SpawnAgentTool.permission is PermissionLevel.READ
     assert SpawnAgentTool.group is ToolGroup.META
     assert SpawnAgentTool.needs_coordinator is True
+    assert SpawnAgentTool.needs_progress is True
     assert SpawnAgentTool.tier is Tier.LAZY
+
+
+def test_each_task_is_reported_on_the_progress_channel():
+    tool, _ = make_tool(
+        [
+            SubAgentResult(focus="general", task="摘要甲文件", summary="甲"),
+            SubAgentResult(focus="general", task="摘要乙文件", summary="乙"),
+        ]
+    )
+    payloads: list[dict] = []
+
+    async def progress(payload: dict) -> None:
+        payloads.append(dict(payload))
+
+    tool.progress = progress
+    result = run(tool.run(tasks=["摘要甲文件", "摘要乙文件"]))
+
+    assert result.ok is True, result.error
+    phases = [(item["phase"], item["index"], item["status"], item["task"]) for item in payloads]
+    assert ("spawn", 0, "started", "摘要甲文件") in phases
+    assert ("spawn", 1, "started", "摘要乙文件") in phases
+    assert ("spawn", 0, "completed", "摘要甲文件") in phases
+    assert ("spawn", 1, "completed", "摘要乙文件") in phases
+    assert payloads[0]["total"] == 2

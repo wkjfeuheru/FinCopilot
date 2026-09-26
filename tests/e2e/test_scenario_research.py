@@ -167,6 +167,33 @@ def test_industry_question_may_use_industry_data_tool(tmp_path):
     assert outcome.citations
 
 
+def test_ranking_question_is_answered_in_the_single_day_frame(tmp_path):
+    """「上个交易日涨幅前五」必须用单日口径作答，且收敛在少数几次取数内。
+
+    回归防线：一次真实运行把这个问题答成了一年区间收益排行，并且逐个取 31 个行业
+    的历史再自行拼接（34 次工具调用、表格错行、没有一句结论）。排行能力（一次取回
+    全部一级行业并按涨跌幅排序）应把它压到 1–2 次调用。
+    """
+    import re
+
+    loop = _build_loop(tmp_path)
+
+    outcome = _run(loop, "上个交易日申万一级行业里涨幅前五的行业是哪些？")
+
+    assert outcome.succeeded is True, outcome.error
+    calls = [c for c in loop.cite.all() if c.tool == "get_industry_perf"]
+    assert calls, "排行问题必须触达 get_industry_perf"
+    # 一次调用即可拿到全部一级行业的排行；远少于逐行业取数的 31 次。
+    assert len(calls) <= 3, f"排行取数应收敛，实际 {len(calls)} 次"
+
+    answer = outcome.answer
+    # 口径必须落在单日，而不是区间。
+    assert re.search(r"单日|(?:上|前)(?:一)?(?:个)?交易日|最近交易日", answer), answer[:200]
+    # 结论必须点名行业、并给出数据日期。
+    assert re.search(r"\d{4}-\d{2}-\d{2}", answer), answer[:200]
+    assert "区间涨跌幅" not in answer
+
+
 # --- backtest + chart（必须借助 tool：稳健） --------------------------------
 
 def test_backtest_question_runs_the_tool_and_reports_discipline(tmp_path):

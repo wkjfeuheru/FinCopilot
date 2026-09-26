@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
 from finharness.provider.errors import ProviderError
-from finharness.types import StreamChunk
+from finharness.types import StreamChunk, StreamEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,12 +28,17 @@ async def stream_with_retry(
     jitter: Callable[[float, float], float] = random.uniform,
     on_retry: Callable[[ProviderError, int, float], None] | None = None,
 ) -> AsyncIterator[StreamChunk]:
-    """产出流，仅对首个 chunk 之前发生的失败进行重试。
+    """产出流，对首个 chunk 之前的失败、以及"作废整次输出"的失败进行重试。
 
-    一旦已产出过 chunk（即响应已开始），失败将直接抛出，因为此时重试
-    会重复或拼接已流出的内容。仅当错误标记为可重试、且重试次数未超出
-    策略上限时才重试，退避延迟按指数增长并叠加抖动与错误自带的
-    ``retry_after_s``。
+    两条重试边界：
+
+    * **首个 chunk 之前**的传输层失败——无内容流出，直接重放即可。
+    * **流结束后**才发现的无效响应（``voids_output=True``，如工具参数被
+      ``max_tokens`` 截断）——此时文本与工具片段已经流出，但问题出在响应整体，
+      重放是安全的，前提是消费方先把它们丢掉。因此重试前先产出
+      ``RESTART``，由消费方清空本轮累积。
+
+    其余情况下，一旦流过 chunk 就不再重试：那会导致两次尝试的内容被拼接。
     """
     retry_index = 0
     while True:
@@ -44,8 +49,13 @@ async def stream_with_retry(
                 yield chunk
             return
         except ProviderError as error:
-            if emitted_chunk or not error.retryable or retry_index >= policy.max_retries:
+            if not error.retryable or retry_index >= policy.max_retries:
                 raise
+            if emitted_chunk and not error.voids_output:
+                raise
+            if error.voids_output:
+                # 已流出的内容作废：先让消费方清空，再重放。
+                yield StreamChunk(StreamEvent.RESTART)
             delay = (
                 min(policy.cap_delay_s, policy.base_delay_s * 2**retry_index)
                 + jitter(0, policy.base_delay_s)

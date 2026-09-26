@@ -89,6 +89,23 @@ class CaseRun:
         return names
 
     # -- 轨迹分析辅助方法 ---------------------------------------------------
+    def spawned_task_texts(self) -> list[str]:
+        """本次运行里 `spawn_agent` 实际派出的子任务文本（拍平）。
+
+        扇出的"拆解"是可观测的：spawn_agent 的 `tasks` 参数就在轨迹的动作里。用来断言
+        "每个声明的实体至少出现在一条子任务里"，从而验证主 Agent 确实逐单元拆解、
+        而非把整个多实体请求原样当成一条任务。未扇出时返回空表。
+        """
+        texts: list[str] = []
+        for turn in self.turns:
+            for round_trace in turn.trace:
+                for action in round_trace.actions:
+                    if action.name != "spawn_agent":
+                        continue
+                    for task in action.args.get("tasks") or []:
+                        texts.append(str(task))
+        return texts
+
     def executed_sequence(self) -> list[str]:
         """按调用顺序排列的已执行工具名（不含被拒）。"""
         return self.called_tools()
@@ -138,6 +155,55 @@ class CaseRun:
                 for name in event.data.get("skills") or []:
                     skills.append(str(name))
         return skills
+
+    def activated_tools(self) -> list[str]:
+        """本次运行被按需激活（lazy → 已注入 schema）的工具名，去重保序。
+
+        激活有两个来源（docs 03.4.3）：``search_tools`` 命中、或模型直接点名一个未激活的
+        按需工具时循环就地激活。两者都经 ``_execute_inner`` / ``search_tools`` 汇入
+        ``registry.activate``，并各发一个 ``tool_activated`` 事件。观测点因此放在事件流上，
+        与 ``loaded_skills`` 同构——它回答"这次运行把哪些按需工具带进了上下文"。
+
+        注意：它记录的是**激活**（工具已可用），不等于该工具随后被成功调用；
+        "确实调用了"仍由 ``called_tools`` 表达。两者互补。
+        """
+        names: list[str] = []
+        seen: set[str] = set()
+        for turn in self.turns:
+            for event in turn.events:
+                if event.kind != "tool_activated":
+                    continue
+                name = str(event.data.get("name") or "")
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        return names
+
+    def per_agent_usage(self) -> dict[str, dict[str, int]]:
+        """子代理按焦点的用量明细（``general`` / ``risk``），取自 ``done`` 事件。
+
+        ``done`` 载荷的 ``per_agent`` 与 ``usage`` 是**顶层兄弟键**（不是 ``usage.per_agent``）：
+        形如 ``{焦点: {input_tokens, output_tokens, runs}}``。没有子代理运行时为空字典。
+        这正是"扇出真的发生了吗/复核真的跑了吗"的直接观测面——比"轨迹里出现了
+        ``spawn_agent`` 这个名字"更硬：名字可以出现而子代理全部失败，用量不会。
+        """
+        for turn in reversed(self.turns):
+            done = [event.data for event in turn.events if event.kind == "done"]
+            if not done:
+                continue
+            agents = done[-1].get("per_agent") or {}
+            return {str(name): dict(entry) for name, entry in agents.items()}
+        return {}
+
+    def review_sidecars(self) -> list[str]:
+        """本次运行产出的风险复核侧车文件（``*.review.md``）。
+
+        ``write_report`` 的隐式复核经 ``review_report → coordinator.review_risk()`` 在进程内
+        直调，**不作为 ``spawn_agent`` 工具调用出现**，因此工具轨迹看不见它；可观测面是产物旁的
+        侧车文件。这些文件本已被 ``_collect_exports`` 收进 ``exports``（``.review.md`` 的 suffix
+        是 ``.md``），这里只是把它们按后缀单独标出，避免与研报正文混为一谈。
+        """
+        return [path for path in self.exports if Path(path).name.endswith(".review.md")]
 
     def degraded(self) -> bool:
         """本次运行是否以降级而非干净成功结束。"""
@@ -477,11 +543,20 @@ class EvalRunner:
 
     @staticmethod
     def _read_reports(exports: list[str]) -> str:
-        """拼接导出的 markdown，供产物检查项检视。"""
+        """拼接导出的 markdown，供产物检查项检视。
+
+        **排除复核侧车**（``*.review.md``）：它是内部产物、不是交付给用户的报告，且其正文
+        会点名工具、并引用报告里的 ``[!无来源:n]`` 标记作建议（如"为表中数字补挂引用"）。
+        把侧车并进 ``report_text`` 会让 ``artifacts.no_tool_names`` / ``no_unsourced_numbers``
+        在报告正文本身干净时误报失败——实测 DYN-007/014 的正文 0 处无来源标记，却因侧车引文
+        被计成 4/2 处。复核是否发生由 ``review_sidecars`` 与 ``per_agent_usage`` 单独观测。
+        """
         chunks: list[str] = []
         for path_str in exports:
             path = Path(path_str)
             if path.suffix.lower() != ".md":
+                continue
+            if path.name.endswith(".review.md"):
                 continue
             try:
                 chunks.append(path.read_text(encoding="utf-8"))

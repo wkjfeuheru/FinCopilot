@@ -44,6 +44,7 @@ def score_trajectory(case: EvalCase, run: CaseRun) -> DimensionScore:
     skills_must_not: list[str] = []
     orders: list[list[str]] = []
     must_not_succeed: list[str] = []
+    spawn_tasks_cover: list[str] = []
     max_repeats: int | None = None
     max_rounds: int | None = None
     max_tool_calls: int | None = None
@@ -58,6 +59,7 @@ def score_trajectory(case: EvalCase, run: CaseRun) -> DimensionScore:
         skills_must_not.extend(trajectory.skills_must_not)
         orders.extend(trajectory.order)
         must_not_succeed.extend(trajectory.must_not_succeed)
+        spawn_tasks_cover.extend(trajectory.spawn_tasks_cover)
         if trajectory.max_repeats is not None:
             max_repeats = _strictest_min(max_repeats, trajectory.max_repeats)
         if trajectory.max_rounds is not None:
@@ -68,7 +70,8 @@ def score_trajectory(case: EvalCase, run: CaseRun) -> DimensionScore:
             plan_required = trajectory.plan_required
 
     declared = any(
-        [must, any_of, must_not, skills_must, skills_must_not, orders, must_not_succeed]
+        [must, any_of, must_not, skills_must, skills_must_not, orders, must_not_succeed,
+         spawn_tasks_cover]
     ) or plan_required is not None or max_repeats is not None or max_tool_calls is not None
     if not declared:
         score.score = 1.0
@@ -142,6 +145,27 @@ def score_trajectory(case: EvalCase, run: CaseRun) -> DimensionScore:
         vetoed = vetoed or bool(present)
         weighted += 0.0 if present else _W_FORBIDDEN
         score.add("skills_must_not", not present, f"不应加载：{present}")
+    if spawn_tasks_cover:
+        # 条件性：**未扇出**时该项不适用（扇出是自由裁量），只记 note、不计权重；
+        # **已扇出**时才是硬检查——每个声明的实体必须出现在至少一条派出的子任务里，
+        # 即主 Agent 确实做了逐单元拆解，而非整包派发。
+        spawned = run.spawned_task_texts()
+        if not spawned:
+            score.notes.append(
+                f"未调用 spawn_agent，跳过拆解覆盖检查（需覆盖 {spawn_tasks_cover}）"
+            )
+        else:
+            total_weight += _W_REQUIRED
+            joined = "\n".join(spawned)
+            missing = [tok for tok in dict.fromkeys(spawn_tasks_cover) if tok not in joined]
+            weighted += _W_REQUIRED * (1.0 if not missing else 0.0)
+            score.add(
+                "spawn_tasks_cover",
+                not missing,
+                f"子任务未覆盖的实体：{missing}"
+                if missing
+                else f"{len(spawned)} 条子任务覆盖全部实体",
+            )
     if plan_required is not None:
         total_weight += _W_REQUIRED
         has_plan = run.plan_present()

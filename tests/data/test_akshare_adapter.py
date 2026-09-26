@@ -486,3 +486,103 @@ def test_a_stock_symbol_still_takes_the_stock_chain(monkeypatch):
 
     assert result.interface == "stock_zh_a_hist"
     assert result.df.iloc[0]["close"] == 1237.0
+
+
+# --- 申万一级行业涨跌幅排行 --------------------------------------------
+
+
+def _sw_ranking_frame() -> pd.DataFrame:
+    """两个交易日的一级行业分析表；列名与 akshare 一致。"""
+    rows = [
+        # 09-23（较早）：有色金属领涨
+        ("801050", "有色金属", "2026-09-23", 7968.56, 1.80),
+        ("801770", "通信", "2026-09-23", 7594.94, 0.50),
+        ("801010", "农林牧渔", "2026-09-23", 2581.53, -0.40),
+        # 09-24（最新）：煤炭领涨，且含一个负收益——不得被过滤掉
+        ("801950", "煤炭", "2026-09-24", 3345.27, 0.63),
+        ("801130", "纺织服饰", "2026-09-24", 1526.06, 0.35),
+        ("801110", "家用电器", "2026-09-24", 8488.67, -0.11),
+        ("801010", "农林牧渔", "2026-09-24", 2538.15, -1.68),
+    ]
+    return pd.DataFrame(
+        rows, columns=["指数代码", "指数名称", "发布日期", "收盘指数", "涨跌幅"]
+    )
+
+
+class FakeSwRankingAk:
+    def __init__(self) -> None:
+        self.daily_calls: list[dict] = []
+        self.weekly_calls: list[dict] = []
+
+    def index_analysis_daily_sw(self, symbol, start_date, end_date):
+        self.daily_calls.append(
+            {"symbol": symbol, "start_date": start_date, "end_date": end_date}
+        )
+        frame = _sw_ranking_frame()
+        # 真实接口按 [start, end] 过滤；as_of 指定单日时只返回那一天。
+        stamps = frame["发布日期"].str.replace("-", "", regex=False)
+        mask = (stamps >= start_date) & (stamps <= end_date)
+        return frame[mask].reset_index(drop=True)
+
+    def index_analysis_week_month_sw(self, symbol):
+        dates = {"week": ["2026-09-11", "2026-09-18"], "month": ["2026-08-31"]}
+        return pd.DataFrame({"date": dates[symbol]})
+
+    def index_analysis_weekly_sw(self, symbol, date):
+        self.weekly_calls.append({"symbol": symbol, "date": date})
+        return _sw_ranking_frame()
+
+
+def make_sw_ranking_adapter(monkeypatch) -> tuple[AkShareAdapter, FakeSwRankingAk]:
+    fake = FakeSwRankingAk()
+    monkeypatch.setattr(akshare_adapter, "_import_akshare", lambda: fake)
+    return AkShareAdapter(throttle_seconds=0), fake
+
+
+def test_industry_ranking_normalizes_columns_and_sorts_descending(monkeypatch):
+    adapter, _ = make_sw_ranking_adapter(monkeypatch)
+
+    result = adapter.fetch_industry_ranking("day", as_of="2026-09-24")
+
+    assert result.interface == "index_analysis_daily_sw"
+    df = result.df
+    assert {"code", "industry", "date", "close", "pct_change"}.issubset(df.columns)
+    assert list(df["industry"]) == ["煤炭", "纺织服饰", "家用电器", "农林牧渔"]
+    assert df["pct_change"].is_monotonic_decreasing
+
+
+def test_industry_ranking_keeps_negative_rows(monkeypatch):
+    """排行是整个横截面：垫底的行业也有负数，不能只留上涨的。"""
+    adapter, _ = make_sw_ranking_adapter(monkeypatch)
+
+    df = adapter.fetch_industry_ranking("day", as_of="2026-09-24").df
+
+    assert (df["pct_change"] < 0).any()
+    assert df.iloc[-1]["industry"] == "农林牧渔"
+
+
+def test_industry_ranking_without_as_of_picks_the_latest_date(monkeypatch):
+    """未指定日期时取窗口内最新一期，而不是逐日试错。"""
+    adapter, fake = make_sw_ranking_adapter(monkeypatch)
+
+    df = adapter.fetch_industry_ranking("day").df
+
+    # 只调用一次，且返回的是 09-24 那一组（煤炭领涨），不是 09-23。
+    assert len(fake.daily_calls) == 1
+    assert df["date"].max().strftime("%Y-%m-%d") == "2026-09-24"
+    assert df.iloc[0]["industry"] == "煤炭"
+
+
+def test_industry_ranking_week_uses_the_period_endpoint(monkeypatch):
+    adapter, fake = make_sw_ranking_adapter(monkeypatch)
+
+    adapter.fetch_industry_ranking("week")
+
+    assert fake.weekly_calls == [{"symbol": "一级行业", "date": "20260918"}]
+
+
+def test_industry_ranking_rejects_an_unknown_period(monkeypatch):
+    adapter, _ = make_sw_ranking_adapter(monkeypatch)
+
+    with pytest.raises(AdapterError):
+        adapter.fetch_industry_ranking("quarter")

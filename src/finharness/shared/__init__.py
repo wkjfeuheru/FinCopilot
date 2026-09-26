@@ -20,7 +20,7 @@
       ├─ fencing.py       第三方文本围栏与中和
       ├─ numbers.py       数字缺漏检测（原 coordinator/numbers.py）
       ├─ review.py        研报复核的渲染与编排（原 coordinator/review.py）
-      └─ summarize.py     长文档分片 / map-reduce（原 coordinator/summarize.py）
+      └─ summarize.py     长文档结构感知切分（分片 id / 骨架；原 coordinator/summarize.py）
 
 依赖方向：``shared`` 只允许依赖 ``utils`` / ``config`` / ``types``；不得依赖
 ``tools`` / ``engine`` / ``coordinator`` / ``data`` / ``context`` / ``server``。

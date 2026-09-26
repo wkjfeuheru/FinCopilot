@@ -134,13 +134,13 @@ def test_hostile_page_text_cannot_forge_the_fence(tmp_path):
 def test_it_is_labelled_read_only_and_generic():
     from finharness.shared.declaration import Tier
     from finharness.tools.base import PermissionLevel, ToolGroup
-    from finharness.tools.registry import worker_tool_names
+    from finharness.tools.registry import reader_tool_names
 
     assert ReadPdfTool.permission is PermissionLevel.READ
     assert ReadPdfTool.group is ToolGroup.GENERIC
     assert ReadPdfTool.tier is Tier.LAZY
-    # 放在 GENERIC 组的直接收益：worker 子代理也能精读长材料。
-    assert "read_pdf" in worker_tool_names()
+    # 放在 GENERIC 组的直接收益：内部 reader 子代理也能精读长材料。
+    assert "read_pdf" in reader_tool_names()
 
 
 def test_reading_more_pages_than_the_ceiling_is_clamped(tmp_path):

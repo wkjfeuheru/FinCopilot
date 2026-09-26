@@ -378,6 +378,18 @@ class DataAccess:
             args=(industry, years),
         )
 
+    async def industry_ranking(self, period: str = "day", as_of: str | None = None) -> RawData:
+        """申万一级行业涨跌幅排行（一次取回全部一级行业，按涨跌幅降序）。
+
+        ``as_of`` 为空时取最新一期；返回的表带 ``date`` 列，上层据此披露数据日期。
+        """
+        return await self._fetch(
+            kind="industry",
+            cache_params={"op": "ranking", "period": period, "as_of": as_of},
+            method="fetch_industry_ranking",
+            args=(period, as_of),
+        )
+
     async def industry_constituents(self, industry: str) -> RawData:
         """申万行业的成分股（横截面选股池的一个来源）。"""
         return await self._fetch(

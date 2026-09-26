@@ -122,6 +122,9 @@ class ModelFinished:
     usage: UsageDelta
     at: str
     permissions: Mapping[str, str] | None = None
+    # 本轮 provider 流在首 chunk 前/整轮作废后重试的次数；累加进
+    # ``AgentState.retry_count``，使"每步 state"能反映重试压力。
+    retries: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +399,7 @@ def transition(state: AgentState, event: AgentEvent) -> AgentState:
         usage = event.usage
         input_tokens = state.input_tokens + usage.input_tokens
         output_tokens = state.output_tokens + usage.output_tokens
+        retries = state.retry_count + event.retries
         if event.tool_uses:
             calls = tuple(
                 _persisted_from_tool_use(tool, event.permissions)
@@ -408,6 +412,7 @@ def transition(state: AgentState, event: AgentEvent) -> AgentState:
                 turn=state.turn + 1,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                retry_count=retries,
                 tool_calls=state.tool_calls + len(calls),
                 calls=calls,
                 outcome=None,
@@ -420,6 +425,7 @@ def transition(state: AgentState, event: AgentEvent) -> AgentState:
             turn=state.turn + 1,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            retry_count=retries,
             outcome=RunOutcome(kind="succeeded", reason=None, resumable=False),
             error=None,
             confirmation=None,

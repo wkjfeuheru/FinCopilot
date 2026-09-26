@@ -80,8 +80,7 @@ export function resolveHighLevelTraceStatus(
   return doneFallback;
 }
 
-/** Narrow an SSE/history payload to the typed public subset; return null if unusable. */
-export function asPublicAgentState(
+/** Narrow an SSE/history payload to the typed public subset; return null if unusable. */export function asPublicAgentState(
   data: Record<string, unknown>,
 ): PublicAgentState | null {
   const runId = data.run_id;
@@ -146,4 +145,66 @@ function isAgentPhase(value: string): value is AgentPhase {
     value === "complete" ||
     value === "error"
   );
+}
+
+/** Minimal shape of a persisted per-step FSM state (`trace_states` / run_detail.states). */
+export type AgentStateStep = {
+  revision: number;
+  phase: string;
+  turn: number | null;
+  created_at: string;
+};
+
+/** One segment of the phase timeline: a step plus how long it lasted. */
+export type AgentStateTimelineEntry = {
+  revision: number;
+  phase: string;
+  label: string;
+  turn: number | null;
+  /** Wall-clock duration of this step, or null when it can't be derived. */
+  duration_ms: number | null;
+  started_at: string;
+};
+
+/** Chinese label for any phase, including the terminal `complete`/`error`. */
+export function agentPhaseLabel(phase: string): string {
+  if (phase === "complete") return "已完成";
+  if (phase === "error") return "出错";
+  if (phase in PHASE_LABELS) {
+    return PHASE_LABELS[phase as keyof typeof PHASE_LABELS];
+  }
+  return phase;
+}
+
+/**
+ * Build a phase timeline from persisted states.
+ *
+ * Each entry's duration is the gap to the next step's `created_at`; the final
+ * step (typically the terminal `complete`/`error`) has no successor, so its
+ * duration is null. Timestamps are ISO strings, so a bad value yields null
+ * rather than a bogus duration.
+ */
+export function buildAgentStateTimeline(
+  states: AgentStateStep[],
+): AgentStateTimelineEntry[] {
+  const ordered = [...states].sort((a, b) => a.revision - b.revision);
+  return ordered.map((step, index) => {
+    const next = ordered[index + 1];
+    let duration_ms: number | null = null;
+    if (next) {
+      const start = Date.parse(step.created_at);
+      const end = Date.parse(next.created_at);
+      if (Number.isFinite(start) && Number.isFinite(end) && end >= start) {
+        duration_ms = end - start;
+      }
+    }
+    return {
+      revision: step.revision,
+      phase: step.phase,
+      label: agentPhaseLabel(step.phase),
+      turn: step.turn,
+      duration_ms,
+      started_at: step.created_at,
+    };
+  });
 }

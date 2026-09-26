@@ -45,6 +45,20 @@ export type TraceRound = {
   llm_first_ms: number;
   llm_ms: number;
   answer: string;
+  /** 记录该轮时的 FSM 阶段与修订号（旧数据为 null）。 */
+  phase: string | null;
+  revision: number | null;
+};
+
+/** 一次 FSM 状态转换（每步 agent 的 state）。 */
+export type TraceState = {
+  run_id: string;
+  agent_run_id: string;
+  revision: number;
+  turn: number | null;
+  phase: string;
+  created_at: string;
+  payload: Record<string, unknown> | null;
 };
 
 /** 一个引擎事件（tool_status / plan_progress 跑偏 / loop_guard 重复调用……）。 */
@@ -58,6 +72,7 @@ export type TraceEvent = {
 export type TraceRunDetail = TraceRun & {
   rounds_trace: TraceRound[];
   events: TraceEvent[];
+  states: TraceState[];
 };
 
 /** 七项运行指标 + 拆解。 */
@@ -72,6 +87,8 @@ export type TraceMetrics = {
   };
   tool_calls_total: number;
   avg_rounds: number | null;
+  total_states: number;
+  avg_steps: number | null;
   tool_failure_rate: number | null;
   repeat_call_rate: number | null;
   loop_guard_events: number;

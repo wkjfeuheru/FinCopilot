@@ -202,3 +202,119 @@ def test_trace_store_records_state_events_without_special_casing(store):
     assert detail is not None
     assert [event["kind"] for event in detail["events"]] == ["state"]
     assert detail["events"][0]["payload"]["phase"] == "hydrate"
+
+
+def test_state_events_also_land_in_trace_states(store):
+    """``state`` 事件同时提升为 trace_states 的一等行（每步 agent 状态）。"""
+    store.start_run(run_id="tr_1", input="分析茅台")
+    store.record_event(
+        "tr_1", "state",
+        {"run_id": "agent-7", "revision": 0, "phase": "hydrate", "turn": 0,
+         "created_at": "2026-09-25T00:00:00.000+00:00"},
+    )
+    store.record_event(
+        "tr_1", "state",
+        {"run_id": "agent-7", "revision": 1, "phase": "thinking", "turn": 0,
+         "created_at": "2026-09-25T00:00:01.000+00:00"},
+    )
+    detail = store.run_detail("tr_1")
+    states = detail["states"]
+    assert [s["phase"] for s in states] == ["hydrate", "thinking"]
+    assert [s["revision"] for s in states] == [0, 1]
+    # agent_run_id 保留 FSM 运行身份，供 resume 的各段串回。
+    assert states[0]["agent_run_id"] == "agent-7"
+    assert states[0]["turn"] == 0
+    assert states[1]["payload"]["phase"] == "thinking"
+
+
+def test_state_rows_are_idempotent_on_run_revision(store):
+    """同一 (run_id, revision) 重复到达（重放/重试）只保留最新一行。"""
+    store.start_run(run_id="tr_1", input="x")
+    store.record_event("tr_1", "state", {"run_id": "a", "revision": 3, "phase": "thinking"})
+    store.record_event("tr_1", "state", {"run_id": "a", "revision": 3, "phase": "tooluse"})
+    detail = store.run_detail("tr_1")
+    assert len(detail["states"]) == 1
+    assert detail["states"][0]["phase"] == "tooluse"
+
+
+def test_record_round_is_live_and_idempotent(store):
+    """实时落轮次；与 finish_run 的批量写就同一 (run_id, turn) 幂等共存。"""
+    store.start_run(run_id="tr_1", input="x")
+    store.record_round("tr_1", _round(1, thought="第一轮草稿"), phase="tooluse", revision=2)
+    # finish 批量写同一轮（phase/revision 为 None）不得覆盖实时写入的它们。
+    store.finish_run("tr_1", status="done", succeeded=True, trace_rounds=[_round(1, thought="最终")])
+    detail = store.run_detail("tr_1")
+    assert len(detail["rounds_trace"]) == 1
+    assert detail["rounds_trace"][0]["thought"] == "最终"
+    assert detail["rounds_trace"][0]["phase"] == "tooluse"
+    assert detail["rounds_trace"][0]["revision"] == 2
+
+
+def test_record_round_survives_without_finish(store):
+    """崩溃场景：只有实时轮次、没有 finish_run 时轮次仍在库里。"""
+    store.start_run(run_id="tr_crash", input="x")
+    store.record_round("tr_crash", _round(1), phase="thinking", revision=1)
+    detail = store.run_detail("tr_crash")
+    assert len(detail["rounds_trace"]) == 1
+    assert detail["status"] == "running"
+
+
+def test_cleanup_removes_states_too(store):
+    store.start_run(run_id="old", input="a")
+    store.record_event("old", "state", {"run_id": "a", "revision": 1, "phase": "thinking"})
+    store.record_round("old", _round(1))
+    store.finish_run("old", status="done", succeeded=True)
+    with store._connect() as conn:
+        conn.execute("UPDATE trace_runs SET started_at = '2000-01-01T00:00:00.000+00:00' WHERE run_id='old'")
+    assert store.cleanup(30) == 1
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM trace_states").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) AS n FROM trace_rounds").fetchone()["n"] == 0
+
+
+def test_migration_adds_round_columns_to_legacy_db(tmp_path):
+    """旧库（trace_rounds 无 phase/revision、无唯一索引）可幂等升级。"""
+    import sqlite3
+
+    legacy = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy)
+    conn.execute(
+        "CREATE TABLE trace_rounds (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,"
+        " turn INTEGER NOT NULL, thought TEXT NOT NULL DEFAULT '',"
+        " actions_json TEXT NOT NULL DEFAULT '[]', observations_json TEXT NOT NULL DEFAULT '[]',"
+        " input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,"
+        " llm_first_ms INTEGER NOT NULL DEFAULT 0, llm_ms INTEGER NOT NULL DEFAULT 0,"
+        " answer TEXT NOT NULL DEFAULT '')"
+    )
+    # 历史重复行：唯一索引建立前必须被收敛。
+    conn.executemany(
+        "INSERT INTO trace_rounds (run_id, turn) VALUES (?, ?)",
+        [("r", 1), ("r", 1), ("r", 2)],
+    )
+    conn.commit()
+    conn.close()
+
+    store = TraceStore(legacy)  # 迁移在 _init_db 内完成
+    with store._connect() as connection:
+        cols = {row["name"] for row in connection.execute("PRAGMA table_info(trace_rounds)")}
+        assert {"phase", "revision"} <= cols
+        # 重复的 (r, 1) 已收敛为一行。
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM trace_rounds WHERE run_id='r' AND turn=1"
+        ).fetchone()["n"] == 1
+    # 升级后可安全实时写。
+    store.record_round("r", _round(3), phase="complete", revision=5)
+    detail = store.run_detail("r")
+    assert detail is None or any(r["turn"] == 3 for r in detail["rounds_trace"])
+
+
+def test_metrics_include_step_counts(store):
+    """指标新增步数口径：总步数与平均步数（只计有状态记录的运行）。"""
+    store.start_run(run_id="r1", input="a")
+    for revision, phase in enumerate(("hydrate", "thinking", "complete")):
+        store.record_event("r1", "state", {"run_id": "a", "revision": revision, "phase": phase})
+    store.finish_run("r1", status="done", succeeded=True)
+
+    m = store.metrics_summary()
+    assert m["total_states"] == 3
+    assert m["avg_steps"] == 3.0

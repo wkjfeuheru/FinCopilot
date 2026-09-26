@@ -130,13 +130,27 @@ class AutoCompactor:
 
         # 当近期轮次本身很大时，仅保留它们可能仍然不够；持续收紧直到窗口
         # 回到预算之内，而不是把下一次请求留在超预算状态。
-        threshold = self.settings.context.compaction_ratio * self.settings.context.context_window_tokens
+        threshold = self.memory.compaction_threshold()
         while after >= threshold:
             extra, _ = self.memory.squash(keep_rounds=1)
             if extra == 0:
                 break
             removed += extra
             after = self._count()
+
+        # 折叠到底仍够不到阈值，说明阈值本身就在不可压缩地板（system + 工具
+        # schema）之下——这是配置问题，不是压缩失败。如实说清，别让"每轮都
+        # 触发压缩却毫无效果"看起来像正常运行。
+        if after >= threshold:
+            floor = self.memory.fixed_tokens(
+                system=self.system, tools=self.tools, extra_text=self.state_text
+            )
+            note = (
+                f"压缩后窗口仍为 {after} token（≥ 阈值 {threshold}）："
+                f"窗口配置过低，system prompt 与工具 schema 的固定开销约 {floor} token "
+                "已无法继续压缩，请上调 context_window_tokens"
+            )
+            warning = note if warning is None else f"{warning}；{note}"
 
         if self.summary is not None and removed > 0:
             self.summary.add(

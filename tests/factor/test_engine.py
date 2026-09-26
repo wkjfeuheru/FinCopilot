@@ -108,8 +108,10 @@ def test_window_above_the_cap_is_rejected():
 
 
 def test_unknown_variable_is_rejected_with_a_message():
-    with pytest.raises(FactorError, match="未知变量"):
+    with pytest.raises(FactorError, match="未知变量") as caught:
         FactorEngine().evaluate("ts_mean(price,20)", {"close": series()})
+    assert "财务字段" not in str(caught.value)
+    assert "pe_ttm" in str(caught.value)
 
 
 def test_missing_market_variable_is_reported():

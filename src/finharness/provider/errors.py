@@ -12,6 +12,13 @@ class ProviderError(RuntimeError):
 
     default_retryable = False
 
+    # 重试前是否必须丢弃本次已流出的内容。传输层失败（连接被拒、首字节超时）
+    # 发生在任何 chunk 之前，无内容可丢，故为 False；而"响应本身无效/被截断"
+    # 是流**结束后**才发现的，此时文本与工具调用片段已经流出，重试必须先让
+    # 消费方清空，否则两次尝试的内容会被拼接在一起。重试层据此决定是否
+    # 向前发出 RESTART 信号。
+    voids_output = False
+
     def __init__(
         self,
         message: str,
@@ -38,6 +45,36 @@ class ServerError(ProviderError):
 
 class NetworkError(ProviderError):
     default_retryable = False
+
+
+class MalformedStreamError(NetworkError):
+    """provider 流本身无效——分片 JSON 不完整、字段类型错误、SSE 载荷缺字段等。
+
+    与 ``NetworkError`` 的差别在于**发现时机**：这一类总是在响应已经流出之后才
+    被发现，因此已产出的文本/工具片段必须被视为作废。它默认可重试（同样的请求
+    换一次采样往往就好了），且以 ``voids_output=True`` 通知重试层先重置消费方。
+    """
+
+    default_retryable = True
+    voids_output = True
+
+
+class OutputTruncatedError(MalformedStreamError):
+    """模型输出触到 ``max_tokens`` 上限被截断（``finish_reason == "length"``）。
+
+    这不是传输故障，而是预算不足：工具参数被截在半句 JSON 上、或正文缺少结尾。
+    它与 ``MalformedStreamError`` 一样可重试且作废已流出内容，但单独成类是为了
+    让"预算不足"在指标里可分辨——否则它会混进"网络错误"，运维看不到该调高
+    ``max_tokens`` 的信号。
+    """
+
+
+class ToolArgumentsError(MalformedStreamError):
+    """工具参数不是合法 JSON 对象——通常正是被截断的后果。
+
+    在读取 ``finish_reason`` 之前它是唯一可见的证据；有了 ``finish_reason``
+    之后应优先报 ``OutputTruncatedError``，以便区分"预算不足"与"模型吐了坏 JSON"。
+    """
 
 
 class TokenLimitError(ProviderError):

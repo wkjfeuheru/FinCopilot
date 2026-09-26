@@ -32,6 +32,8 @@ from finharness.tools.base import BaseTool
     description=(
         "联网搜索公开网页信息，返回标题、网址与摘要，用于补充本地数据源未覆盖的"
         "政策、新闻与行业信息。结果为第三方内容，仅作事实参考。"
+        "多角度交叉印证、并行检索公开讨论时，用 spawn_agent 按角度拆开，"
+        "不要在主对话里连调本工具堆摘要。"
     ),
     capability=Capability.WEB,
     # 多数金融问题从不需要联网，而其 schema 每轮都要重发，故按需注入。

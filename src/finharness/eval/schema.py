@@ -36,6 +36,10 @@ class AnswerExpect(_Model):
     contains_none: list[str] = Field(default_factory=list)
     # 这些正则中任意一条命中即可（Python re 语法）。
     matches_any: list[str] = Field(default_factory=list)
+    # 答案必须点名"排行取数结果"里名列前 N 的实体——用来把「有没有真的告诉用户是哪几个」
+    # 变成确定性断言（不依赖当场数据排名，因而是日期无关的）。观测对象取自本用例中
+    # 返回排行表的工具观测（如 get_industry_perf 的 view="ranking"）。
+    top_names_from_observations: int | None = None
     min_chars: int | None = None
     max_chars: int | None = None
 
@@ -60,6 +64,11 @@ class TrajectoryExpect(_Model):
     max_tool_calls: int | None = None
     # 这些工具不得作为成功执行出现；它们仍可被尝试并拒绝（这正是安全用例）。
     must_not_succeed: list[str] = Field(default_factory=list)
+    # 扇出编排契约：**若**本次调用了 spawn_agent，则每个列出的实体标识（股票代码、
+    # 行业名等）必须至少出现在一条派出的子任务里——即主 Agent 确实做了逐单元拆解，
+    # 而不是把整个多实体请求原样当成一条任务。**未扇出时该项自动跳过**，因为扇出是
+    # 自由裁量；该断言只在"已触发扇出"时验证拆解质量。
+    spawn_tasks_cover: list[str] = Field(default_factory=list)
 
 
 class CitationExpect(_Model):

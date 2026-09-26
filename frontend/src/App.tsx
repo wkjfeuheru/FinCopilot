@@ -47,9 +47,10 @@ function activitiesFromView(view: ChatView | undefined): Activity[] {
   const activities: Activity[] = [];
   for (const message of view.messages) {
     for (const step of message.trace?.steps ?? []) {
-      if (step.kind !== "tool" && step.kind !== "skill" && step.kind !== "plan") continue;
+      if (step.kind !== "tool" && step.kind !== "skill" && step.kind !== "plan" && step.kind !== "agent") continue;
       activities.push({
         key: `${activities.length}-${step.key}`,
+        tool: step.toolName ?? (step.kind === "skill" ? "skill" : step.kind === "agent" ? "spawn_agent" : "tool"),
         label: step.label,
         status:
           step.status === "error" ? "error" : step.status === "running" ? "running" : "done",
@@ -84,6 +85,23 @@ function App() {
   const [loadingConversations, setLoadingConversations] = useState(false);
   const [citations, setCitations] = useState<Citation[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
+  const [focusedTool, setFocusedTool] = useState<string | null>(null);
+
+  function focusActivity(tool?: string) {
+    setFocusedTool(tool ?? null);
+    window.requestAnimationFrame(() => {
+      document.getElementById("execution-activity")?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+      if (tool) {
+        document.getElementById(`activity-group-${tool}`)?.scrollIntoView({
+          behavior: "smooth",
+          block: "nearest",
+        });
+      }
+    });
+  }
   // 本客户端已渲染过的对话，以 conversation id 为键。
   // 在切换时保留完整渲染的视图。历史回答可以从服务端
   // 重建其 trace；产出文件保存在各步的 attachments 中，
@@ -259,6 +277,7 @@ function App() {
     cacheCurrentView();
     // 在历史加载期间立即恢复缓存的活动流。
     setActivities(activitiesFromView(viewCacheRef.current.get(id)));
+    setFocusedTool(null);
     rememberConversation(id);
     setSessionId(null);
     setSessionVersion((version) => version + 1);
@@ -422,11 +441,12 @@ function App() {
                 onCitations={setCitations}
                 activities={activities}
                 onActivities={setActivities}
+                onFocusActivity={focusActivity}
                 resumable={historyConversationId === conversationId ? resumable : null}
                 onRefreshResumable={(target) => void refreshResumable(target)}
               />
             </div>
-            <SourceSidebar activities={activities} citations={citations} />
+            <SourceSidebar activities={activities} citations={citations} focusedTool={focusedTool} />
             </div>
           )}
         </section>

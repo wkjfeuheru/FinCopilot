@@ -14,7 +14,11 @@ from finharness.provider._compat import (
 )
 from finharness.provider.base import Provider
 from finharness.provider.errors import NetworkError
-from finharness.provider.event_stream import ToolUseAccumulator, iter_sse_data
+from finharness.provider.event_stream import (
+    ToolUseAccumulator,
+    finalize_tool_uses,
+    iter_sse_data,
+)
 from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUseDelta
 
 
@@ -82,8 +86,11 @@ class OpenAICompatProvider(Provider):
                 request_messages.append({"role": "assistant", "content": message.content, "tool_calls": [{"id": t.call_id, "type": "function", "function": {"name": t.name, "arguments": json.dumps(t.args, ensure_ascii=False)}} for t in message.tool_uses]})
             else:
                 request_messages.append({"role": message.role, "content": message.content})
-        payload = {"model": self.model, "messages": request_messages, "tools": tools, "temperature": self.temperature, "max_tokens": self.max_tokens, "stream": True, "stream_options": {"include_usage": True}}
+        payload = {"model": self.model, "messages": request_messages, "temperature": self.temperature, "max_tokens": self.max_tokens, "stream": True, "stream_options": {"include_usage": True}}
+        if tools:
+            payload["tools"] = tools
         accumulator, final_usage = ToolUseAccumulator(), ModelUsage()
+        finish_reason: str | None = None
         try:
             async with self.client.stream("POST", f"{self.base_url}/chat/completions", headers={"Authorization": f"Bearer {self.api_key}"}, json=payload) as response:
                 await raise_for_status(response)
@@ -108,6 +115,11 @@ class OpenAICompatProvider(Provider):
                         continue
                     if not isinstance(choices[0], dict):
                         raise NetworkError("Provider returned invalid choice")
+                    # ``finish_reason`` 只在最后一块出现；"length" 表示输出触到
+                    # max_tokens 被截断——这是判断工具参数为何残缺的确定性依据。
+                    reason = choices[0].get("finish_reason")
+                    if isinstance(reason, str):
+                        finish_reason = reason
                     delta = choices[0].get("delta", {})
                     if delta is None:
                         delta = {}
@@ -148,5 +160,5 @@ class OpenAICompatProvider(Provider):
                         yield StreamChunk(StreamEvent.TOOL_USE_DELTA, td)
         except httpx.HTTPError as exc:
             raise as_network_error(exc) from exc
-        final_usage.tool_uses = accumulator.build()
+        final_usage.tool_uses = finalize_tool_uses(accumulator, finish_reason=finish_reason)
         yield StreamChunk(StreamEvent.MESSAGE_END, final_usage)

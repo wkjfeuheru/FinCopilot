@@ -38,6 +38,7 @@ from finharness.engine.state import (
     HydrationFinished,
     ModelFinished,
     ResumeRequested,
+    RunCompleted,
     RunFailed,
     StopRequested,
     ToolBatchFinished,
@@ -46,6 +47,7 @@ from finharness.engine.state import (
     UsageDelta,
     new_agent_state,
 )
+from finharness.engine.tool_summary import tool_status_summary
 from finharness.hooks.base import HookChain
 from finharness.observability import NullObserver
 from finharness.observability.context import update_turn
@@ -53,10 +55,12 @@ from finharness.observability.logs import get_logger
 from finharness.permissions.gate import ConfirmationSpec, GateDecision, ReadOnlyGate
 from finharness.permissions.modes import Verdict
 from finharness.provider.base import Provider
+from finharness.provider.errors import OutputTruncatedError
 from finharness.shared.budget import resolve_result_budget
 from finharness.shared.capabilities import (
     capabilities_in_text,
 )
+from finharness.shared.fanout import fanout_intent
 from finharness.shared.fencing import close_dangled
 from finharness.tools.meta.skills import (
     SkillError,
@@ -106,6 +110,25 @@ class LoopDetected(RuntimeError):
     def __init__(self, message: str, *, tool: str = "") -> None:
         super().__init__(message)
         self.tool = tool
+
+
+# 引擎判定的"多实体逐实体分析"请求下，随状态块下发的强制编排指令。它不是静态提示词，
+# 而是**引擎在判定命中后**放到模型注意力最强处（state 块末尾）的要求——因为仅靠提示词
+# 劝导，模型会走串行取数的省事路（实测隐式触发率极低）。措辞刻意简短、可执行。
+_FANOUT_HINT = (
+    "【本轮编排要求】检测到你在对**多个实体**做逐实体分析。请**必须**使用 `spawn_agent`："
+    "把每个实体拆成**一条自包含子任务**（谁、要什么、标的/区间），在**一次调用**里带上全部"
+    "任务并行派发，再由你汇合各结论、覆盖每个实体作答。**不要**自己逐个串行取数作答。"
+    "（若只要几个数字/字段而非逐实体分析，忽略本要求。）"
+)
+
+# 扇出执行成功后替换上一条指令：此时各子代理的结论已在手，模型的任务变成"汇合"，而不是
+# 再自己去把那件事重做一遍（实测有模型会忽略子代理结论、自行串行重取，直到触发 loop guard）。
+_FANOUT_MERGE_HINT = (
+    "【本轮编排要求】各子代理的结论**已经返回**（见上一条 `spawn_agent` 结果）。请**直接据它们"
+    "汇合**成覆盖每个实体的统一结论——**不要**自己再逐个重复取数或重做分析。缺哪项就在结论里"
+    "如实说明，不必自行补做。"
+)
 
 
 class AgentLoop(PlanProgressMixin):
@@ -228,12 +251,22 @@ class AgentLoop(PlanProgressMixin):
         # 不再提供新信息，因此会被拒绝。
         self._call_counts: dict[str, int] = {}
         self._reminded: set[str] = set()
+        # 同一指纹上一次真正执行失败的原因。循环防护命中时带出它，
+        # 避免把「表达式非法」说成「重复取数」。
+        self._call_errors: dict[str, str] = {}
+        # 同一指纹上一次成功编码的 tool_result：第一次违规时回放，避免空 ok=false
+        # 被模型当成工具失败而换词再搜。
+        self._successful_results: dict[str, str] = {}
         # 计划进展状态，每次运行重置。``_plan_hint`` 搭载在下一次请求的 state
         # 块中（在一轮结束后设置，这样一轮中的三次测量看到的文本一致）；
         # signature/stall 计数器用于检测计划已停止推进。
         self._plan_hint = ""
         self._plan_signature: tuple[Any, ...] | None = None
         self._plan_stall_turns = 0
+        # 引擎侧的扇出强制指令（docs 03.10）：当本轮问题被判为"多实体逐实体分析"时，
+        # 由 hydrate 设置，随 state 块下发。它是确定性触发的一环——提示词劝导不够，
+        # 引擎直接把"必须扇出"的编排要求放到模型注意力最强处（state 块末尾）。
+        self._fanout_hint = ""
         # 本次运行中已被标记为偏离目标的目标，这样单个跑偏的 symbol 只会提示一次，
         # 而不是它在 findings 中每停留一轮就提示一次。
         self._reported_drift: set[str] = set()
@@ -262,6 +295,9 @@ class AgentLoop(PlanProgressMixin):
         self._think_round_output: int = 0
         self._think_llm_first_ms: int = 0
         self._think_llm_ms: int = 0
+        # 本轮 provider 重试次数；在 think 生效前清零，由 ``_on_retry`` 递增，
+        # 随 ModelFinished 进入 reducer 累加到 ``AgentState.retry_count``。
+        self._round_retries: int = 0
         self._machine: AgentStateMachine | None = None
         self._is_resume: bool = False
         self._resume_phase: AgentPhase | None = None
@@ -330,11 +366,19 @@ class AgentLoop(PlanProgressMixin):
             stop_signal_provider=lambda: self.stop_signal,
             audit_hook_factory=audit_hook_factory if audit_writer is not None else None,
             user_id=self.user_id,
+            parent_gate=self.gate,
         )
 
     async def _emit(self, kind: str, data: dict[str, Any]) -> None:
         if self.output is not None:
             await self.output.emit(EngineEvent(kind, data))
+
+    @staticmethod
+    def _attach_tool_summary(payload: dict[str, Any], tool_use: ToolUse) -> None:
+        """把白名单参数摘要挂到 tool_status 上，没有可展示项时不写该字段。"""
+        summary = tool_status_summary(tool_use.name, tool_use.args)
+        if summary:
+            payload["summary"] = summary
 
     def _progress_emitter(self, tool_use: ToolUse):
         """构造工具的进展回调：补齐调用标识后转发为 ``tool_progress`` 事件。
@@ -358,8 +402,9 @@ class AgentLoop(PlanProgressMixin):
         return report
 
     def _on_retry(self, error: BaseException, index: int, delay: float) -> None:
-        """provider 重试回调：计入会话统计，并留下一条可排查的日志。"""
+        """provider 重试回调：计入会话统计与当前轮次，并留下一条可排查的日志。"""
         self.stats.add_retry()
+        self._round_retries += 1
         logger = getattr(self.observer, "log", None)
         if logger is not None:
             logger.warning(
@@ -407,6 +452,8 @@ class AgentLoop(PlanProgressMixin):
         state = self.ctx.state_block()
         if self._plan_hint:
             state = f"{state}\n\n{self._plan_hint}" if state else self._plan_hint
+        if self._fanout_hint:
+            state = f"{state}\n\n{self._fanout_hint}" if state else self._fanout_hint
         return state
 
     def _request_messages(self) -> list[Msg]:
@@ -756,28 +803,150 @@ class AgentLoop(PlanProgressMixin):
         if count < limit:
             return None
 
+        prior = self._call_errors.get(key)
         complex_task = self.ctx.plan is not None
         if key not in self._reminded:
-            # 首次违规：提醒，让模型自行纠正。
+            # 首次违规：提醒，让模型自行纠正。先前已经失败的调用没有可复用的结果，
+            # 提醒必须带上那次错误，否则模型会把失败当成暂时故障再原样重试。
             self._reminded.add(key)
-            if complex_task:
+            if prior:
+                message = (
+                    f"相同参数的 {tool_use.name} 已调用 {count} 次且失败。"
+                    f"上次错误：{prior}。请更换表达式或参数，不要原样重试。"
+                )
+            elif complex_task:
                 message = (
                     f"相同参数的 {tool_use.name} 已调用 {count} 次，结果已在上文。"
-                    "若当前方向行不通，请用 research_plan 修订计划后继续，不要重复取数。"
+                    "若当前方向行不通，请用 research_plan 修订计划后继续；"
+                    "若还要其他角度，用 spawn_agent 按角度拆任务，不要重复取数。"
                 )
             else:
                 message = (
-                    f"相同参数的 {tool_use.name} 已调用 {count} 次，结果已在上文（或对应 citation），"
-                    "请直接复用该结果作答，不要重复取数。"
+                    f"相同参数的 {tool_use.name} 已调用 {count} 次，结果已在上文（或对应 citation）。"
+                    "请直接复用该结果作答；若还要其他角度，用 spawn_agent 按角度拆任务，不要重复同一 query。"
                 )
             return RepeatVerdict(count=count, escalate=False, message=message)
 
         # 同一调用形态的第二次违规：停止；本次运行无法继续推进。
-        return RepeatVerdict(
-            count=count,
-            escalate=True,
-            message=f"相同参数的 {tool_use.name} 重复调用 {count} 次，已中止本轮。",
+        if prior:
+            message = (
+                f"相同参数的 {tool_use.name} 重复调用 {count} 次，已中止本轮。"
+                f"上次错误：{prior}。请更换表达式或参数，不要原样重试。"
+            )
+        else:
+            message = f"相同参数的 {tool_use.name} 重复调用 {count} 次，已中止本轮。"
+        return RepeatVerdict(count=count, escalate=True, message=message)
+
+    def _repeat_result(self, tool_use: ToolUse, guard: RepeatVerdict) -> str:
+        """第一次违规时回放上次成功结果；没有可复用结果则仍返回空失败。"""
+        key = self._call_fingerprint(tool_use)
+        if self._call_errors.get(key):
+            return json.dumps(
+                {"ok": False, "content": "", "error": guard.message},
+                ensure_ascii=False,
+            )
+        cached = self._successful_results.get(key)
+        if not cached:
+            return json.dumps(
+                {"ok": False, "content": "", "error": guard.message},
+                ensure_ascii=False,
+            )
+        payload = json.loads(cached)
+        content = str(payload.get("content") or "")
+        if guard.message not in content:
+            content = f"{content.rstrip()}\n\n{guard.message}"
+        payload["content"] = content
+        payload["ok"] = True
+        payload["error"] = None
+        return json.dumps(payload, ensure_ascii=False)
+
+    async def _wrap_up_after_loop(self, tool_msg: Msg) -> str:
+        """有成果时强制无工具收尾：让模型用已有材料写观点，而不是再调工具。"""
+        self.memory.append(tool_msg)
+        deltas: list[str] = []
+        round_started = self.stats.now()
+        first_token_at: float | None = None
+        round_input = 0
+        round_output = 0
+        model = getattr(self.provider, "model", "") or ""
+        try:
+            async with self.observer.llm_span(
+                model=model,
+                call_type=self.call_type,
+                tool_count=0,
+            ) as llm_span:
+                async for chunk in stream_with_retry(
+                    lambda: self.provider.stream(
+                        system=self._system_prompt(),
+                        messages=self._request_messages(),
+                        tools=[],
+                        usage=self.usage,
+                    ),
+                    policy=self.retry_policy,
+                    on_retry=lambda error, index, delay: self._on_retry(
+                        error, index, delay
+                    ),
+                ):
+                    if chunk.event is StreamEvent.TEXT_DELTA:
+                        if first_token_at is None:
+                            first_token_at = self.stats.now()
+                            mark = getattr(llm_span, "mark_first_token", None)
+                            if callable(mark):
+                                mark()
+                        deltas.append(str(chunk.data or ""))
+                        await self._emit("text_delta", {"text": chunk.data})
+                    elif chunk.event is StreamEvent.RESTART:
+                        deltas.clear()
+                        await self._emit("text_reset", {})
+                    elif chunk.event is StreamEvent.MESSAGE_END and isinstance(
+                        chunk.data, ModelUsage
+                    ):
+                        round_input += chunk.data.input_tokens
+                        round_output += chunk.data.output_tokens
+                        self.usage.input_tokens += chunk.data.input_tokens
+                        self.usage.output_tokens += chunk.data.output_tokens
+                        self.usage.cache_hit_tokens += chunk.data.cache_hit_tokens
+                        self.usage.cache_miss_tokens += chunk.data.cache_miss_tokens
+                        self.stats.add_usage(
+                            chunk.data.input_tokens,
+                            chunk.data.output_tokens,
+                            cache_hit_tokens=chunk.data.cache_hit_tokens,
+                            cache_miss_tokens=chunk.data.cache_miss_tokens,
+                        )
+                        setter = getattr(llm_span, "set_usage", None)
+                        if callable(setter):
+                            setter(chunk.data)
+        except Exception:  # noqa: BLE001 - 收尾失败则回退 loop_detected
+            self._record_round(
+                thought="".join(deltas),
+                actions=[],
+                results=[],
+                input_tokens=round_input,
+                output_tokens=round_output,
+                llm_first_ms=(
+                    round((first_token_at - round_started) * 1000)
+                    if first_token_at is not None
+                    else 0
+                ),
+                llm_ms=round((self.stats.now() - round_started) * 1000),
+            )
+            return ""
+        answer = "".join(deltas).strip()
+        self._record_round(
+            thought="",
+            actions=[],
+            results=[],
+            input_tokens=round_input,
+            output_tokens=round_output,
+            llm_first_ms=(
+                round((first_token_at - round_started) * 1000)
+                if first_token_at is not None
+                else 0
+            ),
+            llm_ms=round((self.stats.now() - round_started) * 1000),
+            answer=answer,
         )
+        return answer
 
     # 运行停止的原因，以面向读者的措辞表述。每一种不成功的终态都会配上一份
     # 部分答案，因此原因必须点明真正的起因：用“检测到重复调用”来描述轮次预算
@@ -789,15 +958,20 @@ class AgentLoop(PlanProgressMixin):
         "user_stopped": "已按你的要求停止",
     }
 
-    def _partial_answer(self, reason: str = "loop_detected") -> str:
+    def _partial_answer(self, reason: str = "loop_detected", detail: str = "") -> str:
         """总结本次运行在停止前设法确立的内容。
 
         在每一种不成功的终态都会调用，因此失败的运行绝不会空手而归：它形成的
         结论和抓取的数据，是已经付出成本的轮次所留下的有用残余。
+
+        ``detail`` 是失败的具体缘由（如"输出被 max_tokens 截断"）。笼统的
+        "模型调用失败"对排查没有帮助，因此有更精确的说法时就一并带出。
         """
         citations = self.cite.all()
         conclusions = self.ctx.conclusions
         cause = self._STOP_REASONS.get(reason, reason)
+        if detail and detail not in cause:
+            cause = f"{cause}：{detail}"
         lines = [f"本轮已提前结束（{cause}）。"]
         if conclusions:
             lines.append("已形成的结论：")
@@ -1009,9 +1183,12 @@ class AgentLoop(PlanProgressMixin):
         self.turn = 0
         self._call_counts = {}
         self._reminded = set()
+        self._call_errors = {}
+        self._successful_results = {}
         self._plan_hint = ""
         self._plan_signature = None
         self._plan_stall_turns = 0
+        self._fanout_hint = ""
         self._reported_drift = set()
         self._reported_mismatch = set()
         self.trace = []
@@ -1188,6 +1365,19 @@ class AgentLoop(PlanProgressMixin):
         if self.route_skills and not self._is_resume:
             await self._route_methodology()
 
+        # 引擎侧确定性扇出触发（docs 03.10）：多实体逐实体分析 → 预激活 spawn_agent
+        # 并把"必须扇出"的编排要求下发。放在 hydrate 末尾，故本轮第一次模型调用即可见；
+        # 只在主循环生效（子代理 call_type != "main"，不应再扇出）。
+        if self.call_type == "main" and fanout_intent(self._last_user_msg):
+            activate = getattr(self.registry, "activate", None)
+            if callable(activate):
+                activate("spawn_agent")
+            await self._emit(
+                "fanout_routed",
+                {"tools": ["spawn_agent"], "reason": "multi_entity_analysis"},
+            )
+            self._fanout_hint = _FANOUT_HINT
+
         mid_tool_round = self._resume_phase in {
             AgentPhase.TOOL_USE,
             AgentPhase.AWAITING_CONFIRMATION,
@@ -1296,6 +1486,8 @@ class AgentLoop(PlanProgressMixin):
         round_input = 0
         round_output = 0
         stop_requested = False
+        # 本轮重试计数从 0 起算——重试属于单轮 provider 调用，跨轮不继承。
+        self._round_retries = 0
 
         async with self.observer.llm_span(
             model=model,
@@ -1325,6 +1517,13 @@ class AgentLoop(PlanProgressMixin):
                             llm_span.mark_first_token()
                         deltas.append(chunk.data)
                         await self._emit("text_delta", {"text": chunk.data})
+                    elif chunk.event is StreamEvent.RESTART:
+                        # 上一次尝试的响应整体作废（如工具参数被截断），重试层即将
+                        # 重放：丢弃已累积的文本与工具片段，并通知客户端清屏，否则
+                        # 两次尝试的内容会拼接在一起。
+                        deltas.clear()
+                        tool_uses = []
+                        await self._emit("text_reset", {})
                     elif chunk.event is StreamEvent.MESSAGE_END and isinstance(
                         chunk.data, ModelUsage
                     ):
@@ -1361,8 +1560,15 @@ class AgentLoop(PlanProgressMixin):
                 self._pending_fail_kind = type(exc).__name__
                 self._pending_fail_message = str(exc)
                 self._pending_error = str(exc)
+                # "输出被截断"是可操作的（该调大 max_tokens），因此如实说出来，
+                # 而不是笼统地报"模型调用失败"。
+                detail = (
+                    "输出超过 max_tokens 被截断，请调大 model.max_tokens"
+                    if isinstance(exc, OutputTruncatedError)
+                    else ""
+                )
                 self._pending_answer = (
-                    self._partial_answer(reason="provider_error")
+                    self._partial_answer(reason="provider_error", detail=detail)
                     if self._has_partial_findings()
                     else ""
                 )
@@ -1418,6 +1624,7 @@ class AgentLoop(PlanProgressMixin):
                     usage=usage,
                     at=utc_now_iso(),
                     permissions=permissions,
+                    retries=self._round_retries,
                 ),
                 messages=pending + (assistant,),
             )
@@ -1441,6 +1648,7 @@ class AgentLoop(PlanProgressMixin):
                 tool_uses=(),
                 usage=usage,
                 at=utc_now_iso(),
+                retries=self._round_retries,
             )
         )
 
@@ -1724,18 +1932,39 @@ class AgentLoop(PlanProgressMixin):
                 llm_ms=llm_ms,
             )
             await self._audit_detection(detected)
+            wrapped = False
+            if self._has_partial_findings():
+                answer = await self._wrap_up_after_loop(tool_msg)
+                wrapped = True
+                if answer:
+                    self._pending_answer = answer
+                    self._pending_reason = None
+                    self._pending_fail_kind = ""
+                    self._pending_fail_message = ""
+                    self._pending_error = None
+                    return EffectResult(
+                        RunCompleted(
+                            kind="succeeded",
+                            reason=None,
+                            resumable=False,
+                            at=utc_now_iso(),
+                        ),
+                        messages=(),
+                    )
             self._pending_reason = "loop_detected"
             self._pending_fail_kind = "loop_detected"
             self._pending_fail_message = str(detected)
             self._pending_error = str(detected)
-            self._pending_answer = self._partial_answer(reason="loop_detected")
+            self._pending_answer = self._partial_answer(
+                reason="loop_detected", detail=str(detected)
+            )
             return EffectResult(
                 RunFailed(
                     kind="loop_detected",
                     message=str(detected),
                     at=utc_now_iso(),
                 ),
-                messages=(tool_msg,),
+                messages=() if wrapped else (tool_msg,),
             )
         except BaseException:
             aborted = await self._persist_aborted_results(machine, state.calls)
@@ -2137,19 +2366,33 @@ class AgentLoop(PlanProgressMixin):
                     preview=preview,
                 )
             observations.append(meta)
-        self.trace.append(
-            RoundTrace(
-                turn=self.rounds,
-                thought=thought,
-                actions=list(actions),
-                observations=observations,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                llm_first_ms=llm_first_ms,
-                llm_ms=llm_ms,
-                answer=answer,
-            )
+        round_trace = RoundTrace(
+            turn=self.rounds,
+            thought=thought,
+            actions=list(actions),
+            observations=observations,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            llm_first_ms=llm_first_ms,
+            llm_ms=llm_ms,
+            answer=answer,
         )
+        self.trace.append(round_trace)
+        # 实时落库旁路（可选）：sink 未实现时 no-op。附上记录该轮时的 FSM
+        # 阶段与修订号，使监控侧能把轮次轨迹与状态时间线对齐。
+        recorder = getattr(self.output, "record_round", None)
+        if recorder is not None:
+            state = self._machine.state if self._machine is not None else None
+            try:
+                recorder(
+                    round_trace,
+                    phase=state.phase.value if state is not None else None,
+                    revision=state.revision if state is not None else None,
+                )
+            except Exception:  # noqa: BLE001 - 观测旁路不得影响主执行
+                logger = getattr(self.observer, "log", None)
+                if logger is not None:
+                    logger.warning("round_record_failed", extra={"turn": self.rounds})
 
     @staticmethod
     def _decode_observation(rendered: str) -> tuple[bool, str | None, str]:
@@ -2211,12 +2454,16 @@ class AgentLoop(PlanProgressMixin):
             status["verdict"] = verdict
         if duration_ms is not None:
             status["duration_ms"] = duration_ms
+        self._attach_tool_summary(status, tool_use)
         await self._emit("tool_status", status)
         # 拒绝（被拒、惰性未激活、受循环防护、超时）同样是观测：只记录执行的
         # 轨迹无法区分一个被阻断的高风险调用和一个从未尝试过的调用。
         self._note_call(
             tool_use, ok=False, error=message, duration_ms=int(duration_ms or 0)
         )
+        # 循环防护自己的拒绝不是「上次工具错误」：盖掉它会让中止文案失去原始原因。
+        if verdict != "loop_guard":
+            self._call_errors[self._call_fingerprint(tool_use)] = message
         return tool_use.call_id, json.dumps(
             {"ok": False, "content": "", "error": message}, ensure_ascii=False
         )
@@ -2300,15 +2547,17 @@ class AgentLoop(PlanProgressMixin):
                 # 该调用形态的第二次违规：停止本次运行，而不是继续为一轮无法
                 # 推进的调用付费。
                 self._note_call(tool_use, ok=False, error=guard.message)
-                raise LoopDetected(
-                    f"tool {tool_use.name} repeated with identical arguments "
-                    f"{guard.count} times"
-                )
-            self._note_call(tool_use, ok=False, error=guard.message)
-            span.set_attribute("status", "loop_guard")
-            return tool_use.call_id, json.dumps(
-                {"ok": False, "content": "", "error": guard.message}, ensure_ascii=False
+                raise LoopDetected(guard.message, tool=tool_use.name)
+            encoded = self._repeat_result(tool_use, guard)
+            payload = json.loads(encoded)
+            self._note_call(
+                tool_use,
+                ok=bool(payload.get("ok")),
+                error=payload.get("error"),
+                content=str(payload.get("content") or ""),
             )
+            span.set_attribute("status", "loop_guard")
+            return tool_use.call_id, encoded
 
         # 治理链（docs 03.3.3）：先做权限判定，再执行 pre-hooks。
         # 已经过 FSM 确认的调用跳过闸门，避免 plain "y" 再次变成 CONFIRM。
@@ -2344,10 +2593,13 @@ class AgentLoop(PlanProgressMixin):
                 tool_use, f"tool blocked by hook: {tool_use.name}", verdict="blocked"
             )
 
-        await self._emit(
-            "tool_status",
-            {"call_id": tool_use.call_id, "name": tool_use.name, "status": "started"},
-        )
+        started: dict[str, Any] = {
+            "call_id": tool_use.call_id,
+            "name": tool_use.name,
+            "status": "started",
+        }
+        self._attach_tool_summary(started, tool_use)
+        await self._emit("tool_status", started)
         # 运维方的覆盖优先；否则使用工具声明的预算，若工具未声明则回退到
         # 全局默认值（docs 03.3.3）。
         default_timeout = self.settings.tools.timeout_default_s
@@ -2418,6 +2670,10 @@ class AgentLoop(PlanProgressMixin):
         span.set_attribute("status", "ok" if result.ok else "error")
         result.citations = self._register_citations(tool_use, result)
         self._note_review_outcome(result)
+        # 扇出已完成：把"必须扇出"换成"据结论汇合、别再自己重做"——既避免指令每轮重复
+        # 诱导反复重派（实测会从 3 个子代理膨胀到 12+），也阻止模型忽略结论后自行串行重取。
+        if tool_use.name == "spawn_agent":
+            self._fanout_hint = _FANOUT_MERGE_HINT
         await self._audit(
             tool,
             tool_use.args,
@@ -2428,20 +2684,19 @@ class AgentLoop(PlanProgressMixin):
             citations=result.citations,
             result=result,
         )
-        await self._emit(
-            "tool_status",
-            {
-                "call_id": tool_use.call_id,
-                "name": tool_use.name,
-                "status": "completed" if result.ok else "failed",
-                "ok": bool(result.ok),
-                "duration_ms": duration_ms,
-                "citations": list(result.citations),
-                # 产出的文件（图表、报告）一并附上，使客户端无需二次查询
-                # 即可提供它们。
-                "attachments": list(result.attachments),
-            },
-        )
+        completed: dict[str, Any] = {
+            "call_id": tool_use.call_id,
+            "name": tool_use.name,
+            "status": "completed" if result.ok else "failed",
+            "ok": bool(result.ok),
+            "duration_ms": duration_ms,
+            "citations": list(result.citations),
+            # 产出的文件（图表、报告）一并附上，使客户端无需二次查询
+            # 即可提供它们。
+            "attachments": list(result.attachments),
+        }
+        self._attach_tool_summary(completed, tool_use)
+        await self._emit("tool_status", completed)
         self._note_call(
             tool_use,
             ok=bool(result.ok),
@@ -2449,9 +2704,14 @@ class AgentLoop(PlanProgressMixin):
             content=result.content,
             duration_ms=duration_ms,
         )
-        return tool_use.call_id, self._encode(
-            result, self._result_budget(tool, tool_use.args)
-        )
+        fingerprint = self._call_fingerprint(tool_use)
+        encoded = self._encode(result, self._result_budget(tool, tool_use.args))
+        if result.ok:
+            self._call_errors.pop(fingerprint, None)
+            self._successful_results[fingerprint] = encoded
+        elif result.error:
+            self._call_errors[fingerprint] = result.error
+        return tool_use.call_id, encoded
 
     def _result_budget(self, tool: Any, args: dict[str, Any]) -> int:
         """按 运维覆盖 → 工具声明 → 全局 解析本次结果的 token 预算。

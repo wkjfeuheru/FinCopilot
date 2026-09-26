@@ -196,3 +196,55 @@ def test_done_payload_carries_rounds():
     sink = run(scenario())
     done = [event for event in sink.events if event.kind == "done"][-1]
     assert done.data["rounds"] == 2
+
+
+class RoundRecordingSink:
+    """实现可选 ``record_round`` 的 sink：模拟服务端实时落库钩子。"""
+
+    def __init__(self) -> None:
+        self.rounds: list[tuple[int, str | None, int | None]] = []
+
+    async def emit(self, event) -> None:  # pragma: no cover - 本测试只关心轮次
+        return None
+
+    def record_round(self, round_trace, *, phase=None, revision=None) -> None:
+        self.rounds.append((round_trace.turn, phase, revision))
+
+
+def test_record_round_is_called_live_with_phase_and_revision():
+    """每完成一轮，loop 通过可选钩子把轮次与当时的 phase/revision 交给 sink。"""
+    async def scenario():
+        sink = RoundRecordingSink()
+        provider = ScriptedProvider(
+            [
+                tool_round(ToolUse("c1", "get_quote", {"symbol": "600519"})),
+                text_round("ok"),
+            ]
+        )
+        registry = StubRegistry({"get_quote": RecordingTool("get_quote")})
+        loop = make_loop(provider, registry=registry, output=sink)
+        await loop.run("q")
+        return sink
+
+    sink = run(scenario())
+    assert [turn for turn, _, _ in sink.rounds] == [1, 2]
+    # 轮次在 think 效果内记录：第一轮回填工具结果时已处于 tooluse；
+    # 终轮记录时仍为 thinking（转为 complete 发生在随后的 dispatch）。
+    assert sink.rounds[0][1] == "tooluse"
+    assert sink.rounds[1][1] == "thinking"
+    # revision 单调递增且非空。
+    revisions = [revision for _, _, revision in sink.rounds]
+    assert all(r is not None for r in revisions)
+    assert revisions == sorted(revisions)
+
+
+def test_sink_without_record_round_is_tolerated():
+    """不实现 record_round 的 sink（旧服务端/脚本）不影响运行。"""
+    async def scenario():
+        from tests.engine.test_loop import Sink
+
+        loop = make_loop(ScriptedProvider([text_round("ok")]), output=Sink())
+        return await loop.run("q")
+
+    outcome = run(scenario())
+    assert outcome.succeeded is True

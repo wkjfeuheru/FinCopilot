@@ -61,8 +61,149 @@ const PLAN_STATUS: Record<PlanStepStatus, PlanStatusMeta> = {
   skipped: { label: "已跳过", tone: "skipped", mark: "—" },
 };
 
+export type LiveTense = "running" | "done";
+
+export type ToolSummary = {
+  industry?: string;
+  symbol?: string;
+  query?: string;
+  view?: string;
+  period?: string;
+  top?: number;
+  years?: number;
+  file?: string;
+  tasks?: string[];
+};
+
+const SKILL_SCENES: Record<string, string> = {
+  "industry-research": "行业研究",
+  "equity-research": "个股研究",
+  "macro-research": "宏观研究",
+  "quant-factor": "量化因子",
+};
+
 export function presentToolAction(name: string): string {
   return TOOL_ACTIONS[name] ?? "执行研究步骤";
+}
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function listedTargets(values: Array<string | undefined>): { text: string; total: number } {
+  const items = uniqueStrings(values);
+  return { text: items.slice(0, 3).join("、"), total: items.length };
+}
+
+function withTense(body: string, tense: LiveTense): string {
+  return tense === "running" ? `正在${body}` : `已${body}`;
+}
+
+function asSummaryList(summary: ToolSummary | ToolSummary[] | undefined): ToolSummary[] {
+  if (!summary) return [];
+  return Array.isArray(summary) ? summary : [summary];
+}
+
+export function asToolSummary(value: unknown): ToolSummary | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const data = value as Record<string, unknown>;
+  const out: ToolSummary = {};
+  if (typeof data.industry === "string" && data.industry) out.industry = data.industry;
+  if (typeof data.symbol === "string" && data.symbol) out.symbol = data.symbol;
+  if (typeof data.query === "string" && data.query) out.query = data.query;
+  if (typeof data.view === "string" && data.view) out.view = data.view;
+  if (typeof data.period === "string" && data.period) out.period = data.period;
+  if (typeof data.file === "string" && data.file) out.file = data.file;
+  if (data.top !== undefined && data.top !== null && `${data.top}` !== "") {
+    const top = Number(data.top);
+    if (Number.isFinite(top)) out.top = top;
+  }
+  if (data.years !== undefined && data.years !== null && `${data.years}` !== "") {
+    const years = Number(data.years);
+    if (Number.isFinite(years)) out.years = years;
+  }
+  if (Array.isArray(data.tasks)) {
+    const tasks = data.tasks.map((item) => String(item ?? "").trim()).filter(Boolean);
+    if (tasks.length) out.tasks = tasks;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+export function presentLiveAction(
+  name: string,
+  summary: ToolSummary | ToolSummary[] | undefined,
+  tense: LiveTense,
+): string {
+  const items = asSummaryList(summary);
+  const industries = listedTargets(items.map((item) => item.industry));
+  const symbols = listedTargets(items.map((item) => item.symbol));
+  const queries = listedTargets(items.map((item) => item.query));
+  const files = listedTargets(items.map((item) => item.file));
+
+  if (name === "get_industry_perf") {
+    if (industries.total === 0) {
+      if (items.some((item) => item.view === "ranking")) return withTense("读取行业涨跌幅排行", tense);
+      return withTense("读取行业表现", tense);
+    }
+    if (industries.total > 3) return withTense(`读取${industries.text}等 ${industries.total} 个行业表现`, tense);
+    return withTense(`读取${industries.text}行业表现`, tense);
+  }
+  if (name === "get_industry_constituents") {
+    if (industries.total === 0) return withTense("读取行业成分股", tense);
+    if (industries.total > 3) return withTense(`读取${industries.text}等 ${industries.total} 个行业成分股`, tense);
+    return withTense(`读取${industries.text}行业成分股`, tense);
+  }
+  if (name === "get_quote") {
+    if (symbols.total === 0) return withTense("读取最新行情", tense);
+    if (symbols.total > 3) return withTense(`读取 ${symbols.text} 等 ${symbols.total} 只最新行情`, tense);
+    return withTense(`读取 ${symbols.text} 最新行情`, tense);
+  }
+  if (name === "get_kline") {
+    return symbols.text ? withTense(`读取 ${symbols.text} 历史走势`, tense) : withTense("读取历史走势", tense);
+  }
+  if (name === "get_financials") {
+    return symbols.text ? withTense(`读取 ${symbols.text} 财务报表`, tense) : withTense("读取财务报表", tense);
+  }
+  if (name === "get_indicators") {
+    return symbols.text ? withTense(`读取 ${symbols.text} 财务指标`, tense) : withTense("读取财务指标", tense);
+  }
+  if (name === "get_valuation") {
+    return symbols.text ? withTense(`获取 ${symbols.text} 估值数据`, tense) : withTense("获取估值数据", tense);
+  }
+  if (name === "get_announcements") {
+    return symbols.text ? withTense(`查询 ${symbols.text} 公司公告`, tense) : withTense("查询公司公告", tense);
+  }
+  if (name === "web_search" || name === "get_market_news") {
+    if (!queries.text) return withTense(presentToolAction(name), tense);
+    return withTense(`检索「${queries.text}」`, tense);
+  }
+  if (name === "spawn_agent") {
+    const task = items[0]?.tasks?.[0];
+    if (task) return tense === "running" ? `正在研究：${task}` : `已完成研究：${task}`;
+    return withTense("分派独立研究任务", tense);
+  }
+  if ((name === "read_file" || name === "read_pdf" || name === "write_file") && files.text) {
+    return withTense(`${presentToolAction(name)} ${files.text}`, tense);
+  }
+  return withTense(presentToolAction(name), tense);
+}
+
+export function presentSkillAction(skills: string[], tense: LiveTense): string {
+  const scenes = uniqueStrings(
+    skills.map((id) => {
+      const root = id.split("/")[0] ?? id;
+      return SKILL_SCENES[root] ?? root;
+    }),
+  );
+  const text = scenes.slice(0, 3).join("、");
+  return withTense(text ? `加载${text}技能` : "加载研究技能", tense);
 }
 
 /**
@@ -89,6 +230,13 @@ export function presentToolProgress(data: Record<string, unknown>): string | nul
       parts.push(`预计剩余 ${Math.max(0, Math.round(Number(data.eta_s)))} 秒`);
     }
     return parts.join(" · ");
+  }
+  if (phase === "spawn") {
+    const task = String(data.task ?? "").trim();
+    const status = String(data.status ?? "");
+    if (status === "failed") return task ? `子任务未能完成：${task}` : "子任务未能完成";
+    if (status === "completed") return task ? `已完成研究：${task}` : "已完成独立研究任务";
+    return task ? `正在研究：${task}` : "正在派发独立研究任务";
   }
   return null;
 }

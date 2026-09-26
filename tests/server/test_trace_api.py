@@ -104,6 +104,14 @@ def test_admin_can_read_runs_and_metrics(tmp_path):
     store = TraceStore(settings.observability.trace_store.db_path)
     store.start_run(run_id="tr_seed", source="server", user_id="u", input="茅台股价")
     store.record_event("tr_seed", "tool_status", {"name": "get_quote", "status": "started", "call_id": "a"})
+    store.record_event(
+        "tr_seed", "state",
+        {"run_id": "agent-1", "revision": 0, "phase": "hydrate", "turn": 0},
+    )
+    store.record_event(
+        "tr_seed", "state",
+        {"run_id": "agent-1", "revision": 1, "phase": "complete", "turn": 1},
+    )
     store.finish_run("tr_seed", status="done", succeeded=True, reason="done", rounds=1, tool_calls=1)
 
     runs = client.get("/v1/trace/runs", headers=headers)
@@ -116,6 +124,10 @@ def test_admin_can_read_runs_and_metrics(tmp_path):
     assert detail.status_code == 200
     assert detail.json()["status"] == "done"
     assert "rounds_trace" in detail.json()
+    # 每步 state 以 states 数组暴露，含 phase/revision。
+    states = detail.json()["states"]
+    assert [s["phase"] for s in states] == ["hydrate", "complete"]
+    assert [s["revision"] for s in states] == [0, 1]
 
     metrics = client.get("/v1/trace/metrics", headers=headers)
     assert metrics.status_code == 200
@@ -123,6 +135,8 @@ def test_admin_can_read_runs_and_metrics(tmp_path):
     assert m["total_runs"] == 1
     assert m["completion"]["task_completion_rate"] == 1.0
     assert m["tool_calls_total"] == 1
+    assert m["total_states"] == 2
+    assert m["avg_steps"] == 2.0
 
 
 def test_non_admin_gets_403(tmp_path):

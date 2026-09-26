@@ -34,8 +34,14 @@ pytestmark = pytest.mark.smoke
 # 使用随包发布的 prompt，以便该资产本身也处于测试之下。
 SYSTEM_PROMPT = system_prompt()
 
-# 故意设得很小，使常规的多步任务会越过它并必须触发 compact。
-WINDOW_TOKENS = 12000
+# 故意设得较小，使常规的多步任务会越过它并必须触发 compact——但不能小到连
+# "压不动的地板"都装不下。窗口的固定开销是 system prompt + 全部工具 schema
+# （实测约 12.5k token），压缩只删历史消息、删不掉这部分。若阈值
+# （compaction_ratio × 窗口）落到地板之下，压缩在数学上无法达标，断言
+# "_window_tokens() < WINDOW_TOKENS" 就恒为假——那验的是配置写错，而不是
+# "窗口有界"这一契约。32000 让阈值（19200）明显高于地板，留有真实余量。
+WINDOW_TOKENS = 32000
+COMPACTION_RATIO = 0.6
 
 
 def _api_key() -> str:
@@ -51,7 +57,9 @@ def _build(tmp_path):
     settings = Settings(
         permission=PermissionSettings(default_mode="auto"),
         context=ContextSettings(
-            context_window_tokens=WINDOW_TOKENS, compaction_ratio=0.6, max_turns=30
+            context_window_tokens=WINDOW_TOKENS,
+            compaction_ratio=COMPACTION_RATIO,
+            max_turns=30,
         ),
         data={"cache_dir": tmp_path / "cache"},
         paths={"output_dir": tmp_path / "output"},
@@ -82,7 +90,17 @@ def _build(tmp_path):
 
 def test_long_session_keeps_the_window_bounded(tmp_path):
     """数据密集的会话必须触发 compact，并保持在 window 之内。"""
-    loop, settings = _build(tmp_path)
+    loop, _ = _build(tmp_path)
+
+    # 先自检窗口配置本身是自洽的：阈值必须高于不可压缩地板，否则下面的断言
+    # 无论如何都不可能成立，失败原因会指向压缩逻辑而非"窗口设小了"。
+    assert loop.memory.threshold_is_reachable(
+        system=SYSTEM_PROMPT, tools=loop.registry.schemas()
+    ), (
+        f"窗口配置自相矛盾：固定地板 "
+        f"{loop.memory.fixed_tokens(system=SYSTEM_PROMPT, tools=loop.registry.schemas())} token "
+        f"已 ≥ 压缩阈值 {loop.memory.compaction_threshold()}；上调 WINDOW_TOKENS"
+    )
 
     async def run():
         return await asyncio.wait_for(

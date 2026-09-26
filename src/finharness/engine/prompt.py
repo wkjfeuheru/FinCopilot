@@ -17,6 +17,8 @@ RISK_REVIEW_PATH = Path(__file__).resolve().parent.parent / "prompts" / "risk_re
 RISK_CHECKLIST_PATH = Path(__file__).resolve().parent.parent / "prompts" / "risk-checklist.md"
 # 通用 sub-agent 角色，用于纯粹为隔离上下文而分派任务时（docs 03.10）。
 WORKER_PATH = Path(__file__).resolve().parent.parent / "prompts" / "worker.md"
+# reader 角色：只消化交给它的材料、不取数（内部焦点；summarize_document 不再内部派它）。
+READER_PATH = Path(__file__).resolve().parent.parent / "prompts" / "reader.md"
 
 
 class PromptNotFoundError(RuntimeError):
@@ -64,6 +66,17 @@ def risk_checklist_prompt(path: str | Path | None = None) -> str:
 def worker_prompt(path: str | Path | None = None) -> str:
     """通用 sub-agent 角色提示词（docs 03.10）。
 
-    用于为隔离上下文而分派任务时，而非针对像风险评审这样的具名聚焦点。
+    用于为隔离上下文而分派任务时，而非针对像风险评审这样的具名聚焦点。任务点名了
+    标的时，该角色**可自行取数**。
     """
     return _read_prompt(Path(path) if path is not None else WORKER_PATH, "子代理提示词")
+
+
+@lru_cache(maxsize=1)
+def reader_prompt(path: str | Path | None = None) -> str:
+    """reader 角色提示词（docs 03.10）。
+
+    只消化交给它的材料、**不取数**；内部焦点，``summarize_document`` 不再内部派它。
+    与 ``worker_prompt`` 的区别是后者被允许自行取数。
+    """
+    return _read_prompt(Path(path) if path is not None else READER_PATH, "reader 提示词")

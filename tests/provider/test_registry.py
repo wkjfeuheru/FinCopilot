@@ -63,7 +63,7 @@ def test_build_provider_assembles_glm(monkeypatch, tmp_path):
         assert provider.base_url == "https://open.bigmodel.cn/api/anthropic/v1"
         assert provider.api_key == "glm-key"
         assert provider.temperature == 0.1
-        assert provider.max_tokens == 4096
+        assert provider.max_tokens == 8192
         assert provider.first_byte_timeout_s == 30.0
         assert provider.idle_timeout_s == 60.0
     finally:

@@ -183,6 +183,32 @@ class FailingProvider:
         yield  # pragma: no cover
 
 
+def test_unreachable_threshold_is_reported_not_silent(tmp_path):
+    """阈值低于不可压缩地板时必须如实告警，而不是每轮空转。
+
+    窗口的固定开销（system + 工具 schema）压缩删不掉。这里特意把 system 提示
+    写得比阈值还大，于是「折叠到最近一轮」之后窗口仍在地板之上；正确的行为是
+    出一条说明配置过低的 warning，而不是假装压缩成功。
+    """
+    settings = make_settings(tmp_path, context_window_tokens=100, compaction_ratio=0.5)
+    ctx = ResearchContext(cite=CitationRegistry(), settings=settings)
+    memory = WorkingMemory(ctx=ctx, settings=settings, counter=COUNTER)
+    for index in range(6):
+        memory.append_user(f"历史问题{index}" * 4)
+        memory.append_assistant(Msg(role="assistant", content=f"历史回答{index}" * 4))
+
+    compactor = AutoCompactor(
+        provider=ScriptedProvider([text_round("摘要内容")]),
+        memory=memory,
+        settings=settings,
+        system="一段足够长的系统提示词，其长度本身已经超过压缩阈值" * 3,
+    )
+    result = asyncio.run(compactor.compact())
+
+    assert result.after_tokens >= compactor.memory.compaction_threshold()
+    assert result.warning and "窗口配置过低" in result.warning
+
+
 def test_compaction_event_is_emitted(tmp_path):
     provider = ScriptedProvider([text_round("摘要"), text_round("答案")])
     sink = Sink()

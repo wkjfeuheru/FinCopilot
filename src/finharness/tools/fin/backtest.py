@@ -22,8 +22,9 @@ import numpy as np
 import pandas as pd
 
 from finharness.data.frames import persist_frame
+from finharness.data.mapping import normalize_valuation_indicator
 from finharness.data.raw import RawData
-from finharness.factor.engine import FactorEngine
+from finharness.factor.engine import MARKET_VARIABLES, FactorEngine
 from finharness.shared.declaration import Capability, Tier, ToolGroup, param, tool
 from finharness.tools.base import BaseTool
 
@@ -138,7 +139,8 @@ class RunBacktestTool(BaseTool):
         "factor_expr",
         desc=(
             "因子表达式（AST 白名单求值）。时序（单股）如 ts_mean(close,20)/ts_mean(close,60)-1；"
-            "横截面必须含 rank/zscore/quantile 算子，如 rank(ts_std(close/ts_delay(close,1)-1,20))"
+            "横截面必须含 rank/zscore/quantile，行情变量用 close 等，估值因子如 rank(-pe_ttm)"
+            "（另支持 pe/pb/pcf/总市值）。未知变量会在取价前拒绝，不要原样重试。"
         ),
     )
     @param("strategy", desc="内建策略（单股）：ma 双均线 / momentum 动量")
@@ -319,8 +321,12 @@ class RunBacktestTool(BaseTool):
         if not factor_expr:
             raise ValueError("横截面回测需要 factor_expr（因子表达式）")
         engine = FactorEngine()
-        if not engine.describe(factor_expr).cross_sectional:
+        info = engine.describe(factor_expr)
+        if not info.cross_sectional:
             raise ValueError("横截面回测的因子应包含 rank/zscore/quantile 等横截面算子")
+        # 未知变量在取股票池和行情之前拒绝：否则会先花掉整段面板取数，
+        # 再以「未知变量」失败，模型往往会原样重试直到循环防护掐断本轮。
+        market_columns, valuation_vars = self._classify_factor_variables(info.variables)
 
         symbols = await self._resolve_pool(pool)
         resolved = len(symbols)
@@ -345,11 +351,24 @@ class RunBacktestTool(BaseTool):
             }
         )
 
-        closes = await self._panel(symbols, years=years)
+        panels = await self._panel(symbols, years=years, columns=market_columns)
+        closes = panels.get("close")
         if closes is None or closes.shape[1] < groups:
             raise ValueError(f"有效股票数不足（{0 if closes is None else closes.shape[1]}），无法分组")
+        missing = [name for name in market_columns if name not in panels]
+        if missing:
+            raise ValueError(f"数据中缺少变量：{'、'.join(missing)}")
 
-        variables = self._panel_variables(closes)
+        variables = dict(panels)
+        if valuation_vars:
+            variables.update(
+                await self._valuation_panels(
+                    list(closes.columns),
+                    years=years,
+                    index=closes.index,
+                    variables=valuation_vars,
+                )
+            )
         factor = engine.evaluate(factor_expr, variables)
         returns = closes.pct_change()
         # 调仓窗口内的前向收益：t 时刻的信号预测 t+1..t+h。
@@ -449,9 +468,102 @@ class RunBacktestTool(BaseTool):
         return variables
 
     @staticmethod
-    def _panel_variables(closes: pd.DataFrame) -> dict[str, pd.DataFrame]:
-        """面板变量与收盘价面板同形（此处仅需 close）。"""
-        return {"close": closes}
+    def _classify_factor_variables(
+        names: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        """把表达式变量分成行情列与估值指标。
+
+        行情列随 K 线一并取出；估值名经 ``normalize_valuation_indicator`` 变成
+        规范指标（``pe_ttm`` → ``市盈率(TTM)``）。两者都不是的名字立刻拒绝，
+        避免先取面板再失败。
+        """
+        market: list[str] = []
+        valuation: dict[str, str] = {}
+        unknown: list[str] = []
+        for name in names:
+            if name in MARKET_VARIABLES:
+                market.append(name)
+                continue
+            try:
+                valuation[name] = normalize_valuation_indicator(name)
+            except ValueError:
+                unknown.append(name)
+        if unknown:
+            joined = "、".join(unknown)
+            raise ValueError(
+                f"未知变量：{joined}。横截面因子目前只支持行情变量"
+                f"（{'/'.join(MARKET_VARIABLES)}）与估值序列"
+                "（pe、pe_ttm、pb、pcf、总市值及其别名）。"
+                "财报字段（如 ROE）不在面板中，请更换表达式，不要原样重试。"
+            )
+        return tuple(market), valuation
+
+    async def _valuation_panels(
+        self,
+        symbols: list[str],
+        *,
+        years: int,
+        index: pd.Index,
+        variables: dict[str, str],
+    ) -> dict[str, pd.DataFrame]:
+        """按规范指标各取一次估值面板，再挂回表达式里的变量名。"""
+        by_indicator: dict[str, list[str]] = {}
+        for name, indicator in variables.items():
+            by_indicator.setdefault(indicator, []).append(name)
+        frames: dict[str, pd.DataFrame] = {}
+        for indicator, names in by_indicator.items():
+            panel = await self._valuation_panel(
+                symbols, years=years, indicator=indicator, index=index
+            )
+            if panel is None or panel.dropna(how="all").empty:
+                raise ValueError(
+                    f"未取到估值序列 {indicator}（变量 {'、'.join(names)}），无法计算因子"
+                )
+            for name in names:
+                frames[name] = panel
+        return frames
+
+    async def _valuation_panel(
+        self,
+        symbols: list[str],
+        *,
+        years: int,
+        indicator: str,
+        index: pd.Index,
+    ) -> pd.DataFrame | None:
+        """逐标的取一条估值序列，对齐到收盘价日期（向前填充）。"""
+
+        async def one(symbol: str) -> tuple[str, pd.Series] | None:
+            try:
+                raw = await self.data.valuation(symbol, lookback_years=years, indicator=indicator)
+            except Exception:
+                return None
+            series = self._valuation_series(raw.df)
+            if series is None:
+                return None
+            return symbol, series.reindex(index.union(series.index)).sort_index().ffill().reindex(index)
+
+        return await self._gather_panel(symbols, one, phase="valuation")
+
+    @staticmethod
+    def _valuation_series(df: pd.DataFrame | None) -> pd.Series | None:
+        """从估值表抽出按日期升序的数值列（指标列名带单位，不依赖固定列名）。"""
+        if df is None or not len(df) or "date" not in df.columns:
+            return None
+        frame = df.copy()
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame.dropna(subset=["date"]).sort_values("date")
+        frame = frame.drop_duplicates("date", keep="last")
+        numeric = [
+            column
+            for column in frame.columns
+            if column != "date" and pd.to_numeric(frame[column], errors="coerce").notna().any()
+        ]
+        if not numeric:
+            return None
+        series = pd.to_numeric(frame[numeric[-1]], errors="coerce")
+        series.index = pd.DatetimeIndex(frame["date"])
+        return series
 
     @staticmethod
     def _signal_from_factor(factor: pd.Series, params: dict[str, Any]) -> pd.Series:
@@ -564,15 +676,18 @@ class RunBacktestTool(BaseTool):
             raise ValueError("股票池为空或代码格式非法（需 6 位 A 股代码）")
         return cleaned
 
-    async def _panel(self, symbols: list[str], *, years: int) -> pd.DataFrame | None:
-        """逐标的取收盘价并对齐为「日期 x 标的」面板。
+    async def _panel(
+        self, symbols: list[str], *, years: int, columns: tuple[str, ...] = ()
+    ) -> dict[str, pd.DataFrame]:
+        """逐标的取行情并对齐为「日期 x 标的」面板，至少含 close。
 
-        面板构建是横截面回测里最慢的一段（逐只网络取数且受全局节流约束），因此
-        这里按完成数上报进度：每 ``_PROGRESS_EVERY`` 只一次，使客户端在整段取数
-        期间持续收到真实事件，而不是只有会被客户端忽略的心跳注释帧。
+        ``columns`` 是表达式额外点名的行情变量（open/volume 等），与 close
+        同一次 K 线取回。面板构建是横截面回测里最慢的一段（逐只网络取数且受
+        全局节流约束），因此按完成数上报进度。
         """
+        wanted = tuple(dict.fromkeys(("close", *columns)))
 
-        async def one(symbol: str) -> tuple[str, pd.Series] | None:
+        async def one(symbol: str) -> tuple[str, dict[str, pd.Series]] | None:
             try:
                 raw = await self.data.kline(symbol, years=years)
             except Exception:
@@ -580,30 +695,72 @@ class RunBacktestTool(BaseTool):
             df = raw.df
             if df is None or not len(df) or "date" not in df.columns or "close" not in df.columns:
                 return None
-            frame = df[["date", "close"]].copy()
+            keep = ["date", *[column for column in wanted if column in df.columns]]
+            frame = df[keep].copy()
             frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-            frame = frame.dropna(subset=["date"]).sort_values("date").set_index("date")
-            return symbol, pd.to_numeric(frame["close"], errors="coerce")
+            frame = frame.dropna(subset=["date"]).sort_values("date")
+            frame = frame.drop_duplicates("date", keep="last").set_index("date")
+            series = {
+                column: pd.to_numeric(frame[column], errors="coerce")
+                for column in wanted
+                if column in frame.columns
+            }
+            if "close" not in series:
+                return None
+            return symbol, series
 
+        buckets: dict[str, dict[str, pd.Series]] = {column: {} for column in wanted}
+
+        def accept(result: tuple[str, dict[str, pd.Series]]) -> None:
+            symbol, series = result
+            for column, values in series.items():
+                buckets[column][symbol] = values
+
+        await self._collect(
+            symbols,
+            one,
+            phase="panel",
+            accept=accept,
+            available=lambda: len(buckets["close"]),
+        )
+        return {
+            column: pd.DataFrame(mapping).sort_index()
+            for column, mapping in buckets.items()
+            if mapping
+        }
+
+    async def _gather_panel(self, symbols: list[str], one, *, phase: str) -> pd.DataFrame | None:
+        """把 ``one(symbol) -> (symbol, series) | None`` 收成「日期 x 标的」表。"""
+        series: dict[str, pd.Series] = {}
+
+        def accept(result: tuple[str, pd.Series]) -> None:
+            series[result[0]] = result[1]
+
+        await self._collect(symbols, one, phase=phase, accept=accept, available=lambda: len(series))
+        if not series:
+            return None
+        return pd.DataFrame(series).sort_index()
+
+    async def _collect(self, symbols, one, *, phase: str, accept, available) -> None:
+        """并发取数并按完成数上报进度；取消本协程时一并取消未完成的任务。"""
         total = len(symbols)
         started = time.monotonic()
-        series: dict[str, pd.Series] = {}
         fetched = 0
-        tasks = [asyncio.ensure_future(one(s)) for s in symbols]
+        tasks = [asyncio.ensure_future(one(symbol)) for symbol in symbols]
         try:
             for completed in asyncio.as_completed(tasks):
                 result = await completed
                 fetched += 1
                 if result is not None:
-                    series[result[0]] = result[1]
+                    accept(result)
                 if fetched % _PROGRESS_EVERY == 0 or fetched == total:
                     elapsed = time.monotonic() - started
                     await self._report_progress(
                         {
-                            "phase": "panel",
+                            "phase": phase,
                             "fetched": fetched,
                             "total": total,
-                            "available": len(series),
+                            "available": available(),
                             "elapsed_s": round(elapsed, 1),
                             # 线性外推，仅作量级提示；取数快慢随命中缓存与网络波动。
                             "eta_s": round(elapsed / fetched * (total - fetched), 1) if fetched else None,
@@ -615,9 +772,6 @@ class RunBacktestTool(BaseTool):
             for task in tasks:
                 if not task.done():
                     task.cancel()
-        if not series:
-            return None
-        return pd.DataFrame(series).sort_index()
 
     async def _report_progress(self, payload: dict[str, Any]) -> None:
         """上报一次中间进展；未注入回调时静默跳过（如单测直接调用工具）。"""

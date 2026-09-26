@@ -115,6 +115,7 @@ FINANCIAL_DATA_TOOLS = ALL_TOOL_CLASSES
 # GENERIC 增加 read_file 以读取渲染产物与缓存 parquet。FIN_CALC 被刻意排除：
 # 这些工具只在调用方提供的输入上做计算，因此无法增加独立核验某个数字的能力。
 REVIEW_TOOL_GROUPS: tuple[ToolGroup, ...] = (ToolGroup.FIN_DATA, ToolGroup.GENERIC)
+_SPAWN_COMPANIONS = frozenset({"web_search", "summarize_document", "read_pdf"})
 
 
 def review_tool_names() -> tuple[str, ...]:
@@ -140,13 +141,29 @@ def review_tool_names() -> tuple[str, ...]:
     )
 
 
-def worker_tool_names() -> tuple[str, ...]:
-    """通用子代理可调用的子集：仅限本地材料（docs 03.10）。
+def general_tool_names() -> tuple[str, ...]:
+    """通用子代理的只读子集：复核者工具 + ``web_search``。
 
-    为隔离上下文而派发的子代理只消费交给它的材料；它不会自行去取数。因此这里刻意
-    只含*通用*只读工具——``read_file``，用于以路径传入的材料——而**不含**
-    ``review_tool_names()``，后者还额外携带数据层。一个唯一输入只是任务文本的
-    worker 本就无法正确选择股票代码或行业，给它数据工具只会招致猜测，而非隔离。
+    不把 ``web_search.review_eligible`` 改成 True：风险复核者仍不得联网，以免把
+    不可信网页文本拉进一次本该核对报告与会话数据的阅读。通用 worker 在任务明确
+    要求检索公开讨论时需要它，因此这里显式追加，而不是放宽复核资格。
+    """
+    extra = ("web_search",) if "web_search" not in review_tool_names() else ()
+    return tuple(dict.fromkeys((*review_tool_names(), *extra)))
+
+
+def reader_tool_names() -> tuple[str, ...]:
+    """reader 子代理可调用的子集：仅限本地材料（docs 03.10）。
+
+    为隔离上下文而派生、**只消化材料**的 reader 不会自行去取数。因此这里刻意只含*通用*
+    只读工具——``read_file`` 与 ``read_pdf``——用于以路径传入或按页精读的材料，而**不含**
+    ``review_tool_names()``，后者还额外携带数据层。一个唯一输入只是任务文本的 reader
+    本就无法正确选择股票代码或行业，给它数据工具只会招致猜测，而非隔离。
+    ``summarize_document`` 不再内部派本焦点（它只返回分片索引）。
+
+    注意与 ``general`` 焦点的区别：``general`` 是模型可见的通用子代理，**可自行取数**
+    （其工具集即 ``general_tool_names()``）；``reader`` 是内部只读材料角色。二者不是同一个
+    东西——历史上本函数曾名为 ``worker_tool_names`` 并同时喂给两者，现已拆开。
 
     与 ``review_tool_names`` 一样按谓词推导：新的通用只读工具无需修改本函数即可可用。
     """
@@ -267,14 +284,22 @@ class ToolRegistry:
         return name in self._lazy
 
     def activate(self, name: str) -> bool:
-        """将一个工具加入已注入集合；对未知或已激活的工具返回 False。"""
-        if name not in self.tools or name in self._active:
+        """将一个工具加入已注入集合；对未知或已激活的工具返回 False。
+
+        激活 ``web_search`` / ``summarize_document`` / ``read_pdf`` 时顺带激活
+        ``spawn_agent``，使下一轮 schema 里可见隔离入口。不注入必须调用 spawn 的指令。
+        """
+        if name not in self.tools:
             return False
-        self._active.add(name)
-        self._order = [existing for existing in self._order if existing != name]
-        self._order.append(name)
-        self._demote_beyond_cap()
-        return True
+        newly = name not in self._active
+        if newly:
+            self._active.add(name)
+            self._order = [existing for existing in self._order if existing != name]
+            self._order.append(name)
+            self._demote_beyond_cap()
+        if name in _SPAWN_COMPANIONS:
+            self.activate("spawn_agent")
+        return newly
 
     def activate_many(self, names: list[str]) -> list[str]:
         """批量激活，返回真正新激活的名称（已激活或未知的项被忽略）。"""

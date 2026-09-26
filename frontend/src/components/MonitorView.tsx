@@ -8,7 +8,7 @@ import {
   fetchTraceRuns,
   fetchTraceStatus,
 } from "../api/trace";
-import type { TraceMetrics, TraceRun, TraceRunDetail, TraceFilters, TraceStatus } from "../api/trace";
+import type { TraceMetrics, TraceRun, TraceRunDetail, TraceFilters, TraceState, TraceStatus } from "../api/trace";
 import { AgentTrace } from "./AgentTrace";
 import type { AgentStep, TurnTrace } from "./AgentTrace";
 import {
@@ -21,6 +21,7 @@ import {
   presentReason,
   presentStatus,
 } from "../lib/monitorPresentation";
+import { buildAgentStateTimeline } from "../lib/agentState";
 
 /** trace 详情 → AgentTrace 可渲染的 TurnTrace（复用工作台时间线样式）。
  * 导出以便单测：跑偏点高亮与逐轮顺序是监控页的核心可读性。 */
@@ -133,6 +134,11 @@ export function MetricsPanel({ filters }: { filters: TraceFilters }) {
         />
         <MetricCard title="工具调用次数" value={formatCount(metrics.tool_calls_total)} />
         <MetricCard title="平均执行步数" value={formatAverage(metrics.avg_rounds)} hint="单位：轮" />
+        <MetricCard
+          title="平均状态步数"
+          value={formatAverage(metrics.avg_steps)}
+          hint={`共 ${formatCount(metrics.total_states)} 步`}
+        />
         <MetricCard title="工具失败率" value={formatRate(metrics.tool_failure_rate)} />
         <MetricCard
           title="重复调用率"
@@ -188,6 +194,30 @@ export function MetricsPanel({ filters }: { filters: TraceFilters }) {
           )}
         </Card>
       </div>
+    </div>
+  );
+}
+
+/** 每步 FSM state 的阶段时间线：hydrate→thinking→tooluse→…，含每段时长。 */
+export function AgentStateTimeline({ states }: { states: TraceState[] }) {
+  const entries = buildAgentStateTimeline(states);
+  if (entries.length === 0) return null;
+  return (
+    <div className="monitor-state-timeline">
+      <strong>阶段时间线</strong>
+      <ul className="monitor-state-steps">
+        {entries.map((entry, index) => (
+          <li key={`${entry.revision}-${index}`} className={`monitor-state-step phase-${entry.phase}`}>
+            <Tag>{entry.label}</Tag>
+            <span className="monitor-state-turn">
+              {entry.turn === null ? "—" : `第 ${entry.turn} 轮`}
+            </span>
+            <span className="monitor-state-duration">
+              {entry.duration_ms === null ? "" : formatDuration(entry.duration_ms)}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -298,6 +328,7 @@ export function RunsPanel({ filters }: { filters: TraceFilters }) {
               <span>工具调用：{detail.tool_calls ?? "—"}</span>
               <span>耗时：{formatDuration(detail.duration_ms)}</span>
             </p>
+            <AgentStateTimeline states={detail.states ?? []} />
             <AgentTrace trace={detailToTrace(detail)} />
             {detail.answer ? (
               <div className="monitor-trace-answer">

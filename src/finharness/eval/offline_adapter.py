@@ -16,6 +16,9 @@ class OfflineAdapter(DataAdapter):
 
     name = "offline"
 
+    # 排行夹具的数据日期：与其它离线夹具保持同一“当下”基准。
+    RANKING_DATE = "2026-09-14"
+
     def _quote_frame(self) -> pd.DataFrame:
         return pd.DataFrame(
             [
@@ -132,6 +135,36 @@ class OfflineAdapter(DataAdapter):
             [{"行业": industry or "申万一级", "涨跌幅": 1.1, "PE": 18.0}]
         )
         return FetchResult(df=df, interface="offline:industry_perf")
+
+    def fetch_industry_ranking(self, period: str = "day", as_of: str | None = None) -> FetchResult:
+        """离线排行：已按涨跌幅降序，前五名固定，供评测做确定性断言。"""
+        rows = [
+            ("801950", "煤炭", 0.63),
+            ("801130", "纺织服饰", 0.35),
+            ("801780", "银行", 0.31),
+            ("801110", "家用电器", 0.01),
+            ("801160", "公用事业", -0.11),
+            ("801960", "石油石化", -0.15),
+            ("801980", "美容护理", -0.28),
+            ("801170", "交通运输", -0.43),
+            ("801140", "轻工制造", -0.82),
+            ("801230", "综合", -0.98),
+            ("801040", "钢铁", -1.01),
+            ("801210", "社会服务", -1.04),
+        ]
+        df = pd.DataFrame(
+            [
+                {
+                    "code": code,
+                    "industry": name,
+                    "date": self.RANKING_DATE,
+                    "close": round(3000 + pct * 100, 2),
+                    "pct_change": pct,
+                }
+                for code, name, pct in rows
+            ]
+        )
+        return FetchResult(df=df, interface=f"offline:industry_ranking:{period}")
 
     def fetch_industry_constituents(self, industry: str) -> FetchResult:
         df = pd.DataFrame([{"代码": "600519", "名称": "贵州茅台"}])

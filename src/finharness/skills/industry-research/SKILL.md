@@ -43,7 +43,7 @@ version: 1
 
 | 步骤 | 做什么 | 加载什么 / 调用什么 |
 |---|---|---|
-| 1 定位 | 确定行业边界与主要参与者 | `get_industry_perf`（行业概览/行情）／`get_peers`（由个股定位行业） |
+| 1 定位 | 确定行业边界与主要参与者 | `get_industry_perf`（行业概览/行情/涨跌幅排行）／`get_peers`（由个股定位行业） |
 | 2 结构 | 生命周期阶段 + 竞争格局与集中度 | references/lifecycle.md；competition.md |
 | 3 产业链 | 上中下游拆解、价值分布、话语权 | references/value-chain.md |
 | 4 景气 | 景气跟踪指标体系与当前判断 | references/prosperity.md |
@@ -51,7 +51,10 @@ version: 1
 | 6 综合 | 关键成功因素 → 投资逻辑归纳 | references/csf.md |
 
 **数据基础**：行业指数行情用 `get_industry_perf`（申万行业，支持一级与二级如"白酒"；
-省略行业名返回申万一级行业总览与估值横向对比），成分股用 `get_industry_constituents`
+省略行业名时 `view="overview"` 返回申万一级行业总览与估值横向对比，`view="ranking"`
+返回申万一级行业涨跌幅排行——问「涨幅前五／涨得最好／跌幅最大」这类**排序**问题用它，
+并用 `period` 指定 day/week/month、用 `top` 指定前若干名，**不要**逐个行业取指数历史
+再自行排序拼接），成分股用 `get_industry_constituents`
 （也可作横截面股票池）；行业特有风险写报告时从 references/risk-identification.md 取候选。
 
 ## 参考文件索引

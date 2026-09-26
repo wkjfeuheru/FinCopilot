@@ -14,8 +14,8 @@
   研报正文是另一台主机上的 PDF。``with_text`` 会逐篇抓取这些 PDF 并**落盘**，
   这也是它默认关闭的原因。
 * **句柄优先于正文。** 一份研报动辄数十页，远超单条工具结果的 token 预算，因此
-  这里返回的是"每篇一行句柄（含本地路径）+ 首页预览"，而不是正文本身。要摘要用
-  ``summarize_document``，要细节用 ``read_pdf`` 按页读取——两者都基于同一个
+  这里返回的是"每篇一行句柄（含本地路径）+ 首页预览"，而不是正文本身。  要摘要用
+  ``summarize_document`` 拿分片索引再按片 ``spawn_agent``，要细节用 ``read_pdf`` 按页读取——两者都基于同一个
   落盘文件，无需重新抓取。
 * **内容不可信。** 研报正文是第三方文本：预览与分页读取都会像网页结果那样被
   围栏包裹（见 ``fencing.py``），使其读起来是引用材料而非指令。
@@ -68,7 +68,7 @@ def _default_end() -> str:
     data_tool=True,
     output_schema_note=(
         "返回研报列表；with_text=true 时每篇另含本地 PDF 路径与首页预览"
-        "（摘要用 summarize_document，精读用 read_pdf）。"
+        "（先 summarize_document 拿分片索引再 spawn_agent，精读用 read_pdf）。"
     ),
 )
 class GetResearchReportsTool(BaseTool):
@@ -142,7 +142,7 @@ class GetResearchReportsTool(BaseTool):
         不知道丢了什么"。
         """
         lines = [EXTERNAL_NOTICE, ""]
-        lines.append(f"共 {len(df)} 篇研报（正文已落盘，摘要用 summarize_document，精读用 read_pdf）。")
+        lines.append(f"共 {len(df)} 篇研报（正文已落盘，先 summarize_document 拿分片索引再 spawn_agent，精读用 read_pdf）。")
         lines.append("")
 
         lines.append("### 研报清单")

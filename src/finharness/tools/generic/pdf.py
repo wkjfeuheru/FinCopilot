@@ -37,7 +37,8 @@ _MAX_PAGES_PER_READ = 10
     name="read_pdf",
     description=(
         "按页读取本地 PDF（研报/公告正文）。给出 path，可选 pages（如 '2-5'）。"
-        "用于在拿到落盘句柄后精读指定页，避免一次性拉入整份长文档。"
+        "用于在拿到落盘句柄或 summarize_document 分片索引后精读指定页。"
+        "消化多页长文档时用 spawn_agent 按片隔离，不要一次性拉入整份。"
     ),
     capability=Capability.FILE,
     # 只有在拿到落盘句柄（研报/公告 PDF）之后才有用，故与抓取类工具同属按需注入。

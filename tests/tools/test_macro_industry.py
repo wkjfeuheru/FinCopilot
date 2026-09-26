@@ -1,6 +1,7 @@
 """宏观与行业数据工具：映射、渲染与 adapter 契约。"""
 
 import asyncio
+import re
 from datetime import date, timedelta
 
 import pandas as pd
@@ -59,6 +60,30 @@ class Adapter(DataAdapter):
             df=pd.DataFrame({"序号": [1], "证券代码": ["000596"], "证券名称": ["古井贡酒"]}),
             interface="fake_cons",
         )
+
+    def fetch_industry_ranking(self, period="day", as_of=None):
+        # 适配器契约：已按涨跌幅降序，并带 date 列供上层披露口径。
+        rows = [
+            ("801950", "煤炭", 0.63),
+            ("801130", "纺织服饰", 0.35),
+            ("801780", "银行", 0.31),
+            ("801110", "家用电器", 0.01),
+            ("801160", "公用事业", -0.11),
+            ("801960", "石油石化", -0.15),
+        ]
+        df = pd.DataFrame(
+            [
+                {
+                    "code": code,
+                    "industry": name,
+                    "date": pd.Timestamp("2026-09-24"),
+                    "close": 3000.0,
+                    "pct_change": pct,
+                }
+                for code, name, pct in rows
+            ]
+        )
+        return FetchResult(df=df, interface=f"fake_ranking_{period}")
 
 
 def make_access(tmp_path) -> DataAccess:
@@ -303,3 +328,58 @@ def test_industry_constituents_returns_symbols(tmp_path):
 
     assert result.ok is True
     assert "古井贡酒" in result.content
+
+
+def test_industry_ranking_leads_with_the_conclusion_and_data_date(tmp_path):
+    """排行必须把「前几名是谁」放在最前，并给出数据日期。
+
+    这正是本仓库一次真实缺陷的验收面：当时模型只给了 31 行全量年榜、没有一句
+    「前五是这五个」，用户被迫自己拼答案。
+    """
+    async def run():
+        return await GetIndustryPerfTool(make_access(tmp_path)).run(view="ranking", top=5)
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    content = result.content
+    # 结论行在最前，直接点名第一名与数据日期。
+    assert content.startswith("申万一级行业单日涨跌幅排行")
+    assert "2026-09-24" in content
+    assert "第 1 名 煤炭" in content
+    # 单日口径，而不是区间收益。
+    assert "单日" in content
+    assert "区间" not in content
+
+
+def test_industry_ranking_top_limits_rows_and_keeps_order(tmp_path):
+    """``top=5`` 只留 5 行，且顺序由工具保证（模型不再自行排序）。"""
+    async def run():
+        return await GetIndustryPerfTool(make_access(tmp_path)).run(view="ranking", top=5)
+
+    result = asyncio.run(run())
+
+    # 表体只有 5 个数据行（表头与分隔行都不以「| 数字 |」开头）。
+    data_rows = [line for line in result.content.splitlines() if re.match(r"\|\s*\d+\s*\|", line)]
+    assert len(data_rows) == 5
+    assert "石油石化" not in result.content  # 第 6 名被 top 截掉
+
+
+def test_industry_ranking_without_top_returns_all_rows(tmp_path):
+    async def run():
+        return await GetIndustryPerfTool(make_access(tmp_path)).run(view="ranking")
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert "石油石化" in result.content
+
+
+def test_industry_ranking_keeps_negative_industries_visible(tmp_path):
+    """垫底行业可能是负收益：排行不得只留上涨的。"""
+    async def run():
+        return await GetIndustryPerfTool(make_access(tmp_path)).run(view="ranking", top=5)
+
+    result = asyncio.run(run())
+
+    assert "-0.11%" in result.content

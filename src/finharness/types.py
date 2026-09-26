@@ -49,6 +49,11 @@ class StreamEvent(str, Enum):
     TOOL_USE_DELTA = "tool_use_delta"
     MESSAGE_END = "message_end"
     ERROR = "error"
+    # 重试层在重放一次作废的尝试（见 ``ProviderError.voids_output``）之前发出，
+    # 要求消费方丢弃本轮到目前为止已累积的文本与工具片段。它只出现在"响应本身
+    # 无效"这类**流结束后**才发现的失败上——传输层失败发生在任何片段之前，
+    # 消费方本就还没有累积任何东西。
+    RESTART = "restart"
 
 
 @dataclass(slots=True)
@@ -153,6 +158,17 @@ class OutputSink(Protocol):
     """引擎事件的输出汇点；服务层借此接收流式事件并推送给客户端。"""
 
     async def emit(self, event: EngineEvent) -> None: ...
+
+    def record_round(
+        self, round_trace: RoundTrace, *, phase: str | None = None, revision: int | None = None
+    ) -> None:
+        """可选：实时落一条轮次轨迹（监控旁路，docs 03.14）。
+
+        引擎不依赖任何观测存储，因此这是**可选**钩子——不实现它的 sink
+        （旧服务端、脚本、纯事件收集器）保持原样，引擎通过 ``getattr``
+        探测后调用。``phase``/``revision`` 是记录该轮时的 FSM 阶段与修订号。
+        """
+        ...
 
 
 class StopSignal:

@@ -1,0 +1,357 @@
+# D6 动态编排类（dynamic，14 条）
+#
+# 主题：**引擎的两类动态行为**——按问题意图自动注入场景技能（skill），以及按任务结构
+# 把工作分派给子代理（spawn_agent）。二者都不是模型可自行调用的"工具"，而是引擎在
+# 路由/编排层的动作，因此断言落在**可观测的注入与分派**上，而不是回答措辞。
+#
+# 判定核心：
+#   * 技能注入（skills_must / skills_must_not）读 ``context_routed`` 事件。
+#     键的词汇是精确的：**裸技能名**（``equity-research``）代表注入了该场景的
+#     **流程** SKILL.md；``技能/文件``（``equity-research/references/valuation.md``）
+#     代表只注入了某份**方法论/模板**。单一能力的问题只该拿到方法论、不该连带整套
+#     流程，因此 "裸名缺席" 本身是可断言的契约（见 DYN-005/DYN-008）。
+#   * 子代理分派读工具轨迹。触发判据是"每个工作单元的中间材料量"，不是"是不是取数"：
+#     逐实体深分析 → 可扇出；单纯并行取几份数据 → 不扇出（同轮 gather 即可）。
+#     因此多数多实体用例用 ``tools_any``（扇出自由裁量）。**若**扇出，则由
+#     ``spawn_tasks_cover`` 强制"逐单元拆解"（每个实体须出现在某条子任务里），
+#     ``answer.contains_all`` 无条件守住"每个实体都被最终答案覆盖"。spawn_agent 是
+#     懒加载工具，直接调用即激活（docs 03.4.3）。
+#
+# ID 前缀 DYN。category 第一段 = 功能域（SKILL/META）。
+# 执行：python -m finharness.eval run --set dynamic
+
+# ── 技能动态加载：多能力叠加注入多套流程 + 方法论 ──
+# 门槛：命中 ≥2 个研究能力时，连场景**流程**一起注入（_SKILL_FLOW_THRESHOLD=2）。
+
+- id: DYN-001
+  title: 三场景叠加：行业+宏观+个股，注入三套流程与方法论
+  category: SKILL
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 结合行业景气度与宏观利率环境，分析宁德时代(300750)的估值与盈利前景
+      interactive: none
+      expect:
+        trajectory:
+          skills_must: [equity-research, industry-research, macro-research]
+          tools_any: [get_valuation, get_financials, get_industry_perf, get_macro_indicators]
+          max_tool_calls: 80
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 400000, max_seconds: 900, max_rounds: 24}
+  notes: "四能力（财务/估值/行业/宏观）同时命中 → 三套场景流程 + 各自方法论一起注入。"
+
+- id: DYN-002
+  title: 双场景叠加：行业竞争格局 + 同业估值对比
+  category: SKILL
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 分析白酒行业的竞争格局，并对比茅台(600519)与五粮液(000858)的估值水平
+      interactive: none
+      expect:
+        trajectory:
+          skills_must: [industry-research, equity-research]
+          tools_any: [get_industry_perf, get_valuation, get_financials]
+          max_tool_calls: 80
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 700000, max_seconds: 900, max_rounds: 24}
+
+- id: DYN-003
+  title: 宏观传导到行业与估值：三套方法论协同
+  category: SKILL
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 当前宏观流动性与利率环境对成长股估值意味着什么？请结合行业景气度说明
+      interactive: none
+      expect:
+        trajectory:
+          skills_must: [macro-research, industry-research, equity-research]
+          tools_any: [get_macro_indicators, get_industry_perf]
+          max_tool_calls: 80
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 400000, max_seconds: 900, max_rounds: 24}
+  notes: "无个股代码也应正确路由：能力来自文本意图，不依赖标的。"
+
+- id: DYN-004
+  title: 量化+宏观+估值：因子回测与宏观解读叠加
+  category: SKILL
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 用估值分位与动量因子构建一个组合并回测，再结合宏观环境解读结果
+      interactive: none
+      expect:
+        trajectory:
+          skills_must: [quant-factor, macro-research, equity-research]
+          tools_must: [run_backtest]
+          max_tool_calls: 80
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 400000, max_seconds: 900, max_rounds: 24}
+
+# ── 技能动态加载：单能力的边界契约（只给方法论，不塞整套流程）──
+
+- id: DYN-005
+  title: 单能力只注入方法论，不注入场景流程
+  category: SKILL
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 宁德时代(300750)近一年的经营性现金流质量如何？
+      interactive: none
+      expect:
+        trajectory:
+          # 精确到方法论文件：现金流质量归属于盈利方法论。
+          skills_must: [equity-research/references/profitability.md]
+          # 裸技能名代表"整套场景流程"，单一能力不该触发它。
+          skills_must_not: [equity-research, industry-research, macro-research, quant-factor]
+          tools_any: [get_financials, get_indicators]
+          max_tool_calls: 20
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 200000, max_seconds: 300, max_rounds: 12}
+  notes: "gate=2：命中少于 2 个研究能力时不注入流程。这是「轻量提问付轻量开销」的回归防线。"
+
+- id: DYN-006
+  title: 成稿请求：注入报告模板（多能力时连流程一起）
+  category: SKILL
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 结合盈利与估值，为五粮液(000858)出一份研报
+      interactive: confirm
+      expect:
+        trajectory:
+          skills_must: [equity-research, equity-research/assets/report-template.md]
+          tools_any: [get_financials, get_valuation, write_report]
+          max_tool_calls: 80
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 400000, max_seconds: 900, max_rounds: 24}
+  notes: "成稿关键词触发模板注入；模板是排版契约，缺它则章节/引用附录形状不受控。"
+
+- id: DYN-007
+  title: 行业成稿：模板按行业场景选取
+  category: SKILL
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 对光伏行业做一次全景研究：竞争格局、产业链价值分布与风险，最后成稿
+      interactive: confirm
+      expect:
+        trajectory:
+          skills_must: [industry-research/references/competition.md, industry-research/assets/report-template.md]
+          tools_must: [write_report]
+          max_tool_calls: 80
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 400000, max_seconds: 900, max_rounds: 24}
+
+- id: DYN-008
+  title: 简单事实问题不加载任何技能
+  category: SKILL
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 贵州茅台(600519)今天的最新股价是多少？
+      interactive: none
+      expect:
+        trajectory:
+          skills_must_not: [equity-research, industry-research, macro-research, quant-factor]
+          tools_must: [get_quote]
+          plan_required: false
+          max_tool_calls: 6
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 60000, max_seconds: 90, max_rounds: 6}
+  notes: "单点取数：既不注入方法论也不起计划——路由不能对简单问题过度反应。citations.required 兼作「确实作答了」的守卫（未拒答才会有引用）。"
+
+# ── 子代理分派：把相互独立的工作线交给并行子代理 ──
+
+- id: DYN-009
+  title: 四家银行资产质量各自独立评估（扇出）
+  category: META
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 分别评估招商银行(600036)、兴业银行(601166)、平安银行(000001)、宁波银行(002142)的资产质量，各给一句话结论
+      interactive: none
+      expect:
+        answer:
+          contains_all: [招商银行, 兴业银行, 平安银行, 宁波银行]
+        trajectory:
+          tools_any: [spawn_agent, get_indicators, get_financials]
+          spawn_tasks_cover: ["600036", "601166", "000001", "002142"]
+          max_tool_calls: 80
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 650000, max_seconds: 900, max_rounds: 24}
+  notes: "扇出为自由裁量（docs 03.10：隔离是唯一理由，prompt 明确「不要为并行取数派
+        子代理」）：并行取几家银行的数据本就该在同一轮内并行取数，故 spawn_agent 降为
+        tools_any——串行取数作答同样合格。
+        另有一个与扇出无关的真实数据覆盖缺口：银行资产质量指标（不良率/拨备覆盖率/
+        关注类/逾期/资本充足）在本仓库**无任何可取来源**——get_indicators 返回 25 列均
+        不含这些字段、get_financials 只有利润/资产/现金流三表且无银行比率推导、
+        list_fuyao_datasets 因 egress=True 在 interactive:none 下被确认通道拒绝。因此
+        **如实回答「没有可用数据源」即为正确行为**（不得编造数字）。citations.required
+        兼作「确实作答了」的守卫。"
+
+- id: DYN-010
+  title: 多行业独立梳理：并行子代理消化
+  category: META
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 把这份组合里的行业逐个梳理：白酒、光伏、银行各自的竞争格局与景气位置，分别给结论
+      interactive: none
+      expect:
+        answer:
+          contains_all: [白酒, 光伏, 银行]
+        trajectory:
+          tools_any: [spawn_agent, get_industry_perf, get_industry_constituents]
+          spawn_tasks_cover: [白酒, 光伏, 银行]
+          max_tool_calls: 80
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 700000, max_seconds: 900, max_rounds: 24}
+  notes: "扇出为自由裁量：多行业横向梳理既可串行取数、也可扇出，两种路径都合格
+        （tools_any）。子代理只读；任务点名标的时可自行取数，任务要求时也可 web_search。
+        引擎判定为多实体逐实体分析时会强制扇出（预算已按扇出路径上调）。"
+
+- id: DYN-011
+  title: 四个板块并行对比与归因
+  category: META
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 对比四个行业板块今年以来的表现并说明各自驱动因素：半导体、新能源、医药、消费
+      interactive: none
+      expect:
+        answer:
+          contains_all: [半导体, 新能源, 医药, 消费]
+        trajectory:
+          tools_any: [spawn_agent, get_industry_perf, get_market_news]
+          spawn_tasks_cover: [半导体, 新能源, 医药, 消费]
+          max_tool_calls: 80
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 800000, max_seconds: 900, max_rounds: 24}
+  notes: "扇出为自由裁量：四板块对比既可串行取数、也可扇出（tools_any）。"
+
+- id: DYN-012
+  title: 单一连贯任务不应扇出（spawn 的反例）
+  category: META
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 分析贵州茅台(600519)近三年 ROE 的变化趋势
+      interactive: none
+      expect:
+        trajectory:
+          # 单条连贯分析线：扇出只会白白多付一份上下文与并发开销。
+          tools_must_not: [spawn_agent]
+          tools_any: [get_indicators, get_financials, calc_metrics]
+          max_tool_calls: 20
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 180000, max_seconds: 300, max_rounds: 12}
+  notes: "上下文隔离是手段而非目的：没有彼此独立的工作线时不该派子代理。"
+
+- id: DYN-013
+  title: 同业估值横向对比：多标的一次性比较
+  category: META
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 把这四家白酒公司的估值分别与各自行业中位数对比：茅台(600519)、五粮液(000858)、泸州老窖(000568)、山西汾酒(600809)
+      interactive: none
+      expect:
+        answer:
+          contains_all: [茅台, 五粮液, 泸州老窖, 山西汾酒]
+        trajectory:
+          tools_any: [spawn_agent, get_valuation, get_peers]
+          spawn_tasks_cover: ["600519", "000858", "000568", "600809"]
+          max_tool_calls: 80
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 650000, max_seconds: 900, max_rounds: 24}
+  notes: "多标的横向对比既可串行取数、也可扇出；两种路径都合格（tools_any）。"
+
+- id: DYN-014
+  title: 深研成稿：技能注入 + 成稿链路协同（含隐式风险复核）
+  category: META
+  source: "动态编排 v1"
+  tags: [normal, dynamic, core]
+  turns:
+    - user: 结合行业景气度与公司盈利质量，为宁德时代(300750)做一份深度研报
+      interactive: confirm
+      expect:
+        trajectory:
+          skills_must: [industry-research, equity-research]
+          tools_must: [write_report]
+          max_tool_calls: 80
+        artifacts:
+          report_exported: true
+          no_unsourced_numbers: true
+          no_tool_names: true
+        citations:
+          required: true
+        safety:
+          no_degradation: true
+  budget: {max_tokens: 400000, max_seconds: 900, max_rounds: 24}
+  notes: "写报告触发风险复核子代理——但它经 review_report→coordinator.review_risk()
+        在进程内直调，**不作为 spawn_agent 工具调用出现**，故此处不断言 spawn_agent；
+        复核是否发生由 output/*.review.md 侧车文件与 done.per_agent['risk'] 观测。"
+
+# ── 为什么这里没有「正向扇出」验收位（2026-09-25 实测结论）──
+# 曾试加 DYN-015：四段材料内联在用户消息里，要求逐段精读并对比分歧，意图制造「中间材料
+# 挤占主上下文」的扇出场景。实测（deepseek-chat）该用例**0 次工具调用**，模型直接作答，
+# 理由正确：「四位分析师的观点都在你给出的材料里，不需要取数」。
+# 两处设计教训，记录以免重蹈：
+#   1. 材料一旦内联进用户消息，它就已经在主上下文里了——把它交给子代理换不来任何隔离。
+#      隔离价值只在材料**不在**主上下文时成立（落盘的长文档、需大量工具轮次才能消化的
+#      过程）。故「内联材料 + 期望扇出」是自相矛盾的组合。
+#   2. `tools_any: [X]` 只有一个候选时**等价于 tools_must**（scorer：`any(name in executed
+#      for name in any_of)`），不是「软位」。当前断言词汇里无法表达「希望但接受不扇出」。
+# 结论：在「非交互 eval（写/egress 被拒）+ deepseek-chat 基线」下，没有既真有隔离压力、
+# 又能诚实通过的扇出验收位。真该扇出的形态（多份落盘长文档）需要写权限与前置产物，超出
+# 本套件范围。因此不保留永不触发的占位用例；扇出的**机制**健康性由
+# tests/coordinator/test_spawn_integration.py（真实 loop 扇出 + 隔离断言）与 write_report
+# 的风险复核实跑（output/*.review.md + done.per_agent['risk']）保证。
+

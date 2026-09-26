@@ -75,9 +75,10 @@ version: 1
 
 **因子表达式**（白名单算子、AST 解析、绝不 eval）：时序 `ts_mean/ts_std/ts_sum/ts_min/
 ts_max/ts_delay/ts_delta/ts_pct_change/ts_rank/ts_corr/ts_cov/ts_skew`，元素级 `abs/log/
-sign/sqrt/exp/clip/where`，算术/逻辑 `+ - * /` 与比较/布尔；变量限 OHLCV/成交额/换手/
-财务字段；窗口 ≤250、表达式深度受限。横截面算子 `rank/zscore/quantile` 属横截面专用，
-单股序列不可用。**先写经济含义假设，再写表达式。**
+sign/sqrt/exp/clip/where`，算术/逻辑 `+ - * /` 与比较/布尔；变量限 OHLCV/成交额/换手，
+以及横截面估值序列 `pe`/`pe_ttm`/`pb`/`pcf`/`总市值`（财报字段如 ROE 不在回测面板中，
+用了会在取价前被拒绝）；窗口 ≤250、表达式深度受限。横截面算子 `rank/zscore/quantile`
+属横截面专用，单股序列不可用。低市盈率写成 `rank(-pe_ttm)`。**先写经济含义假设，再写表达式。**
 
 ## 输出契约
 

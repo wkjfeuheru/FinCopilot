@@ -29,6 +29,7 @@ function baseDetail(overrides: Partial<TraceRunDetail> = {}): TraceRunDetail {
     duration_ms: 1200,
     rounds_trace: [],
     events: [],
+    states: [],
     ...overrides,
   };
 }
@@ -50,6 +51,8 @@ describe("detailToTrace", () => {
             llm_first_ms: 200,
             llm_ms: 900,
             answer: "",
+            phase: "tooluse",
+            revision: 3,
           },
         ],
       }),
@@ -77,6 +80,8 @@ describe("detailToTrace", () => {
             llm_first_ms: 0,
             llm_ms: 0,
             answer: "",
+            phase: "thinking",
+            revision: 2,
           },
         ],
       }),

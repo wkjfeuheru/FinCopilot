@@ -44,6 +44,15 @@ class Adapter(DataAdapter):
             df=pd.DataFrame({"symbol": symbols, "name": symbols}), interface="fake_cons"
         )
 
+    def fetch_valuation(self, symbol, lookback_years, indicator):
+        dates = pd.date_range("2022-01-03", periods=400, freq="B")
+        rng = np.random.default_rng(abs(hash(symbol + indicator)) % 10_000)
+        values = rng.uniform(8, 60, len(dates))
+        column = f"{indicator}(亿元)" if indicator == "总市值" else f"{indicator}(倍)"
+        return FetchResult(
+            df=pd.DataFrame({"date": dates, column: values}), interface="fake_valuation"
+        )
+
 
 def make_access(tmp_path) -> DataAccess:
     settings = Settings(data={"cache_dir": tmp_path / "cache"}, paths={"output_dir": tmp_path / "out"})
@@ -321,3 +330,52 @@ def test_uncapped_pool_carries_no_truncation_notice(tmp_path):
 
     assert result.ok is True
     assert "截断" not in result.content
+
+
+def test_low_pe_factor_uses_the_valuation_panel(tmp_path):
+    """低市盈率是估值序列上的横截面排名，不是收盘价面板能算出来的。"""
+    result = run(
+        RunBacktestTool(make_access(tmp_path)),
+        pool="000300",
+        factor_expr="rank(-1*pe_ttm)",
+        params={"groups": 3, "rebalance": 5, "max_symbols": 6},
+        years=2,
+    )
+
+    assert result.ok is True, result.error
+    assert "IC" in result.content
+    assert "分组净值" in result.content
+    assert "pe_ttm" in result.content
+
+
+def test_unknown_factor_variable_fails_before_any_fetch(tmp_path):
+    class CountingAdapter(Adapter):
+        def __init__(self):
+            self.kline_calls = 0
+            self.constituent_calls = 0
+
+        def fetch_kline(self, symbol, period, adjust, years):
+            self.kline_calls += 1
+            return super().fetch_kline(symbol, period, adjust, years)
+
+        def fetch_index_constituents(self, index):
+            self.constituent_calls += 1
+            return super().fetch_index_constituents(index)
+
+    adapter = CountingAdapter()
+    settings = Settings(data={"cache_dir": tmp_path / "cache"}, paths={"output_dir": tmp_path / "out"})
+    data = DataAccess([adapter], cache=LocalCache(tmp_path / "cache"), settings=settings)
+    data.settings = settings
+
+    result = run(
+        RunBacktestTool(data),
+        pool="000300",
+        factor_expr="rank(roe)",
+        years=2,
+    )
+
+    assert result.ok is False
+    assert "roe" in result.error
+    assert "不要原样重试" in result.error
+    assert adapter.kline_calls == 0
+    assert adapter.constituent_calls == 0

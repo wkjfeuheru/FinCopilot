@@ -11,14 +11,14 @@ import asyncio
 import pandas as pd
 
 from finharness.config.settings import ContextSettings, Settings
-from finharness.coordinator import GENERAL_FOCUS, MAX_SPAWN_TASKS, Coordinator
+from finharness.coordinator import GENERAL_FOCUS, MAX_SPAWN_TASKS, READER_FOCUS, Coordinator
 from finharness.data.access import DataAccess
 from finharness.data.adapters.base import DataAdapter, FetchResult
 from finharness.data.cache import LocalCache
 from finharness.data.citation import CitationRegistry
 from finharness.engine.cost import SessionStats
 from finharness.provider.base import Provider
-from finharness.tools.registry import worker_tool_names
+from finharness.tools.registry import reader_tool_names
 from finharness.types import ModelUsage, StreamChunk, StreamEvent, ToolUse
 from tests.conftest import settings_with_cache
 
@@ -95,7 +95,7 @@ def make_settings(tmp_path, **context) -> Settings:
     )
 
 
-def make_coordinator(tmp_path, provider, *, cite=None, stats=None, usage=None):
+def make_coordinator(tmp_path, provider, *, cite=None, stats=None, usage=None, parent_gate=None):
     settings = make_settings(tmp_path)
     data = DataAccess([Adapter()], cache=LocalCache(tmp_path / "cache"), settings=settings)
     coordinator = Coordinator(
@@ -103,6 +103,7 @@ def make_coordinator(tmp_path, provider, *, cite=None, stats=None, usage=None):
         data=data,
         settings=settings,
         cite=cite if cite is not None else CitationRegistry(),
+        parent_gate=parent_gate,
     )
     if stats is not None or usage is not None:
         coordinator.bind_accounting(
@@ -117,6 +118,33 @@ def run(coro):
 
 
 # -- fan-out 形状 ------------------------------------------------------------
+
+
+def test_spawn_reports_started_and_completed_for_each_task(tmp_path):
+    """主界面要用现有 tool_progress 通道展示子任务起止，不能等整次 spawn 结束。"""
+    provider = EchoTaskProvider()
+    coordinator = make_coordinator(tmp_path, provider)
+    seen: list[tuple[int, int, str, str]] = []
+
+    async def on_task(index: int, total: int, task: str, status: str) -> None:
+        seen.append((index, total, task, status))
+
+    results = run(
+        coordinator.spawn(tasks=["任务甲", "任务乙"], on_task=on_task)
+    )
+
+    assert [item.ok for item in results] == [True, True]
+    starts = [item for item in seen if item[3] == "started"]
+    ends = [item for item in seen if item[3] in {"completed", "failed"}]
+    assert {(i, t, task) for i, t, task, _ in starts} == {
+        (0, 2, "任务甲"),
+        (1, 2, "任务乙"),
+    }
+    assert {(i, t, task) for i, t, task, _ in ends} == {
+        (0, 2, "任务甲"),
+        (1, 2, "任务乙"),
+    }
+    assert all(status == "completed" for *_, status in ends)
 
 
 def test_each_task_yields_its_own_result_in_order(tmp_path):
@@ -166,23 +194,47 @@ def test_workers_see_only_their_own_task_and_no_main_transcript(tmp_path):
         assert sum(task in body for task in ("任务甲", "任务乙")) == 1
 
 
-def test_a_worker_can_only_reach_local_material_tools(tmp_path):
+def test_the_general_sub_agent_can_reach_read_only_data_tools(tmp_path):
+    """通用子代理被派去"分析某实体"时要能自己取数：其工具集即只读取数子集。
+
+    仍然只读——不含写工具、不含 META（因此结构上不能再派生、不能改任何东西）。
+    任务要求检索公开网页时可以 web_search；risk 复核者仍然不能联网。
+    """
+    from finharness.tools.registry import general_tool_names
+
     provider = EchoTaskProvider()
     coordinator = make_coordinator(tmp_path, provider)
 
-    run(coordinator.spawn(tasks=["任务甲"]))
+    run(coordinator.spawn(tasks=["分析茅台(600519)的盈利能力"]))
 
-    assert set(provider.requests[0]["tools"]) == set(worker_tool_names())
-    # worker 的 tool 目录中没有数据层。
-    assert "get_quote" not in provider.requests[0]["tools"]
+    tools = set(provider.requests[0]["tools"])
+    assert tools == set(general_tool_names())
+    # 可取数，任务要求时也可联网。
+    assert "get_quote" in tools and "get_indicators" in tools
+    assert "web_search" in tools
+    # 但不能写、不能派生、不能影响会话状态。
+    for name in ("write_file", "spawn_agent", "search_tools", "ask_user", "remember_preference"):
+        assert name not in tools
 
 
-def test_a_worker_cannot_reach_the_data_layer_even_if_asked(tmp_path):
-    """这是结构性的而非指令性的：该名称根本无法解析。"""
+def test_the_reader_sub_agent_gets_local_material_tools_only(tmp_path):
+    """内部 reader 只消化材料、不取数——这是结构性边界。"""
+    provider = EchoTaskProvider()
+    coordinator = make_coordinator(tmp_path, provider)
+
+    run(coordinator.spawn(tasks=["摘要这段材料"], focus=READER_FOCUS))
+
+    tools = set(provider.requests[0]["tools"])
+    assert tools == set(reader_tool_names())
+    assert "get_quote" not in tools and "get_research_reports" not in tools
+
+
+def test_a_reader_cannot_reach_the_data_layer_even_if_asked(tmp_path):
+    """reader 不取数是结构性的而非指令性的：该名称根本无法解析。"""
     provider = FetchingProvider("get_quote", {"symbol": "600519"})
     coordinator = make_coordinator(tmp_path, provider)
 
-    results = run(coordinator.spawn(tasks=["查一下茅台股价"]))
+    results = run(coordinator.spawn(tasks=["查一下茅台股价"], focus=READER_FOCUS))
 
     # tool call 因未知而被拒绝；sub-agent 仍会给出结论。
     assert results[0].ok is True
@@ -290,3 +342,43 @@ def test_an_unknown_focus_is_refused(tmp_path):
         assert "未知" in str(exc)
         return
     raise AssertionError("expected ValueError for an unknown focus")
+
+
+def test_spawn_confirms_egress_once_before_dispatching_general_workers(tmp_path):
+    """general worker 能 web_search，派发前须走一次与主会话同类的 egress 确认。"""
+    from finharness.permissions.gate import PermissionGate
+
+    asked: list[str] = []
+
+    async def confirm(name, args):
+        asked.append(name)
+        return True
+
+    settings = make_settings(tmp_path)
+    gate = PermissionGate(settings=settings, confirm_egress=confirm)
+    provider = EchoTaskProvider()
+    coordinator = make_coordinator(tmp_path, provider, parent_gate=gate)
+
+    run(coordinator.spawn(tasks=["搜索锂电池产能过剩的公开讨论"]))
+    assert asked == ["web_search"]
+    asked.clear()
+    run(coordinator.spawn(tasks=["再搜一则交叉印证"]))
+    assert asked == []
+
+
+def test_denied_egress_does_not_dispatch_general_workers(tmp_path):
+    from finharness.permissions.gate import PermissionGate
+
+    async def confirm(name, args):
+        return False
+
+    settings = make_settings(tmp_path)
+    gate = PermissionGate(settings=settings, confirm_egress=confirm)
+    provider = EchoTaskProvider()
+    coordinator = make_coordinator(tmp_path, provider, parent_gate=gate)
+
+    results = run(coordinator.spawn(tasks=["搜索公开讨论"]))
+
+    assert results[0].ok is False
+    assert results[0].error
+    assert provider.requests == []

@@ -274,6 +274,39 @@ def test_thinking_to_complete_on_text_answer():
     assert next_state.output_tokens == 4
 
 
+def test_model_finished_accumulates_retries_into_state():
+    """``ModelFinished.retries`` 累加进 state.retry_count（每步 state 反映重试压力）。"""
+    tool = ToolUse(call_id="c1", name="quote", args={})
+
+    to_tooluse = transition(
+        replace(
+            new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0"),
+            phase=AgentPhase.THINKING,
+            revision=1,
+            retry_count=2,
+        ),
+        ModelFinished(
+            answer="",
+            tool_uses=(tool,),
+            usage=UsageDelta(),
+            at="t2",
+            retries=3,
+        ),
+    )
+    assert to_tooluse.retry_count == 5
+
+    to_complete = transition(
+        replace(
+            new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0"),
+            phase=AgentPhase.THINKING,
+            revision=1,
+            retry_count=2,
+        ),
+        ModelFinished(answer="done", tool_uses=(), usage=UsageDelta(), at="t3", retries=1),
+    )
+    assert to_complete.retry_count == 3
+
+
 def test_thinking_to_error_on_run_failed():
     state = replace(
         new_agent_state(run_id="r", conversation_id="c", user_id="u", now="t0"),

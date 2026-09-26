@@ -83,6 +83,11 @@ class DataAdapter(ABC):
     def fetch_industry_constituents(self, industry: str) -> FetchResult:
         raise NotImplementedError
 
+    # 行业涨跌幅排行：一次取回全部行业并横向排序。与逐一抓取行业指数历史不同，
+    # 它是“涨幅前五/垫底”这类排序问题的正解。
+    def fetch_industry_ranking(self, period: str = "day", as_of: str | None = None) -> FetchResult:
+        raise NotImplementedError
+
     def fetch_index_constituents(self, index: str) -> FetchResult:
         raise NotImplementedError
 

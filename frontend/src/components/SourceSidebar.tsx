@@ -1,11 +1,14 @@
+import { useEffect, useMemo, useState } from "react";
 import { Empty, Tag } from "antd";
 import type { Citation } from "../api/client";
 import { artifactUrl } from "../api/client";
 import { presentToolAction } from "../lib/researchPresentation";
+import { groupActivitiesByTool } from "../lib/liveStatus";
 
 /** 智能体活动流中的一条实时记录。 */
 export type Activity = {
   key: string;
+  tool?: string;
   label: string;
   status: "running" | "done" | "error" | "info";
   detail?: string;
@@ -36,38 +39,106 @@ function formatTime(value: string): string {
   });
 }
 
+function ActivityChildren({ items }: { items: Activity[] }) {
+  return (
+    <ol className="activity-children">
+      {items.map((item) => (
+        <li key={item.key} className={`activity-item activity-${item.status}`}>
+          <span className="activity-mark">{statusMark(item.status)}</span>
+          <div className="activity-body">
+            <span className="activity-label">{item.label}</span>
+            {item.detail && <span className="activity-detail">{item.detail}</span>}
+            {item.attachments && item.attachments.length > 0 && (
+              <span className="activity-files">
+                {item.attachments.map((path) => (
+                  <a key={path} href={artifactUrl(path)} download>
+                    {fileName(path)}
+                  </a>
+                ))}
+              </span>
+            )}
+          </div>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function ActivityGroupItem({
+  tool,
+  title,
+  status,
+  items,
+  forcedOpen,
+}: {
+  tool: string;
+  title: string;
+  status: Activity["status"];
+  items: Activity[];
+  forcedOpen: boolean;
+}) {
+  const [open, setOpen] = useState(status === "running");
+  useEffect(() => {
+    if (forcedOpen) setOpen(true);
+  }, [forcedOpen]);
+  return (
+    <li className={`activity-group activity-${status}`} id={`activity-group-${tool}`}>
+      <details open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+        <summary className="activity-group-summary">
+          <span className="activity-mark">{statusMark(status)}</span>
+          <span className="activity-label">{title}</span>
+        </summary>
+        <ActivityChildren items={items} />
+      </details>
+    </li>
+  );
+}
+
 export function SourceSidebar({
   activities,
   citations,
+  focusedTool,
 }: {
   activities: Activity[];
   citations: Citation[];
+  focusedTool?: string | null;
 }) {
+  const groups = useMemo(
+    () =>
+      groupActivitiesByTool(
+        activities.map((item) => ({
+          ...item,
+          tool: item.tool ?? "tool",
+        })),
+      ),
+    [activities],
+  );
+
+  useEffect(() => {
+    if (!focusedTool) return;
+    document.getElementById(`activity-group-${focusedTool}`)?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
+  }, [focusedTool]);
+
   return (
     <aside className="source-sidebar">
-      <section className="sidebar-section">
+      <section className="sidebar-section" id="execution-activity">
         <span className="sidebar-title">执行动态</span>
-        {activities.length === 0 ? (
+        {groups.length === 0 ? (
           <p className="sidebar-empty">暂无执行记录</p>
         ) : (
           <ol className="activity-list">
-            {activities.map((item) => (
-              <li key={item.key} className={`activity-item activity-${item.status}`}>
-                <span className="activity-mark">{statusMark(item.status)}</span>
-                <div className="activity-body">
-                  <span className="activity-label">{item.label}</span>
-                  {item.detail && <span className="activity-detail">{item.detail}</span>}
-                  {item.attachments && item.attachments.length > 0 && (
-                    <span className="activity-files">
-                      {item.attachments.map((path) => (
-                        <a key={path} href={artifactUrl(path)} download>
-                          {fileName(path)}
-                        </a>
-                      ))}
-                    </span>
-                  )}
-                </div>
-              </li>
+            {groups.map((group) => (
+              <ActivityGroupItem
+                key={group.tool}
+                tool={group.tool}
+                title={group.title}
+                status={group.status}
+                forcedOpen={focusedTool === group.tool}
+                items={group.children}
+              />
             ))}
           </ol>
         )}

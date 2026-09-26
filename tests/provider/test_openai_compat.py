@@ -254,6 +254,46 @@ def test_openai_invalid_json_is_network_error():
         collect_from(handler)
 
 
+def test_openai_truncated_tool_arguments_are_output_truncated_error():
+    """finish_reason=length + 半句参数：必须报"输出被截断"，而非笼统网络错误。
+
+    这正是线上那次研报失败的形态：write_report 的参数被 max_tokens 截断，
+    结果被贴上 NetworkError、看起来像网络故障。
+    """
+    from finharness.provider.errors import OutputTruncatedError
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response([
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "write_report", "arguments": '{"topic":"宁德时代","sections":[{"heading":"营'}}
+            ]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]},
+        ])
+
+    with pytest.raises(OutputTruncatedError, match="max_tokens") as error:
+        collect_from(handler)
+    assert error.value.retryable is True
+    assert error.value.voids_output is True
+
+
+def test_openai_bad_tool_arguments_without_length_reason_stay_tool_arguments_error():
+    """没有 length 标记的坏参数仍归为坏参数，不与截断混为一谈。"""
+    from finharness.provider.errors import OutputTruncatedError, ToolArgumentsError
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response([
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "get_quote", "arguments": "not-json"}}
+            ]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ])
+
+    with pytest.raises(ToolArgumentsError) as error:
+        collect_from(handler)
+    assert not isinstance(error.value, OutputTruncatedError)
+    assert error.value.voids_output is True
+
+
 def test_openai_payload_without_choices_is_network_error():
     async def handler(request: httpx.Request) -> httpx.Response:
         return sse_response([{"id": "chatcmpl-x"}])
@@ -429,6 +469,18 @@ def test_openai_request_schema_converts_messages_tools_and_parameters():
     ]
     chunks = collect_custom(handler, messages=messages, tools=[{"type": "function", "function": {"name": "get_quote", "parameters": {"type": "object"}}}])
     assert chunks[-1].event == StreamEvent.MESSAGE_END
+
+
+def test_openai_omits_tools_key_when_the_tool_list_is_empty():
+    """空 tools 不得发 \"tools\": []，部分兼容接口会把它当成非法 schema。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "tools" not in payload
+        return sse_response([{"choices": [{"delta": {"content": "ok"}}]}])
+
+    chunks = collect_from(handler)
+    assert chunks[0].data == "ok"
 
 
 @pytest.mark.parametrize("event", [

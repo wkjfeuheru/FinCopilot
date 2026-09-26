@@ -13,7 +13,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Final
 
 import pandas as pd
 
@@ -39,6 +39,44 @@ from finharness.data.mapping import (
 
 _PERIOD_MAP = {"day": "daily", "week": "weekly", "month": "monthly"}
 _PERIOD_LABEL = {1: "近一年", 2: "近一年", 3: "近三年", 5: "近五年"}
+
+# 申万“指数分析”排行接口（日/周/月三个函数共用一套列名）。排行接口单次即返回
+# 全部一级行业，因此它是“行业涨跌幅排行”类问题的正解；逐行业抓日线再自行拼接
+# 既慢又会在拼接时把代码与名称错配。
+_SW_RANKING_RENAME: Final[dict[str, str]] = {
+    "指数代码": "code",
+    "指数名称": "industry",
+    "发布日期": "date",
+    "收盘指数": "close",
+    "涨跌幅": "pct_change",
+    "成交量": "volume",
+    "换手率": "turnover",
+    "市盈率": "pe",
+    "市净率": "pb",
+    "均价": "avg_price",
+    "成交额占比": "amount_share",
+    "流通市值": "float_mcap",
+    "平均流通市值": "avg_float_mcap",
+    "股息率": "dividend_yield",
+}
+# 日频接口按区间取数，窗口要覆盖长假（中秋/国庆连休可达 8 天），否则“上个交易日”
+# 会落到窗口之外、结果为空。
+_SW_RANKING_WINDOW_DAYS = 14
+_SW_RANKING_PERIODS: Final[dict[str, str]] = {
+    "day": "index_analysis_daily_sw",
+    "week": "index_analysis_weekly_sw",
+    "month": "index_analysis_monthly_sw",
+}
+_SW_RANKING_PERIOD_LABELS: Final[dict[str, str]] = {
+    "day": "单日",
+    "week": "单周",
+    "month": "单月",
+}
+
+
+def _period_label(period: str) -> str:
+    """排行周期的人类可读标签，用于错误信息。"""
+    return _SW_RANKING_PERIOD_LABELS.get(period, period)
 
 # --- 行情候选接口的时间预算 -----------------------------------------------
 # 快照类数据源是同步、分页的，而且（对于 EM/Sina）未设置请求超时，因此一个
@@ -686,6 +724,95 @@ class AkShareAdapter(DataAdapter):
         if "date" in df.columns:
             df = df.sort_values("date", ascending=False)
         return FetchResult(df=df.reset_index(drop=True), interface="index_hist_sw")
+
+    def fetch_industry_ranking(self, period: str = "day", as_of: str | None = None) -> FetchResult:
+        """申万一级行业涨跌幅排行（一次调用取回全部一级行业）。
+
+        “行业涨跌幅排行”类问题问的是所有行业之间的横向次序，因此用申万自带的
+        “指数分析”接口一次取回，而不是逐行业抓日线再自行拼接——后者既慢，又会
+        在拼接时把代码与名称错配（本仓库曾因此产出“数值真实但归属错乱”的表格）。
+
+        ``period="day"`` 走 ``index_analysis_daily_sw``（区间入参，返回若干交易日，
+        取其中最新一期即为“上个交易日”）；``week`` / ``month`` 走对应的周/月接口
+        （单日入参，日期取自 ``index_analysis_week_month_sw`` 的合法日期列表）。
+        未指定 ``as_of`` 时取最新一期，因此不必逐日试错。结果按涨跌幅降序排列，
+        并保留 ``date`` 列供上层披露数据日期。
+        """
+        if period not in _SW_RANKING_PERIODS:
+            raise AdapterError(f"不支持的排行周期：{period}；可选 day/week/month")
+        interface = _SW_RANKING_PERIODS[period]
+
+        if period == "day":
+            raw = self._fetch_sw_daily_ranking(as_of)
+        else:
+            target = as_of or self._latest_sw_period_date(period)
+            raw = self._call(
+                interface,
+                lambda ak: getattr(ak, interface)(
+                    symbol="一级行业", date=target.replace("-", "")
+                ),
+            )
+
+        if raw is None or not len(raw):
+            raise AdapterError(
+                f"申万一级行业{_period_label(period)}排行暂时不可用（接口限流或非交易日），请稍后重试"
+            )
+        df = self._shape_sw_ranking(raw)
+        if not len(df):
+            raise AdapterError(f"申万一级行业{_period_label(period)}排行无有效数据")
+        return FetchResult(df=df, interface=interface)
+
+    def _fetch_sw_daily_ranking(self, as_of: str | None) -> pd.DataFrame:
+        """按天数取排行：指定日期就取当天，否则取短窗口里的最新一期。"""
+
+        def build(ak: Any) -> pd.DataFrame:
+            if as_of:
+                stamp = as_of.replace("-", "")
+                return ak.index_analysis_daily_sw(
+                    symbol="一级行业", start_date=stamp, end_date=stamp
+                )
+            end = date.today()
+            start = end - timedelta(days=_SW_RANKING_WINDOW_DAYS)
+            df = ak.index_analysis_daily_sw(
+                symbol="一级行业",
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+            )
+            if df is None or not len(df) or "发布日期" not in df.columns:
+                return df
+            dates = pd.to_datetime(df["发布日期"], errors="coerce")
+            latest = dates.max()
+            if pd.isna(latest):
+                return df
+            return df[dates == latest]
+
+        return self._call("index_analysis_daily_sw", build)
+
+    def _latest_sw_period_date(self, period: str) -> str:
+        """周/月排行的最新一期日期（``YYYY-MM-DD``），取自接口的合法日期列表。"""
+        raw = self._call(
+            "index_analysis_week_month_sw",
+            lambda ak: ak.index_analysis_week_month_sw(symbol=period),
+        )
+        if raw is None or not len(raw) or "date" not in raw.columns:
+            raise AdapterError(f"无法获取申万{_period_label(period)}排行的可用日期")
+        dates = pd.to_datetime(raw["date"], errors="coerce").dropna()
+        if not len(dates):
+            raise AdapterError(f"申万{_period_label(period)}排行的日期列表为空")
+        cutoff = pd.Timestamp(date.today())
+        usable = dates[dates <= cutoff]
+        return (usable.max() if len(usable) else dates.max()).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _shape_sw_ranking(df: pd.DataFrame) -> pd.DataFrame:
+        """列名归一化、按涨跌幅降序排列、日期解析。"""
+        frame = df.rename(columns={k: v for k, v in _SW_RANKING_RENAME.items() if k in df.columns})
+        if "date" in frame.columns:
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        if "pct_change" in frame.columns:
+            frame["pct_change"] = pd.to_numeric(frame["pct_change"], errors="coerce")
+            frame = frame.sort_values("pct_change", ascending=False, kind="stable")
+        return frame.reset_index(drop=True)
 
     def fetch_industry_constituents(self, industry: str) -> FetchResult:
         """解析行业代码后抓取其成分股，统一为 symbol/name 两列。"""

@@ -68,6 +68,33 @@ def test_over_budget_past_the_ratio(tmp_path):
     assert memory.over_budget(system="s", tools=[]) is True
 
 
+def test_fixed_tokens_ignores_history_but_counts_system_and_tools(tmp_path):
+    """地板是压缩删不动的那部分：system + 工具 schema，与历史无关。"""
+    memory = make_memory(tmp_path)
+    tools = [{"type": "function", "function": {"name": "get_quote", "description": "查询报价", "parameters": "{}"}}]
+
+    bare = memory.fixed_tokens(system="系统提示", tools=tools)
+    memory.append_user("一大段历史" * 50)
+
+    assert memory.fixed_tokens(system="系统提示", tools=tools) == bare
+    assert bare == memory.request_tokens(system="系统提示", tools=tools) or (
+        memory.request_tokens(system="系统提示", tools=tools) > bare
+    )
+
+
+def test_threshold_is_reachable_only_above_the_floor(tmp_path):
+    """阈值必须高过地板，否则压缩无法把窗口拉回预算内。"""
+    tools = [{"type": "function", "function": {"name": "t", "description": "描述" * 20, "parameters": "{}"}}]
+    # 阈值 = 1000 × 0.8 = 800，明显高于这段短 system/tools 的地板。
+    roomy = make_memory(tmp_path, context_window_tokens=1000, compaction_ratio=0.8)
+    assert roomy.threshold_is_reachable(system="s", tools=tools) is True
+    assert roomy.compaction_threshold() == 800
+
+    # 阈值 = 20 × 0.5 = 10，连 system 本身都装不下——不可达。
+    tight = make_memory(tmp_path, context_window_tokens=20, compaction_ratio=0.5)
+    assert tight.threshold_is_reachable(system="一个足够长的系统提示", tools=tools) is False
+
+
 def test_squash_keeps_the_recent_rounds_and_returns_removed_count(tmp_path):
     memory = make_memory(tmp_path)
     for index in range(5):

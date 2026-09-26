@@ -137,16 +137,41 @@ def test_prompt_explains_the_handle_then_summarize_workflow():
 
 def test_prompt_explains_when_to_spawn_and_what_it_costs():
     """spawn_agent 是懒加载且代价高昂的；prompt 是模型唯一能同时了解到
-    其触发条件（是隔离，而非提速）与边界（子代理不取数）的地方。"""
+    其触发条件（看每个单元的中间材料量，而非是否取数）、边界（浅取数不扇出）
+    与编排要求（先拆解、后汇合）的地方。"""
     text = system_prompt()
     section = text.split("## 子代理与上下文隔离", 1)[1].split("\n## ", 1)[0]
 
     assert "spawn_agent" in section
-    # 理由必须是隔离，并且要排除单纯的并行抓取。
+    # 理由必须是隔离。
     assert "隔离" in section
+    # 单纯的并行取数不扇出：仍要明确排除。
     assert "不要" in section and "并行" in section
-    # 子代理不取数：素材是交给它们的。
-    assert "不取数" in section
+    # 编排契约：先拆解、后汇合。
+    assert "拆解" in section and "汇合" in section
+    # 子代理可自行取数（形态已由"只读材料"改为"任务点名标的则取数"）。
+    assert "取数" in section
+
+
+def test_worker_prompt_lets_it_fetch_but_forbids_guessing():
+    """通用子代理可自行取数，但未点名标的时须如实回报而非猜。"""
+    from finharness.engine.prompt import worker_prompt
+
+    text = worker_prompt()
+    assert "取数工具" in text
+    # 不得用记忆/近似值补一个标的或数字。
+    assert "猜" in text
+    assert "web_search" in text
+    assert "read_pdf" in text
+
+
+def test_reader_prompt_is_material_only():
+    """内部 reader 只消化材料、不取数。"""
+    from finharness.engine.prompt import reader_prompt
+
+    text = reader_prompt()
+    assert "不取数" in text
+    assert "read_file" in text or "read_pdf" in text
 
 
 def test_prompt_names_the_backtest_tool_and_its_discipline():

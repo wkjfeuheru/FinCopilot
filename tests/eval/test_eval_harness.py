@@ -119,6 +119,49 @@ def test_task_scorer_detects_refusal_and_forbidden_words():
     assert bad.score < 1.0
 
 
+def test_task_scorer_requires_the_ranked_names_in_the_answer():
+    """「前五」问题必须真的点名工具返回的前五名——这是与运行日期无关的确定性判据。
+
+    回归防线：一次真实运行给了一堆过程和互相矛盾的表格，却没有一句「前五是这五个」。
+    """
+    from finharness.eval.schema import EvalCase
+    from finharness.eval.scorers import score_task
+
+    case = EvalCase.model_validate(
+        {
+            "id": "T-rank",
+            "turns": [
+                {
+                    "user": "上个交易日涨幅前五",
+                    "expect": {"answer": {"top_names_from_observations": 3}},
+                }
+            ],
+        }
+    )
+    preview = (
+        "申万一级行业单日涨跌幅排行（数据日期：2026-09-24，共 31 个行业）\n"
+        "第 1 名 煤炭 +0.63%；第 2 名 纺织服饰 +0.35%；第 3 名 银行 +0.31%"
+    )
+    trace = [
+        RoundTrace(
+            turn=1,
+            observations=[
+                ObservedCall(
+                    call_id="c1", name="get_industry_perf", ok=True, preview=preview
+                )
+            ],
+        )
+    ]
+
+    good = score_task(case, make_run(case, answers=["前五：煤炭、纺织服饰、银行。"], trace=trace))
+    assert good.passed is True
+
+    # 只说「取了数、算完了」却不点名，就是那次真实失败的模式。
+    bad = score_task(case, make_run(case, answers=["已按涨跌幅排序，详见上表。"], trace=trace))
+    assert bad.passed is False
+    assert any(not c.passed and "top_names" in c.name for c in bad.checks)
+
+
 def test_trajectory_scorer_vetoes_forbidden_tool():
     from finharness.eval.schema import EvalCase
     from finharness.eval.scorers import score_trajectory
@@ -157,6 +200,93 @@ def test_trajectory_scorer_requires_listed_tools():
     score = score_trajectory(case, make_run(case, trace=[RoundTrace(turn=1)]))
     assert score.score == 0.0
     assert score.passed is False
+
+
+def test_spawn_tasks_cover_is_skipped_when_not_fanned_out():
+    """扇出是自由裁量：未调用 spawn_agent 时，拆解覆盖检查跳过、不计权重。"""
+    from finharness.eval.schema import EvalCase
+    from finharness.eval.scorers import score_trajectory
+
+    case = EvalCase.model_validate(
+        {
+            "id": "T-SC-1",
+            "turns": [
+                {"user": "q", "expect": {"trajectory": {"spawn_tasks_cover": ["600519"]}}}
+            ],
+        }
+    )
+    trace = [
+        RoundTrace(
+            turn=1,
+            actions=[ToolUse("c1", "get_indicators", {"symbol": "600519"})],
+            observations=[obs("c1", "get_indicators")],
+        )
+    ]
+    score = score_trajectory(case, make_run(case, trace=trace))
+    assert score.score == 1.0, "未扇出不应因拆解覆盖检查而失分"
+    assert any("跳过拆解覆盖检查" in note for note in score.notes)
+
+
+def test_spawn_tasks_cover_requires_each_entity_in_some_task():
+    """一旦扇出，每个声明实体必须出现在至少一条派出的子任务里。"""
+    from finharness.eval.schema import EvalCase
+    from finharness.eval.scorers import score_trajectory
+
+    case = EvalCase.model_validate(
+        {
+            "id": "T-SC-2",
+            "turns": [
+                {
+                    "user": "q",
+                    "expect": {
+                        "trajectory": {
+                            "spawn_tasks_cover": ["600519", "000858", "000568"]
+                        }
+                    },
+                }
+            ],
+        }
+    )
+    # 只拆了两个实体，漏了 000568 → 拆解覆盖失败。
+    trace = [
+        RoundTrace(
+            turn=1,
+            actions=[
+                ToolUse(
+                    "c1",
+                    "spawn_agent",
+                    {"tasks": ["分析茅台(600519)", "分析五粮液(000858)"]},
+                )
+            ],
+            observations=[obs("c1", "spawn_agent")],
+        )
+    ]
+    score = score_trajectory(case, make_run(case, trace=trace))
+    check = next(c for c in score.checks if c.name == "spawn_tasks_cover")
+    assert check.passed is False
+    assert "000568" in check.detail
+    # 补全三个实体后通过。
+    full = [
+        RoundTrace(
+            turn=1,
+            actions=[
+                ToolUse(
+                    "c1",
+                    "spawn_agent",
+                    {
+                        "tasks": [
+                            "分析茅台(600519)",
+                            "分析五粮液(000858)",
+                            "分析泸州老窖(000568)",
+                        ]
+                    },
+                )
+            ],
+            observations=[obs("c1", "spawn_agent")],
+        )
+    ]
+    ok_score = score_trajectory(case, make_run(case, trace=full))
+    assert next(c for c in ok_score.checks if c.name == "spawn_tasks_cover").passed is True
 
 
 def test_efficiency_scorer_rewards_within_budget():
@@ -338,6 +468,43 @@ def test_eval_records_explicit_agent_states(tmp_path):
         if event.kind == "state"
     ]
     assert phases == ["hydrate", "thinking", "complete"]
+
+
+def test_eval_trace_store_records_each_step_state(tmp_path):
+    """eval 批量重放同样把每步 state 提升为 trace_states 行。
+
+    eval 路径不实时写，而是在用例结束时逐事件重放（``_record_trace``）；
+    由于 ``record_event`` 内识别 ``state``，两条生产路径自动同构。
+    """
+    import asyncio
+    import sys
+
+    from finharness.config.settings import Settings
+    from finharness.eval.runner import EvalRunner
+    from finharness.eval.schema import EvalCase
+    from finharness.observability.trace_store import TraceStore
+
+    engine_dir = str(REPO_ROOT / "tests" / "engine")
+    if engine_dir not in sys.path:
+        sys.path.insert(0, engine_dir)
+    from test_loop import ScriptedProvider, text_round  # noqa: E402
+
+    case = EvalCase.model_validate({"id": "EV-STATE-9", "turns": [{"user": "q"}]})
+    store = TraceStore(Path(tmp_path) / "trace.db")
+    runner = EvalRunner(
+        base_settings=Settings(),
+        provider=ScriptedProvider([text_round("ok")]),
+        run_dir=Path(tmp_path) / "runs",
+        offline=True,
+        trace_store=store,
+    )
+    asyncio.run(runner.run_case(case))
+
+    detail = store.run_detail("tr_eval_EV-STATE-9_0")
+    assert detail is not None
+    states = detail["states"]
+    assert [s["phase"] for s in states] == ["hydrate", "thinking", "complete"]
+    assert [s["revision"] for s in states] == [0, 1, 2]
 
 
 def test_offline_selfcheck_end_to_end(tmp_path):

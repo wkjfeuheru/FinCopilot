@@ -105,27 +105,29 @@ def test_registry_covers_the_documented_catalogue(tmp_path):
     assert set(registry.names()) == {cls.name for cls in ALL_TOOL_CLASSES}
 
 
-def test_the_general_sub_agent_gets_local_material_tools_only(tmp_path):
-    """worker 消费素材；它不得携带数据获取层。
+def test_the_reader_sub_agent_gets_local_material_tools_only(tmp_path):
+    """reader 消费素材；它不得携带数据获取层。
 
-    reviewer 合理地拥有数据 tool（它要复核数字）；普通 worker 则不然，
-    因为任务语句不指定任何 symbol 或 period，若赋予它数据 tool，
-    会招致猜测而非隔离。它确实拥有 read_pdf：那是**读取交给它的材料**的能力，
-    不是取数能力——长文档分片前先精读某一页，正属于 worker 的职责。
+    ``risk`` 与模型可见的 ``general`` 都合理地拥有只读取数工具（前者复核数字，后者
+    被派去分析某实体时自行取数）；内部 ``reader`` 则不然——它的任务是消化交给它的
+    材料。它确实拥有 read_pdf：那是**读取材料**的能力，不是取数能力。
     """
-    from finharness.tools.registry import review_tool_names, worker_tool_names
+    from finharness.tools.registry import general_tool_names, reader_tool_names, review_tool_names
 
-    worker = set(worker_tool_names())
+    reader = set(reader_tool_names())
     reviewer = set(review_tool_names())
+    general = set(general_tool_names())
 
-    assert worker == {"read_file", "read_pdf"}
-    assert "get_quote" not in worker and "get_research_reports" not in worker
-    # reviewer 保留其数据 tool——这正是它的全部价值所在。
+    assert reader == {"read_file", "read_pdf"}
+    assert "get_quote" not in reader and "get_research_reports" not in reader
+    # reviewer/general 的只读取数子集保留数据 tool——这正是它的价值所在。
     assert "get_quote" in reviewer
+    assert "web_search" in general and "web_search" not in reviewer
     # 且两个子 agent 都不得再 spawn 或触达 META/写 tool。
     for name in ("spawn_agent", "write_report", "write_file", "search_tools", "ask_user"):
-        assert name not in worker
+        assert name not in reader
         assert name not in reviewer
+        assert name not in general
 
 
 def test_meta_tools_can_reach_the_catalogue(tmp_path):
@@ -134,3 +136,27 @@ def test_meta_tools_can_reach_the_catalogue(tmp_path):
     tool = registry.resolve("search_tools")
 
     assert tool.registry is registry
+
+
+def test_search_for_cross_check_hits_spawn_agent(tmp_path):
+    registry = make_registry(tmp_path)
+    names = [brief.name for brief in registry.search("交叉印证")]
+    assert "spawn_agent" in names
+    names = [brief.name for brief in registry.search("并行检索")]
+    assert "spawn_agent" in names
+
+
+def test_activating_web_or_document_tools_also_activates_spawn(tmp_path):
+    registry = make_registry(tmp_path)
+    assert registry.is_active("spawn_agent") is False
+
+    assert registry.activate("web_search") is True
+    assert registry.is_active("spawn_agent") is True
+
+    other = make_registry(tmp_path)
+    other.activate("summarize_document")
+    assert other.is_active("spawn_agent") is True
+
+    third = make_registry(tmp_path)
+    third.activate("read_pdf")
+    assert third.is_active("spawn_agent") is True

@@ -1,8 +1,9 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MarkdownMessage } from "./MarkdownMessage";
 import type { Citation } from "../api/client";
-import { AgentTrace, TurnMetricsBar } from "./AgentTrace";
+import { TurnMetricsBar } from "./AgentTrace";
 import type { TurnTrace } from "./AgentTrace";
+import { LiveStatusOverlay } from "./LiveStatusOverlay";
 import { isNearBottom } from "../lib/autoScroll";
 
 export type Message = {
@@ -23,15 +24,19 @@ const MessageRow = memo(function MessageRow({
   message,
   citationOrder,
   onRetry,
+  onOpenProcess,
 }: {
   message: Message;
   citationOrder: Map<string, number>;
   onRetry?: (prompt: string) => void;
+  onOpenProcess?: (toolName?: string) => void;
 }) {
   return (
     <article className={`message message-${message.role}`}>
       <span className="message-role">{message.role === "user" ? "你" : message.role === "error" ? "错误" : "FinHarness"}</span>
-      {message.role === "assistant" && message.trace && <AgentTrace trace={message.trace} />}
+      {message.role === "assistant" && message.trace && (
+        <LiveStatusOverlay trace={message.trace} onOpenProcess={onOpenProcess} />
+      )}
       {message.role === "assistant" ? (
         <MarkdownMessage text={message.text} citationOrder={citationOrder} />
       ) : (
@@ -55,10 +60,12 @@ export function MessageList({
   messages,
   citations,
   onRetry,
+  onOpenProcess,
 }: {
   messages: Message[];
   citations: Citation[];
   onRetry?: (prompt: string) => void;
+  onOpenProcess?: (toolName?: string) => void;
 }) {
   // 同一个 cid 在每条消息中保持相同编号，与数据来源
   // 侧栏的编号一致，因此 `[n]` 链接总能落到正确的卡片上。
@@ -71,6 +78,12 @@ export function MessageList({
   onRetryRef.current = onRetry;
   const handleRetry = useCallback(
     (prompt: string) => onRetryRef.current?.(prompt),
+    [],
+  );
+  const onOpenProcessRef = useRef(onOpenProcess);
+  onOpenProcessRef.current = onOpenProcess;
+  const handleOpenProcess = useCallback(
+    (toolName?: string) => onOpenProcessRef.current?.(toolName),
     [],
   );
   // 跟随开关（ref 而非 state）：滚动决策在每个流事件后发生，不值得
@@ -150,6 +163,7 @@ export function MessageList({
             message={message}
             citationOrder={citationOrder}
             onRetry={handleRetry}
+            onOpenProcess={handleOpenProcess}
           />
         ))}
       </div>

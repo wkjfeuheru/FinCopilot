@@ -28,8 +28,10 @@ import pandas as pd
 MAX_WINDOW = 250
 MAX_DEPTH = 12
 
-# 表达式可引用的变量。行情变量为小写；财务字段为指标/财务工具所用的 snake_case 名称。
+# 表达式可引用的行情变量。估值变量（pe/pe_ttm/pb/pcf/总市值）由回测面板另行装入，
+# 不在此元组里：未装入时按未知变量拒绝，而不是暗示存在尚未实现的财务字段。
 MARKET_VARIABLES = ("open", "high", "low", "close", "volume", "amount", "turnover")
+_VARIABLE_HINT = f"{'/'.join(MARKET_VARIABLES)}；估值变量 pe/pe_ttm/pb/pcf/总市值"
 
 # 时间序列运算符：(series, window[, series]) -> series
 _TS_OPS: dict[str, tuple[int, Callable[..., pd.DataFrame]]] = {}
@@ -331,7 +333,7 @@ class FactorEngine:
                 return variables[node.id]
             if node.id in MARKET_VARIABLES:
                 raise FactorError(f"数据中缺少变量：{node.id}")
-            raise FactorError(f"未知变量：{node.id}（可用：{'/'.join(MARKET_VARIABLES)} 及财务字段）")
+            raise FactorError(f"未知变量：{node.id}（可用：{_VARIABLE_HINT}）")
         if isinstance(node, ast.BinOp):
             left = self._eval(node.left, variables)
             right = self._eval(node.right, variables)

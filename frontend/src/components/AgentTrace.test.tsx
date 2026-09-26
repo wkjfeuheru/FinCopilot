@@ -76,6 +76,40 @@ describe("traceFromStoredTurn", () => {
     expect(trace.status).toBe("error");
   });
 
+  it("names a stored industry read with the sector from summary", () => {
+    const trace = traceFromStoredTurn(
+      turn([
+        {
+          event: "tool_status",
+          data: {
+            call_id: "call_1",
+            name: "get_industry_perf",
+            status: "completed",
+            ok: true,
+            summary: { industry: "白酒" },
+          },
+        },
+      ]),
+    );
+    const step = trace.steps.find((item) => item.key === "call_1");
+    expect(step?.label).toBe("已读取白酒行业表现");
+    expect(step?.toolName).toBe("get_industry_perf");
+    expect(step?.summary).toEqual({ industry: "白酒" });
+  });
+
+  it("renders a routed skill as a Chinese load line", () => {
+    const trace = traceFromStoredTurn(
+      turn([
+        {
+          event: "context_routed",
+          data: { skills: ["industry-research"], capabilities: ["industry"] },
+        },
+      ]),
+    );
+    const step = trace.steps.find((item) => item.kind === "skill");
+    expect(step?.label).toBe("已加载行业研究技能");
+  });
+
   it("derives high-level phase from the last state event while keeping done metrics", () => {
     // done 仍提供指标；高阶 phase 以最后一条 state 为准（此处覆盖 done 的 stopped）。
     const trace = traceFromStoredTurn(

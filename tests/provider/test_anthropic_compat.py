@@ -210,3 +210,13 @@ def test_anthropic_sse_context_overflow_is_token_limit_error():
 
     with pytest.raises(TokenLimitError):
         collect(handler)
+
+
+def test_anthropic_omits_tools_key_when_the_tool_list_is_empty():
+    async def handler(request):
+        body = json.loads(request.content)
+        assert "tools" not in body
+        return sse_response([{"type": "message_stop"}])
+
+    chunks = collect(handler, tools=[])
+    assert chunks[-1].event == StreamEvent.MESSAGE_END

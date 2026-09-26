@@ -624,7 +624,7 @@ finharness/
 | 工具总数 | "12 金融+5 通用"/"23 能力"口径不一 | **37 个**（金融-数据17 + 金融-计算3 + 金融-输出2 + 通用4 + 元11） |
 | 按需激活 | 仅描述 search 后按需注册 | 引擎发起：检索即激活 + 直接调用即激活，schema 下一次请求生效（ADR-11） |
 | 元工具 | 5 个 | **8 个**（含 `search_tools`、`summarize_document`；`load_tool`/`load_skill`/`list_skills` 已删） |
-| 常驻/按需 | ~15 常驻 | **21 常驻 / 8 按需**（get_announcements, calc_valuation, web_search, get_research_reports, spawn_agent, read_pdf, summarize_document, run_backtest），层级由 `@tool(tier=...)` 声明 |
+| 常驻/按需 | ~15 常驻 | **21 常驻 / 16 按需**（get_announcements, calc_valuation, web_search, get_research_reports, spawn_agent, read_pdf, summarize_document, run_backtest, list_fuyao_datasets, query_a_share_data, query_fund_data, query_futures_data, query_options_data, search_memory, update_memory, forget_memory），层级由 `@tool(tier=...)` 声明 |
 | make_chart 权限 | §3.3 输出类需确认 vs §3.6 图表 read 矛盾 | **read**（产物隔离 output/） |
 | run_python | 未细述 | **write+沙箱**（白名单 import + deny + 受限内建） |
 | 模型层 | Provider 抽象 | 细化 AnthropicCompat/OpenAICompat 事件映射、Msg 协议、错误分级 |

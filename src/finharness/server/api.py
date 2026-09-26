@@ -108,7 +108,7 @@ class StopRequest(BaseModel):
 
 
 class QueueSink:
-    def __init__(self, trace_recorder=None):
+    def __init__(self, trace_recorder=None, round_recorder=None):
         import asyncio
 
         self.queue = asyncio.Queue()
@@ -119,6 +119,9 @@ class QueueSink:
         # 可选的 trace 落库旁路（监控平台，docs 03.14.4）：记录非 text_delta
         # 事件；TraceStore 自身吞错，落库失败绝不影响对话流。
         self.trace_recorder = trace_recorder
+        # 轮次轨迹的实时落库钩子（可选）：引擎每完成一轮就调用，使进程崩溃
+        # 不再丢掉已发生的轮次（旧行为只在 run 结束时批量写）。
+        self.round_recorder = round_recorder
 
     async def emit(self, event):
         """将引擎事件入队，并记录计时与重放所需的元数据。"""
@@ -149,6 +152,11 @@ class QueueSink:
                 {"event": _event_name(event.kind), "data": dict(event.data)}
             )
         await self.queue.put(event)
+
+    def record_round(self, round_trace, *, phase=None, revision=None) -> None:
+        """引擎每完成一轮调用一次；无 recorder 时 no-op（观测旁路）。"""
+        if self.round_recorder is not None:
+            self.round_recorder(round_trace, phase=phase, revision=revision)
 
     def turn_metadata(self) -> dict | None:
         """汇总本轮的重放事件与耗时元数据；轮次未完成时返回 None。"""
@@ -1415,9 +1423,13 @@ def create_app(
                 if event.kind != "text_delta":
                     trace_store.record_event(run_id, event.kind, dict(event.data))
 
+            def record_trace_round(round_trace, *, phase=None, revision=None) -> None:
+                trace_store.record_round(run_id, round_trace, phase=phase, revision=revision)
+
         else:
             record_trace_event = None
-        sink = QueueSink(trace_recorder=record_trace_event)
+            record_trace_round = None
+        sink = QueueSink(trace_recorder=record_trace_event, round_recorder=record_trace_round)
         session.loop.output = sink
         task = asyncio.create_task(
             session.loop.run(run_message, resume=loop_resume)

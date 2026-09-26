@@ -14,7 +14,11 @@ from finharness.provider._compat import (
 )
 from finharness.provider.base import Provider
 from finharness.provider.errors import NetworkError
-from finharness.provider.event_stream import ToolUseAccumulator, iter_sse_data
+from finharness.provider.event_stream import (
+    ToolUseAccumulator,
+    finalize_tool_uses,
+    iter_sse_data,
+)
 from finharness.types import ModelUsage, Msg, StreamChunk, StreamEvent, ToolUseDelta
 
 
@@ -76,8 +80,11 @@ class AnthropicCompatProvider(Provider):
 
     async def stream(self, *, system: str, messages: list[Msg], tools: list[dict], usage: ModelUsage) -> AsyncIterator[StreamChunk]:
         """以流式方式请求 Anthropic Messages 接口并产出规范化 StreamChunk 事件。"""
-        payload = {"model": self.model, "system": system, "temperature": self.temperature, "max_tokens": self.max_tokens, "stream": True, "messages": _convert_messages(messages), "tools": _convert_tools(tools)}
+        payload = {"model": self.model, "system": system, "temperature": self.temperature, "max_tokens": self.max_tokens, "stream": True, "messages": _convert_messages(messages)}
+        if tools:
+            payload["tools"] = _convert_tools(tools)
         acc, final = ToolUseAccumulator(), ModelUsage(); seen: set[int] = set()
+        finish_reason: str | None = None
         try:
             async with self.client.stream("POST", f"{self.base_url}/messages", headers={"x-api-key": self.api_key, "anthropic-version": self.api_version, "content-type": "application/json"}, json=payload) as response:
                 await raise_for_status(response)
@@ -96,6 +103,13 @@ class AnthropicCompatProvider(Provider):
                         _update_usage(final, message.get("usage", {}))
                     elif typ == "message_delta":
                         _update_usage(final, event.get("usage", {}))
+                        # stop_reason="max_tokens" 即输出被 max_tokens 截断，
+                        # 是判断工具 input_json 为何残缺的确定性依据。
+                        stop_reason = (event.get("delta") or {}).get("stop_reason")
+                        if isinstance(stop_reason, str):
+                            finish_reason = (
+                                "length" if stop_reason == "max_tokens" else stop_reason
+                            )
                     elif typ == "content_block_start":
                         i, b = event.get("index"), event.get("content_block")
                         if not isinstance(i, int) or isinstance(i, bool) or not isinstance(b, dict): raise NetworkError("Provider returned invalid content block")
@@ -130,4 +144,4 @@ class AnthropicCompatProvider(Provider):
                         raise NetworkError("Provider returned invalid SSE event")
         except httpx.HTTPError as exc:
             raise as_network_error(exc) from exc
-        final.tool_uses = acc.build(); yield StreamChunk(StreamEvent.MESSAGE_END, final)
+        final.tool_uses = finalize_tool_uses(acc, finish_reason=finish_reason); yield StreamChunk(StreamEvent.MESSAGE_END, final)

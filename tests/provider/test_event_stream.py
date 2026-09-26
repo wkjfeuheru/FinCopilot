@@ -2,8 +2,17 @@ import asyncio
 
 import pytest
 
-from finharness.provider.errors import NetworkError
-from finharness.provider.event_stream import ToolUseAccumulator, iter_sse_data
+from finharness.provider.errors import (
+    MalformedStreamError,
+    NetworkError,
+    OutputTruncatedError,
+    ToolArgumentsError,
+)
+from finharness.provider.event_stream import (
+    ToolUseAccumulator,
+    finalize_tool_uses,
+    iter_sse_data,
+)
 from finharness.types import ToolUseDelta
 
 
@@ -160,3 +169,64 @@ def test_iter_sse_data_times_out_when_stream_goes_idle():
 
     with pytest.raises(NetworkError, match="stream idle"):
         asyncio.run(collect())
+
+
+def test_finalize_classifies_truncated_tool_arguments_as_truncation():
+    """finish_reason=length 时参数残缺，应报"输出被截断"而非笼统的网络错误。
+
+    这是运维能否看到"max_tokens 不够用"这一信号的关键：没有这层区分，截断会
+    被贴上 NetworkError 标签，看起来像网络抖动。
+    """
+    accumulator = ToolUseAccumulator()
+    accumulator.add(
+        ToolUseDelta(
+            index=0,
+            call_id="call-1",
+            name_delta="write_report",
+            arguments_delta='{"topic": "宁德时代", "sections": [{"heading": "营收',
+        )
+    )
+
+    with pytest.raises(OutputTruncatedError, match="max_tokens"):
+        finalize_tool_uses(accumulator, finish_reason="length")
+
+
+def test_finalize_keeps_bad_arguments_separate_from_truncation():
+    """非 length 的坏 JSON 报坏参数——模型吐错了，而不是预算不足。"""
+    accumulator = ToolUseAccumulator()
+    accumulator.add(
+        ToolUseDelta(
+            index=0, call_id="call-1", name_delta="get_quote", arguments_delta="not-json"
+        )
+    )
+
+    with pytest.raises(ToolArgumentsError) as error:
+        finalize_tool_uses(accumulator, finish_reason="tool_calls")
+    assert not isinstance(error.value, OutputTruncatedError)
+
+
+def test_finalize_passes_through_valid_arguments():
+    accumulator = ToolUseAccumulator()
+    accumulator.add(
+        ToolUseDelta(
+            index=0, call_id="call-1", name_delta="get_quote", arguments_delta='{"symbol":"600519"}'
+        )
+    )
+
+    assert finalize_tool_uses(accumulator, finish_reason="tool_calls")[0].args == {
+        "symbol": "600519"
+    }
+
+
+def test_malformed_stream_errors_are_retryable_and_void_output():
+    """这一类失败发生在流结束之后，重放前必须先作废已流出的内容。"""
+    error = OutputTruncatedError("truncated")
+
+    assert isinstance(error, MalformedStreamError)
+    assert isinstance(error, NetworkError)
+    assert error.retryable is True
+    assert error.voids_output is True
+
+    # 普通传输层 NetworkError 不得作废输出：它发生在任何 chunk 之前。
+    assert NetworkError("connection refused").voids_output is False
+

@@ -45,5 +45,9 @@ sets:
     tags: ["risk"]
   noise:
     tags: ["noise"]
+  # 正交集：动态编排（技能按意图注入 + 子代理分派）。这些用例同时带 `normal`
+  # 标签（判定核心仍是正常完成），此处的 `dynamic` 让它们可单独成组跑。
+  dynamic:
+    tags: ["dynamic"]
 
 cases_dir: cases

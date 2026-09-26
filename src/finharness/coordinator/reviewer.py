@@ -1,21 +1,31 @@
 """子代理协调器：在隔离上下文中执行聚焦范围的工作（docs 03.10）。
 
 只有当隔离能换来某些东西时，子代理才配得上它的开销。上下文压缩已经能回收窗口
-空间，并行工具调用已经能覆盖速度，所以这两者都不是派生一个子代理的理由。真正
-的理由有两个：
+空间，**单纯的并行取数**也已由同轮 ``asyncio.gather`` 覆盖，所以这两者都不是派生
+子代理的理由。真正的理由有两个：
 
 * **一次独立阅读。** 风险复核者从未撰写该研报，并且可以重新获取底层数据，因此
   它能看见作者在自己草稿中看不到的东西（``focus="risk"``）。
-* **上下文隔离。** 一个中间材料会挤占主窗口的任务——例如消化三份长文档——可以
-  在它自己的上下文中运行至完成，只回传其结论（``focus="general"``）。
+* **上下文隔离。** 一个中间材料会挤占主窗口的任务——例如逐实体深分析多家公司、
+  消化三份长文档——可以在它自己的上下文中运行至完成，只回传其结论
+  （``focus="general"`` / ``focus="reader"``）。
+
+三个焦点：
+
+* ``general``——**模型可见**的通用子代理（``spawn_agent`` 派出的唯一焦点）。任务
+  点名了标的时它**可自行取数**，再在隔离上下文里完成分析、只回结论。
+* ``reader``——内部专用：只消化交给它的材料、**不取数**。保留在协调器；
+  ``summarize_document`` 不再内部派它（该工具只返回分片索引，由主 Agent
+  发现 ``spawn_agent`` 后按片消化）。
+* ``risk``——内部专用：研报风险终审，一次独立阅读，可重新取数核对数字。
 
 隔离是通过结构而非指令来强制的：
 
 * 每个子代理都获得全新的 ``ResearchContext``、transcript 与 stats，因此它看不到
   主对话的推理，且它所做的任何事都不会进入对话记忆（``store=None``）；
 * 它的工具目录在构造时就被收窄（``only=<focus tool names>``），因此子集之外的
-  名称根本无法解析——又因为 ``spawn_agent`` 位于 META 组，子代理在结构上无法再
-  派生另一个子代理；
+  名称根本无法解析——又因为 ``spawn_agent`` 位于 META 组、且只读取数子集不含
+  META/写工具，子代理在结构上无法再派生另一个子代理，也无法修改任何东西；
 * 引用登记表（citation registry）是共享的，使 cid 在整个会话中保持连续，但每个
   子代理通过 ``ScopedCitationRegistry`` 写入，因此它铸造的 cid 可以被精确知晓，
   无需对共享存储做差集比较（两个并发的子代理会把它算错）。
@@ -26,7 +36,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,15 +46,18 @@ from finharness.data.citation import CitationRegistry, ScopedCitationRegistry
 
 # 聚焦名与派发上限是 tools.spawn_agent 与协调器之间的**协议**，因此定义在
 # shared（tools 也要读它），这里只消费。
-from finharness.shared.agents import GENERAL_FOCUS, MAX_SPAWN_TASKS, RISK_FOCUS
+from finharness.shared.agents import GENERAL_FOCUS, MAX_SPAWN_TASKS, READER_FOCUS, RISK_FOCUS
 
 # 读取研报，重新获取并交叉核对其中若干数字，然后写出复核意见。三轮曾经过紧：
 # 一份有几个数字需要核验的研报会在写出任何意见之前就耗尽轮次（表现为
 # ``max_turns_exhausted``），从而静默地交付一份未经复核的研报。六轮为读取加上
 # 若干独立核查留出了余量，又不会允许出现死循环。
 REVIEW_MAX_TURNS = 6
-# worker 读取其材料并写出结论；它不获取数据，因此需要的轮次远少于复核者。
-WORKER_MAX_TURNS = 4
+# reader 只消化交给它的材料、不取数，因此需要的轮次很少。
+READER_MAX_TURNS = 4
+# 通用子代理可在任务点名标的时**自行取数**，再做分析：取数（数次）加上分析、
+# 写作，轮次需求远高于纯 reader。四轮曾按"只读材料"估，取数后不够。
+GENERAL_MAX_TURNS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,10 +115,32 @@ def _general_system() -> str:
     return worker_prompt()
 
 
-def _worker_tools() -> tuple[str, ...]:
-    from finharness.tools.registry import worker_tool_names
+def _general_tools() -> tuple[str, ...]:
+    """通用子代理的工具集：只读取数子集，任务要求时含 ``web_search``。
 
-    return worker_tool_names()
+    与 risk 共用 ``review_tool_names()`` 不够——交叉印证公开讨论需要联网，但
+    不得放宽复核资格。仍然只读：不给写、不给 META，因此结构上不能再派生。
+    """
+    from finharness.tools.registry import general_tool_names
+
+    return general_tool_names()
+
+
+def _reader_system() -> str:
+    from finharness.engine.prompt import reader_prompt
+
+    return reader_prompt()
+
+
+def _reader_tools() -> tuple[str, ...]:
+    """reader 的工具集：只读**材料**，不含取数层（docs 03.10）。
+
+    ``summarize_document`` 不再内部复用本焦点：它只返回分片索引。本焦点仍保留
+    给内部只读材料任务——只该消化交给它的文本，不该自行去猜标的取数。
+    """
+    from finharness.tools.registry import reader_tool_names
+
+    return reader_tool_names()
 
 
 _FOCUSES: dict[str, _Focus] = {
@@ -118,15 +153,39 @@ _FOCUSES: dict[str, _Focus] = {
     GENERAL_FOCUS: _Focus(
         name=GENERAL_FOCUS,
         system=_general_system,
-        tool_names=_worker_tools,
-        max_turns=WORKER_MAX_TURNS,
+        tool_names=_general_tools,
+        max_turns=GENERAL_MAX_TURNS,
+    ),
+    READER_FOCUS: _Focus(
+        name=READER_FOCUS,
+        system=_reader_system,
+        tool_names=_reader_tools,
+        max_turns=READER_MAX_TURNS,
     ),
 }
 
 
 def focus_names() -> tuple[str, ...]:
-    """调用方可以请求的子代理角色。"""
+    """调用方可以请求的子代理角色（含内部焦点）。"""
     return tuple(sorted(_FOCUSES))
+
+
+async def _notify_task(
+    on_task: Callable[[int, int, str, str], Awaitable[None]] | None,
+    index: int,
+    total: int,
+    task: str,
+    status: str,
+) -> None:
+    """子任务进展回调是尽力而为：失败不得连累正在跑的兄弟任务。"""
+    if on_task is None:
+        return
+    try:
+        await on_task(index, total, task, status)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - 覆盖条断了也不该杀掉子代理
+        pass
 
 
 class Coordinator:
@@ -144,6 +203,7 @@ class Coordinator:
         stop_signal_provider: Callable[[], Any | None] | None = None,
         audit_hook_factory: Callable[[str], Any] | None = None,
         user_id: str = "",
+        parent_gate: Any | None = None,
     ) -> None:
         self.provider = provider
         self.data = data
@@ -167,6 +227,9 @@ class Coordinator:
         # 各自落行；未接线时子代理仍运行，只是不留痕（测试替身路径）。
         self._audit_hook_factory = audit_hook_factory
         self._user_id = user_id
+        # 父会话权限闸门：general worker 一旦能 web_search，必须沿用已确认的
+        # egress 授权，而不是 ReadOnlyGate 跳过询问。
+        self._parent_gate = parent_gate
 
     def bind_accounting(self, *, usage: Any, stats: Any, observer: Any | None = None) -> None:
         """挂接主循环的计数器与观测器，使子代理的开销被记到那里。"""
@@ -183,6 +246,31 @@ class Coordinator:
             return self._stop_signal_provider()
         except Exception:  # noqa: BLE001 - 取值失败只是"子代理不响应停止"
             return None
+
+    async def _authorize_web_egress(self) -> tuple[bool, str]:
+        """general worker 派发前确认联网；一次授权放行本批及后续 worker。"""
+        gate = self._parent_gate
+        if gate is None:
+            return True, ""
+        from finharness.permissions.gate import EGRESS_CATEGORY, Verdict
+        from finharness.tools.generic.web import WebSearchTool
+
+        web = WebSearchTool(self.data)
+        args = {"query": "（子代理联网检索）"}
+        decide = getattr(gate, "decide", None)
+        if not callable(decide):
+            return True, ""
+        decision = decide(web, args)
+        if decision.verdict is Verdict.CONFIRM:
+            check = getattr(gate, "check", None)
+            if callable(check):
+                decision = await check(web, args)
+        if decision.verdict is Verdict.ALLOW:
+            confirmed = getattr(gate, "confirmed_categories", None)
+            if isinstance(confirmed, set):
+                confirmed.add(EGRESS_CATEGORY)
+            return True, ""
+        return False, decision.reason or "网络访问未授权"
 
     # -- 风险复核 ----------------------------------------------------------
     async def review_risk(self, *, topic: str, markdown: str) -> SubAgentResult:
@@ -208,12 +296,16 @@ class Coordinator:
         tasks: list[str],
         focus: str = GENERAL_FOCUS,
         context: str | None = None,
+        on_task: Callable[[int, int, str, str], Awaitable[None]] | None = None,
     ) -> list[SubAgentResult]:
         """把独立任务作为并发子代理运行并收集结论。
 
         结果按任务给定的顺序返回，每个结果都如实说明自身的结果：一个任务失败
         不会中止它的兄弟任务。此方法绝不抛出异常——调用方会为每个任务得到一个
         结果，其中失败者会被标记出来。
+
+        ``on_task(index, total, task, status)`` 是可选的进展回调（started /
+        completed / failed）。覆盖条靠它展示子代理派发，失败不得连累任务本身。
         """
         if focus not in _FOCUSES:
             raise ValueError(f"未知的子代理类型：{focus}（可选 {'、'.join(sorted(_FOCUSES))}）")
@@ -223,11 +315,39 @@ class Coordinator:
         if len(cleaned) > MAX_SPAWN_TASKS:
             raise ValueError(f"单次最多派发 {MAX_SPAWN_TASKS} 个子任务（收到 {len(cleaned)}）")
 
+        if focus == GENERAL_FOCUS:
+            allowed, error = await self._authorize_web_egress()
+            if not allowed:
+                return [
+                    SubAgentResult(
+                        focus=focus, summary="", task=task, ok=False, error=error
+                    )
+                    for task in cleaned
+                ]
+
+        total = len(cleaned)
+
+        async def tracked(index: int, task: str) -> SubAgentResult:
+            await _notify_task(on_task, index, total, task, "started")
+            try:
+                result = await self._run(focus=focus, task=task, context=context)
+            except Exception as exc:  # noqa: BLE001 - 与 gather 的兜底同一口径
+                result = SubAgentResult(
+                    focus=focus,
+                    summary="",
+                    task=task,
+                    ok=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            status = "completed" if result.ok else "failed"
+            await _notify_task(on_task, index, total, task, status)
+            return result
+
         # 并发是刻意设计的：这些任务彼此独立，这正是它们能够被拆分的前提。每个
         # _run 已经会吞掉自身的失败，但 gather 也被包裹起来，这样 harness 中意外
         # 的抛出就不会丢失兄弟任务的结果。
         gathered = await asyncio.gather(
-            *(self._run(focus=focus, task=task, context=context) for task in cleaned),
+            *(tracked(index, task) for index, task in enumerate(cleaned)),
             return_exceptions=True,
         )
         results: list[SubAgentResult] = []
@@ -293,6 +413,12 @@ class Coordinator:
             else []
         )
 
+        worker_gate = (
+            self._parent_gate
+            if focus == GENERAL_FOCUS and self._parent_gate is not None
+            else ReadOnlyGate()
+        )
+
         sub_loop = AgentLoop(
             provider=self.provider,
             registry=ToolRegistry(
@@ -302,7 +428,7 @@ class Coordinator:
             system=system,
             cite=scoped_cite,
             ctx=sub_ctx,
-            gate=ReadOnlyGate(),
+            gate=worker_gate,
             counter=self.counter,
             # 不设 store：这次运行是它自己的一个片段，而非对话记忆。它的
             # transcript 随本次调用一起消亡。
